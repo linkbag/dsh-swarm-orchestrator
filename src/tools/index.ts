@@ -12,6 +12,25 @@ const taskItemSchema = {
     role: { type: 'string' as const, required: true as const, description: 'Duty-table role (architect | builder | reviewer | integrator, or a custom role)' },
     blockedBy: { type: 'array' as const, items: { type: 'string' as const }, description: 'Task ids that must complete before this one starts' },
     reviewBy: { type: 'string' as const, description: 'Role that reviews this task\'s output after completion (e.g. reviewer); rejections loop back with feedback up to reviewLoops times' },
+    reviewGate: { type: 'string' as const, description: '\'agent\' (default) or \'human\' — human routes the verdict to dashboard Approve/Reject buttons' },
+    model: {
+      type: 'object' as const,
+      additionalProperties: true,
+      description: 'Per-task model override (wins over the role pin): { provider, model }',
+      properties: {
+        provider: { type: 'string' as const, required: true as const },
+        model: { type: 'string' as const, required: true as const },
+      },
+    },
+    evidence: {
+      type: 'object' as const,
+      additionalProperties: true,
+      description: 'Evidence contract: the task will not close until these hold. { files: [paths], commands: [shell commands] }',
+      properties: {
+        files: { type: 'array' as const, items: { type: 'string' as const }, description: 'Files (relative to the workspace) that must exist and be non-empty' },
+        commands: { type: 'array' as const, items: { type: 'string' as const }, description: 'Shell commands that must exit 0' },
+      },
+    },
   },
 }
 
@@ -60,6 +79,24 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
             id: task.id, subject: task.subject, description: task.description, role: task.role,
             ...(task.blockedBy !== undefined && task.blockedBy.length > 0 ? { blockedBy: task.blockedBy } : {}),
             ...(task.reviewBy !== undefined && task.reviewBy.length > 0 ? { reviewBy: task.reviewBy } : {}),
+            ...(task.reviewGate === 'human' ? { reviewGate: 'human' as const } : {}),
+            ...(task.model !== undefined && typeof task.model === 'object'
+              && typeof (task.model as { provider?: unknown }).provider === 'string'
+              && typeof (task.model as { model?: unknown }).model === 'string'
+              ? { model: { provider: (task.model as { provider: string }).provider, model: (task.model as { model: string }).model } }
+              : {}),
+            ...(task.evidence !== undefined && typeof task.evidence === 'object'
+              ? {
+                  evidence: {
+                    ...(Array.isArray((task.evidence as { files?: unknown }).files)
+                      ? { files: (task.evidence as { files: string[] }).files.filter((f) => typeof f === 'string') }
+                      : {}),
+                    ...(Array.isArray((task.evidence as { commands?: unknown }).commands)
+                      ? { commands: (task.evidence as { commands: string[] }).commands.filter((c) => typeof c === 'string') }
+                      : {}),
+                  },
+                }
+              : {}),
           })),
           ...(args.endorse === true ? { endorse: true } : {}),
         },
@@ -103,6 +140,46 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     execute: async (args, exec) => {
       if (exec.agent === undefined) throw new Error('swarm_report is only available to swarm task agents')
       return service.report(String(exec.agent.id), args.taskId, args.note)
+    },
+  })))
+
+  disposers.push(tools.register(defineTool({
+    name: 'swarm_retry',
+    description:
+      'Requeue a failed or blocked swarm task for another attempt (recovery after a fix). '
+      + 'Gated to the run\'s dispatching session; other sessions must use the Swarm dashboard.',
+    parameters: {
+      runId: { type: 'string', required: true, description: 'The run id' },
+      taskId: { type: 'string', required: true, description: 'The failed/blocked task id to requeue' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    isConcurrencySafe: () => true,
+    execute: async (args, exec) => {
+      service.retryTask(args.runId, args.taskId, exec.agent === undefined ? undefined : String(exec.agent.id))
+      return `Task ${args.taskId} requeued — the dispatcher will relaunch it when its blockers allow. Track with swarm_status.`
+    },
+  })))
+
+  disposers.push(tools.register(defineTool({
+    name: 'swarm_wait',
+    description:
+      'Block until the swarm board changes (task completed/failed, run state change) or the timeout expires — '
+      + 'use this instead of sleep-polling when supervising a swarm run. Returns the board text at the moment of the change.',
+    parameters: {
+      runId: { type: 'string', description: 'Only wait for changes in this run (omit for any swarm activity)' },
+      timeoutSeconds: { type: 'number', description: 'Max seconds to wait (default 240, max 600)' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    isConcurrencySafe: () => true,
+    execute: async (args, exec) => {
+      const timeoutSeconds = Math.min(Math.max(args.timeoutSeconds ?? 240, 5), 600)
+      return service.waitForChange(args.runId, timeoutSeconds * 1000, exec.signal)
     },
   })))
 

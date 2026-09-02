@@ -21,6 +21,12 @@ export interface RoleConfig {
   maxTokens?: number
   /** Applied by intercepting the child's LLM requests (AgentOptions has no effort field). */
   reasoningEffort?: string
+  /** Effort ladder (A1): on spawn/turn failure the next entry is tried, ending at inherit. */
+  effortFallbacks?: string[]
+  /** Optional tool restriction applied to this role's task agents (J1; spawn provider toolFilter capability). */
+  toolFilter?: { deny?: string[]; allow?: string[] }
+  /** Per-role concurrency cap (C3); unset = the global maxConcurrent applies. */
+  maxConcurrent?: number
   /** Ordered fallback chain tried when the primary model is unavailable. */
   fallbacks: ModelRef[]
   /** Per-child persona shadowing the deployment persona for agents in this role. */
@@ -36,10 +42,18 @@ export interface DutyTable {
   roles: Record<RoleId, RoleConfig>
 }
 
-export type RunStatus = 'planning' | 'awaiting-endorsement' | 'running' | 'completed' | 'failed' | 'aborted'
+export type RunStatus = 'planning' | 'awaiting-endorsement' | 'running' | 'paused' | 'completed' | 'failed' | 'aborted'
 export type TaskStatus =
   | 'pending' | 'ready' | 'dispatching' | 'running' | 'reviewing'
   | 'retrying' | 'completed' | 'failed' | 'blocked'
+
+/** Machine-checkable proof a task must produce before it may close (J2 evidence contract). */
+export interface TaskEvidence {
+  /** Files (relative to the run workspace) that must exist and be non-empty. */
+  files?: string[]
+  /** Shell commands that must exit 0 (run in the task agent's workspace). */
+  commands?: string[]
+}
 
 /** Task as submitted by the swarm-lead (main session) via swarm_dispatch. */
 export interface TaskSpec {
@@ -50,6 +64,12 @@ export interface TaskSpec {
   blockedBy?: string[]
   /** Role that reviews this task's output before it counts as done (review loop, capped by reviewLoops). */
   reviewBy?: RoleId
+  /** Per-task model override (K4): wins over the role's pinned chain; unset = role chain / run default. */
+  model?: ModelRef
+  /** Evidence contract (J2): machine-checked before the task may close. */
+  evidence?: TaskEvidence
+  /** 'human' routes the review verdict to a dashboard Approve/Reject instead of an agent reviewer (J7). */
+  reviewGate?: 'agent' | 'human'
 }
 
 /** Task state folded from the event log. */
@@ -66,6 +86,10 @@ export interface Task extends TaskSpec {
   reviewFeedback?: string
   reviewed?: boolean
   reviewExhausted?: boolean
+  /** Human-gated review pending (J7). */
+  humanReview?: boolean
+  /** Timestamp of the last heartbeat — the board greys stale notes (B2). */
+  lastNoteAt?: number
   updatedAt: number
 }
 
@@ -85,6 +109,7 @@ export interface RunReport {
  * join this preset and route; unpinned duty roles inherit this model).
  */
 export interface RunDispatchContext {
+  sessionId?: string
   presetId?: string
   provider?: string
   model?: string
@@ -103,6 +128,8 @@ export interface Run {
   taskIds: string[]
   report?: RunReport
   dispatch?: RunDispatchContext
+  /** Set while status = paused (A3): why the run stopped waiting for human action. */
+  pauseReason?: string
   /** Live counters folded from task events. */
   stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number }
 }
@@ -124,6 +151,8 @@ export type SwarmEventKind =
   | 'run/started'
   | 'run/completed'
   | 'run/failed'
+  | 'run/paused'
+  | 'run/resumed'
   | 'run/aborted'
   | 'task/started'
   | 'task/agent-started'
@@ -132,6 +161,7 @@ export type SwarmEventKind =
   | 'task/completed'
   | 'task/failed'
   | 'task/blocked'
+  | 'task/unblocked'
   | 'task/review-started'
   | 'task/reviewed'
   | 'duty/updated'

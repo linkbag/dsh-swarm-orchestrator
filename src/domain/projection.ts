@@ -84,6 +84,13 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         role: typeof spec.role === 'string' ? spec.role : 'builder',
         blockedBy: Array.isArray(spec.blockedBy) ? (spec.blockedBy as string[]) : undefined,
         reviewBy: typeof spec.reviewBy === 'string' ? spec.reviewBy : undefined,
+        reviewGate: spec.reviewGate === 'human' ? 'human' : undefined,
+        model: spec.model !== null && typeof spec.model === 'object'
+          && typeof (spec.model as Record<string, unknown>).provider === 'string'
+          && typeof (spec.model as Record<string, unknown>).model === 'string'
+          ? { provider: (spec.model as { provider: string }).provider, model: (spec.model as { model: string }).model }
+          : undefined,
+        evidence: spec.evidence !== null && typeof spec.evidence === 'object' ? (spec.evidence as Task['evidence']) : undefined,
         status: 'pending',
         attempts: 0,
         reviews: 0,
@@ -101,8 +108,12 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
     run.updatedAt = event.at
 
     if (kind === 'run/endorsed') {
-      run.status = 'running'
-      run.endorsedAt = event.at
+      // J5 legality: an endorsement may only bring a not-yet-running run to
+      // life — a crafted replay must not resurrect an aborted/terminal run.
+      if (run.status === 'planning' || run.status === 'awaiting-endorsement') {
+        run.status = 'running'
+        run.endorsedAt = event.at
+      }
     } else if (kind === 'run/started') {
       if (run.status !== 'completed' && run.status !== 'aborted') run.status = 'running'
     } else if (kind === 'run/completed') {
@@ -113,6 +124,13 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       run.status = 'failed'
       run.completedAt = event.at
       if (d.report !== null && typeof d.report === 'object') run.report = d.report as Run['report']
+    } else if (kind === 'run/paused') {
+      run.status = 'paused'
+      run.pauseReason = str('reason')
+    } else if (kind === 'run/resumed') {
+      run.status = 'running'
+      run.completedAt = undefined
+      run.pauseReason = undefined
     } else if (kind === 'run/aborted') {
       run.status = 'aborted'
     }
@@ -121,6 +139,12 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
   if (taskId !== undefined && runId !== undefined) {
     const task = state.tasks.get(taskKey(runId, taskId))
     if (task === undefined) return
+    // J5 legality: a terminal or paused run's tasks never move again (a human
+    // retry appends run/resumed first, which flips the run back to running).
+    const ownerRun = state.runs.get(runId)
+    if (ownerRun !== undefined && (ownerRun.status === 'aborted' || ownerRun.status === 'completed' || ownerRun.status === 'failed' || ownerRun.status === 'paused')) {
+      return
+    }
     task.updatedAt = event.at
 
     switch (kind) {
@@ -140,6 +164,7 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         break
       case 'task/heartbeat':
         if (typeof d.note === 'string') task.lastNote = d.note
+        task.lastNoteAt = event.at
         break
       case 'task/model-fallback': {
         task.agent = {
@@ -172,8 +197,15 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         task.status = 'blocked'
         task.blockedReason = str('reason')
         break
+      case 'task/unblocked':
+        if (task.status === 'blocked') {
+          task.status = 'pending'
+          task.blockedReason = undefined
+        }
+        break
       case 'task/review-started':
         if (task.status === 'completed') task.status = 'reviewing'
+        if (d.human === true) task.humanReview = true
         break
       case 'task/reviewed': {
         const verdict = str('verdict') ?? 'error'

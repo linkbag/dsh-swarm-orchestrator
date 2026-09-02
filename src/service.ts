@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { mkdirSync } from 'node:fs'
+import { exec } from 'node:child_process'
+import { mkdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
@@ -14,7 +16,16 @@ import { fold, isReady, newState, runningCount, taskKeyOf, type SwarmState } fro
 import type { BoardSnapshot } from './board.js'
 import { buildBoardSnapshot } from './board.js'
 import { spawnTaskAgent, buildReviewPrompt, parseVerdict, type SpawnDeps } from './dispatch/spawn.js'
-import type { DispatchInput, DispatchResult, DutyTable, RoleConfig, Run, Task, TaskSpec } from './domain/types.js'
+import type { DispatchInput, DispatchResult, DutyTable, ModelRef, RoleConfig, Run, Task, TaskSpec } from './domain/types.js'
+
+const execAsync = promisify(exec)
+
+/** Classify a spawn-failure reason for pause (A3) and adaptive-concurrency (K1) decisions. */
+function classifyFailure(reason: string): 'quota' | 'provider' | 'other' {
+  if (/quota|insufficient (balance|credit|funds)|balance (exhausted|depleted)|402|payment required|credit (ran out|exhausted)/i.test(reason)) return 'quota'
+  if (/timeout|timed out|rate limit|429|empty response|stream|503|502|server error|transport|econn/i.test(reason)) return 'provider'
+  return 'other'
+}
 
 interface InFlight {
   controller: AbortController
@@ -56,9 +67,10 @@ function captureDispatchContext(parent: Agent | undefined): Partial<Run['dispatc
     }
   } catch { /* route unreadable — leave unset */ }
   try {
-    const header = (parent as { session?: { header?: { cwd?: string } } }).session?.header
+    const header = (parent as { session?: { header?: { id?: string; cwd?: string } } }).session?.header
+    if (typeof header?.id === 'string' && header.id.length > 0) captured.sessionId = header.id
     if (typeof header?.cwd === 'string' && header.cwd.length > 0) captured.cwd = header.cwd
-  } catch { /* cwd unreadable — leave unset */ }
+  } catch { /* header unreadable — leave unset */ }
   try {
     const presets = (parent as { ctx?: { get(name: string): unknown } }).ctx?.get('agentPresets') as
       | { composedPreset(agentCtx: unknown): string | undefined }
@@ -87,6 +99,8 @@ export class SwarmService extends Service {
   private readonly runParents = new Map<string, Agent>()
   /** Service-owned idle anchor agents every spawn of a run is routed through. */
   private readonly runAnchors = new Map<string, { agent: Agent; dispose(): Promise<void> }>()
+  /** K1: per-run adaptive launch capacity (shrinks on provider-class failures, recovers on completions). */
+  private readonly adaptiveLimits = new Map<string, number>()
   private readonly sessionTasks = new Map<string, { taskKey: string; effort?: string }>()
   private tickScheduled = false
 
@@ -320,7 +334,13 @@ export class SwarmService extends Service {
    * every "inherit the default" (empty) entry. Undefined when no route at all
    * is resolvable — the caller then fails the task with an actionable reason.
    */
-  private resolveCandidates(run: Run, roleId: string): Array<{ provider: string; model: string }> | undefined {
+  private resolveCandidates(run: Run, roleId: string, task?: Task): Array<{ provider: string; model: string }> | undefined {
+    // K4: an explicit per-task model override leads the whole chain.
+    if (task?.model !== undefined && task.model.provider.length > 0 && task.model.model.length > 0) {
+      const override: ModelRef = { provider: task.model.provider, model: task.model.model }
+      const rest = this.duty.resolveChain(roleId).filter((c) => !(c.provider === override.provider && c.model === override.model))
+      return [override, ...rest]
+    }
     const fallback = run.dispatch?.provider !== undefined && run.dispatch?.model !== undefined
       ? { provider: run.dispatch.provider, model: run.dispatch.model }
       : undefined
@@ -347,6 +367,129 @@ export class SwarmService extends Service {
     })
   }
 
+  /** K1: the launch capacity this run currently earns (shrinks on provider pain, recovers on success). */
+  private effectiveConcurrency(runId: string): number {
+    const adaptive = this.adaptiveLimits.get(runId)
+    const base = this.swarmConfig.adaptiveConcurrency
+      ? Math.min(this.swarmConfig.maxConcurrent, adaptive ?? this.swarmConfig.maxConcurrent)
+      : this.swarmConfig.maxConcurrent
+    return Math.max(1, base)
+  }
+
+  private shrinkConcurrency(runId: string): void {
+    if (!this.swarmConfig.adaptiveConcurrency) return
+    const next = Math.max(1, this.effectiveConcurrency(runId) - 1)
+    this.adaptiveLimits.set(runId, next)
+  }
+
+  private growConcurrency(runId: string): void {
+    if (!this.swarmConfig.adaptiveConcurrency) return
+    if (this.effectiveConcurrency(runId) < this.swarmConfig.maxConcurrent) {
+      this.adaptiveLimits.set(runId, this.effectiveConcurrency(runId) + 1)
+    } else {
+      this.adaptiveLimits.delete(runId)
+    }
+  }
+
+  /** A1: the effort this attempt uses — primary first, then the ladder, then inherit. */
+  private resolveEffort(role: RoleConfig, attemptNumber: number): string | undefined {
+    const chain = [role.reasoningEffort, ...(role.effortFallbacks ?? [])]
+      .filter((e): e is string => typeof e === 'string' && e.length > 0)
+    if (chain.length === 0) return undefined
+    return chain[Math.min(Math.max(0, attemptNumber - 1), chain.length - 1)]
+  }
+
+  /** J2: machine-check the evidence contract; null = pass, otherwise the first failure. */
+  private async checkEvidence(task: Task): Promise<string | null> {
+    const evidence = task.evidence
+    if (evidence === undefined) return null
+    const cwd = this.view().runs.get(task.runId)?.dispatch?.cwd ?? process.cwd()
+    for (const file of evidence.files ?? []) {
+      try {
+        const info = statSync(join(cwd, file))
+        if (!info.isFile() || info.size === 0) return `required file "${file}" is missing or empty`
+      } catch {
+        return `required file "${file}" is missing or empty`
+      }
+    }
+    for (const command of evidence.commands ?? []) {
+      try {
+        await execAsync(command, { cwd, timeout: 120_000 })
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        return `evidence command failed: ${command} — ${message.slice(0, 300)}`
+      }
+    }
+    return null
+  }
+
+  /** A3: stop launching, abort in-flight children, and park the run for a human resume. */
+  private pauseRun(runId: string, cause: string): void {
+    for (const [key, flight] of this.inFlight) {
+      if (flight.taskKey.startsWith(runId + '/')) {
+        flight.controller.abort()
+        this.inFlight.delete(key)
+      }
+    }
+    this.events.append('run/paused', { runId, data: { reason: `provider quota exhausted — resume from the Swarm dashboard after topping up (${cause})` } })
+  }
+
+  /** A3/K2: resume a paused (or requeue a terminally failed) run, keeping completed tasks. */
+  resumeRun(runId: string): void {
+    const run = this.view().runs.get(runId)
+    if (run === undefined) throw new Error(`unknown run ${runId}`)
+    if (run.status !== 'paused' && run.status !== 'failed' && run.status !== 'aborted') {
+      throw new Error(`run ${runId} is ${run.status}; only paused or failed runs can be resumed`)
+    }
+    this.events.append('run/resumed', { runId })
+    for (const id of run.taskIds) {
+      const task = this.view().tasks.get(`${runId}/${id}`)
+      if (task?.status === 'failed') {
+        this.events.append('task/failed', { runId, taskId: id, data: { retry: true, reason: 'run resumed — requeued' } })
+      }
+    }
+    this.scheduleTick()
+  }
+
+  /** J7: the human verdict on a human-gated review, from the dashboard. */
+  review(runId: string, taskId: string, verdict: 'approve' | 'reject'): void {
+    const task = this.view().tasks.get(`${runId}/${taskId}`)
+    if (task === undefined) throw new Error(`unknown task ${runId}/${taskId}`)
+    if (task.status !== 'reviewing' || task.humanReview !== true) {
+      throw new Error(`task ${taskId} is not awaiting a human review`)
+    }
+    const reviews = (task.reviews ?? 0) + 1
+    if (verdict === 'approve') {
+      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'approve', feedback: 'approved by human review' } })
+    } else {
+      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'reject', reviews, feedback: 'rejected by human review — fix and resubmit' } })
+    }
+    this.scheduleTick()
+  }
+
+  /** C1: resolve when the watched scope changes (long-poll for dispatcher chats). */
+  waitForChange(runId: string | undefined, timeoutMs: number, signal?: AbortSignal): Promise<string> {
+    return new Promise((resolve) => {
+      let settled = false
+      const finish = (note: string): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        unsubscribe()
+        signal?.removeEventListener('abort', onAbort)
+        resolve(`${note}\n\n${this.statusText(runId)}`)
+      }
+      const unsubscribe = this.events.subscribe((event) => {
+        if (runId === undefined || event.runId === undefined || event.runId === runId) {
+          finish(`change at seq ${event.seq}: ${event.kind}${event.taskId !== undefined ? ` (${event.taskId})` : ''}`)
+        }
+      })
+      const timer = setTimeout(() => finish(`no swarm changes within ${Math.round(timeoutMs / 1000)}s`), timeoutMs)
+      const onAbort = (): void => finish('wait aborted')
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
   private scheduleTick(): void {
     if (this.tickScheduled) return
     this.tickScheduled = true
@@ -360,7 +503,7 @@ export class SwarmService extends Service {
     })
   }
 
-  /** Launch ready tasks up to the concurrency cap. Synchronous planning; async spawns are fire-and-track. */
+  /** Launch ready tasks up to the concurrency caps. Sync planning; spawns are staggered + fire-and-track. */
   private tick(): void {
     const state = this.view()
     for (const run of state.runs.values()) {
@@ -372,6 +515,14 @@ export class SwarmService extends Service {
       // become ready — block it now so the run can reach a terminal status
       // instead of hanging in 'running' with a pending task forever.
       for (const task of tasks) {
+        if (task.status === 'blocked') {
+          // A5 auto-unblock: every blocker reached completed after a rescue/retry.
+          const blockers = (task.blockedBy ?? []).map((b) => state.tasks.get(`${run.id}/${b}`)?.status)
+          if (blockers.length > 0 && blockers.every((s) => s === 'completed')) {
+            this.events.append('task/unblocked', { runId: run.id, taskId: task.id })
+          }
+          continue
+        }
         if (task.status !== 'pending' && task.status !== 'retrying') continue
         const dead = (task.blockedBy ?? []).find((blocker) => {
           const status = state.tasks.get(`${run.id}/${blocker}`)?.status
@@ -384,27 +535,46 @@ export class SwarmService extends Service {
           })
         }
       }
-      let capacity = this.swarmConfig.maxConcurrent - runningCount(state, run.id)
-      for (const task of tasks) {
+      // A5: refresh — the appends above may have unblocked tasks just now.
+      const fresh = this.view()
+      const runTasks = run.taskIds
+        .map((id) => fresh.tasks.get(`${run.id}/${id}`))
+        .filter((t): t is Task => t !== undefined)
+      const roleRunning = new Map<string, number>()
+      for (const task of runTasks) {
+        if (task.status === 'running' || task.status === 'dispatching' || task.status === 'reviewing') {
+          roleRunning.set(task.role, (roleRunning.get(task.role) ?? 0) + 1)
+        }
+      }
+      let capacity = this.effectiveConcurrency(run.id) - runningCount(fresh, run.id)
+      let wave = 0
+      for (const task of runTasks) {
         if (capacity <= 0) break
-        if (!isReady(state, task)) continue
+        if (!isReady(fresh, task)) continue
         if (this.inFlight.has(taskKeyOf(task))) continue
-        this.launchTask(run.id, task)
+        const role = this.duty.role(task.role)
+        const roleCap = role?.maxConcurrent
+        if (roleCap !== undefined && (roleRunning.get(task.role) ?? 0) >= roleCap) continue
+        const delayMs = wave === 0 ? 0 : this.swarmConfig.spawnStaggerMs * wave
+        this.launchTask(run.id, task, delayMs)
         capacity -= 1
-        state.tasks.get(taskKeyOf(task))!.status = 'dispatching'
+        wave += 1
+        roleRunning.set(task.role, (roleRunning.get(task.role) ?? 0) + 1)
+        fresh.tasks.get(taskKeyOf(task))!.status = 'dispatching'
       }
       this.checkRunCompletion(run.id)
     }
   }
 
-  private launchTask(runId: string, task: Task): void {
+  private launchTask(runId: string, task: Task, delayMs = 0): void {
     const role: RoleConfig | undefined = this.duty.role(task.role)
     const run = this.view().runs.get(runId)
     if (run === undefined || role === undefined) {
       this.events.append('task/blocked', { runId, taskId: task.id, data: { reason: 'run context unavailable' } })
       return
     }
-    const candidates = this.resolveCandidates(run, task.role)
+    // K4: per-task model override wins; A1: per-attempt effort comes from the ladder.
+    let candidates = this.resolveCandidates(run, task.role, task)
     if (candidates === undefined) {
       // No route and nothing to inherit — retrying cannot fix this.
       this.events.append('task/failed', {
@@ -416,9 +586,119 @@ export class SwarmService extends Service {
       })
       return
     }
+    // A6: from the second attempt on, rotate the chain so a persistently failing
+    // primary gets a different model even when its error is not classed as
+    // "model unavailable".
+    if (task.attempts >= 1 && candidates.length > 1) {
+      const offset = task.attempts % candidates.length
+      candidates = [...candidates.slice(offset), ...candidates.slice(0, offset)]
+    }
+    const effort = this.resolveEffort(role, task.attempts + 1)
     const controller = new AbortController()
     const key = taskKeyOf(task)
     this.inFlight.set(key, { controller, taskKey: key })
+
+    const startSpawn = (): void => {
+      const deps = this.spawnDeps()
+      void this.ensureAnchor(runId).then(async (parent) => {
+        if (parent === undefined) {
+          this.inFlight.delete(key)
+          this.events.append('task/failed', {
+            runId, taskId: task.id,
+            data: {
+              retry: task.attempts <= this.swarmConfig.maxRetries,
+              reason: 'no spawn anchor available (agents service absent and the dispatching session is gone)',
+            },
+          })
+          return
+        }
+        // A4: feed the retry its own history so it resumes instead of restarting.
+        const priorNotes = task.attempts > 0
+          ? this.events.all()
+            .filter((e) => e.taskId === task.id && e.runId === runId && e.kind === 'task/heartbeat' && typeof e.data?.note === 'string')
+            .slice(-6)
+            .map((e) => String(e.data?.note))
+          : undefined
+        const outcome = await spawnTaskAgent(deps, {
+          parent, run, task, role, candidates, signal: controller.signal,
+          ...(role.toolFilter !== undefined ? { toolFilter: role.toolFilter } : {}),
+          ...(priorNotes !== undefined && priorNotes.length > 0 ? { priorNotes } : {}),
+          ...(task.evidence !== undefined ? { evidence: task.evidence } : {}),
+          onFallback: (failed, next) => {
+            this.events.append('task/model-fallback', {
+              runId, taskId: task.id,
+              data: {
+                from: `${failed.provider}/${failed.model}`,
+                ...(next !== undefined ? { provider: next.provider, model: next.model } : {}),
+                reason: 'unavailable',
+              },
+            })
+          },
+          onStarted: (childSessionId) => {
+            this.trackChildSession(childSessionId, key, effort)
+            this.events.append('task/agent-started', { runId, taskId: task.id, data: { sessionId: childSessionId } })
+          },
+        })
+        this.inFlight.delete(key)
+        if (outcome.childSessionId !== undefined) this.forgetChildSession(outcome.childSessionId)
+        const fresh = this.view().tasks.get(key)
+        if (fresh === undefined) return
+        if (this.view().runs.get(runId)?.status === 'aborted' || this.view().runs.get(runId)?.status === 'paused') return
+        // The watchdog (or abort path) may already have recorded a terminal transition.
+        if (fresh.status !== 'running' && fresh.status !== 'dispatching') return
+        if (outcome.ok) {
+          this.growConcurrency(runId)
+          // J2: the evidence contract gates completion.
+          if (task.evidence !== undefined) {
+            const evidenceFailure = await this.checkEvidence(task)
+            if (evidenceFailure !== null) {
+              this.events.append('task/failed', {
+                runId, taskId: task.id,
+                data: {
+                  retry: fresh.attempts <= this.swarmConfig.maxRetries,
+                  reason: `evidence contract failed — ${evidenceFailure}`,
+                },
+              })
+              return
+            }
+          }
+          this.events.append('task/completed', {
+            runId, taskId: task.id,
+            data: { summary: outcome.summary ?? '' },
+          })
+          if (task.reviewBy !== undefined && task.reviewBy.length > 0) {
+            if (task.reviewGate === 'human') {
+              // J7: park the task for a human verdict on the dashboard.
+              this.events.append('task/review-started', { runId, taskId: task.id, data: { reviewer: task.reviewBy, human: true } })
+              this.scheduleTick()
+            } else {
+              void this.runReview(runId, task.id, task.reviewBy)
+            }
+          }
+        } else {
+          const reason = outcome.reason ?? `stop: ${outcome.stopReason ?? 'unknown'}`
+          const failureClass = classifyFailure(reason)
+          if (failureClass !== 'other') this.shrinkConcurrency(runId)
+          if (failureClass === 'quota') {
+            // A3: park the whole run — more attempts would just burn quota.
+            this.events.append('task/failed', {
+              runId, taskId: task.id,
+              data: { retry: false, reason: `provider quota exhausted (before this failure: ${reason})` },
+            })
+            this.pauseRun(runId, reason)
+            return
+          }
+          const retry = fresh.attempts <= this.swarmConfig.maxRetries
+          this.events.append('task/failed', {
+            runId, taskId: task.id,
+            data: { retry, reason },
+          })
+        }
+      }).catch((err: unknown) => {
+        this.inFlight.delete(key)
+        this.ctx.logger('swarm').warn('task %s crashed dispatcher bookkeeping: %s', key, String(err))
+      })
+    }
 
     this.events.append('task/started', {
       runId, taskId: task.id,
@@ -428,63 +708,8 @@ export class SwarmService extends Service {
         model: candidates[0]?.model,
       },
     })
-
-    const deps = this.spawnDeps()
-    void this.ensureAnchor(runId).then(async (parent) => {
-      if (parent === undefined) {
-        this.inFlight.delete(key)
-        this.events.append('task/failed', {
-          runId, taskId: task.id,
-          data: {
-            retry: task.attempts <= this.swarmConfig.maxRetries,
-            reason: 'no spawn anchor available (agents service absent and the dispatching session is gone)',
-          },
-        })
-        return
-      }
-      const outcome = await spawnTaskAgent(deps, {
-        parent, run, task, role, candidates, signal: controller.signal,
-        onFallback: (failed, next) => {
-          this.events.append('task/model-fallback', {
-            runId, taskId: task.id,
-            data: {
-              from: `${failed.provider}/${failed.model}`,
-              ...(next !== undefined ? { provider: next.provider, model: next.model } : {}),
-              reason: 'unavailable',
-            },
-          })
-        },
-        onStarted: (childSessionId) => {
-          this.trackChildSession(childSessionId, key, role.reasoningEffort)
-          this.events.append('task/agent-started', { runId, taskId: task.id, data: { sessionId: childSessionId } })
-        },
-      })
-      this.inFlight.delete(key)
-      if (outcome.childSessionId !== undefined) this.forgetChildSession(outcome.childSessionId)
-      const fresh = this.view().tasks.get(key)
-      if (fresh === undefined) return
-      if (this.view().runs.get(runId)?.status === 'aborted') return
-      // The watchdog (or abort path) may already have recorded a terminal transition.
-      if (fresh.status !== 'running' && fresh.status !== 'dispatching') return
-      if (outcome.ok) {
-        this.events.append('task/completed', {
-          runId, taskId: task.id,
-          data: { summary: outcome.summary ?? '' },
-        })
-        if (task.reviewBy !== undefined && task.reviewBy.length > 0) {
-          void this.runReview(runId, task.id, task.reviewBy)
-        }
-      } else {
-        const retry = fresh.attempts <= this.swarmConfig.maxRetries
-        this.events.append('task/failed', {
-          runId, taskId: task.id,
-          data: { retry, reason: outcome.reason ?? `stop: ${outcome.stopReason ?? 'unknown'}` },
-        })
-      }
-    }).catch((err: unknown) => {
-      this.inFlight.delete(key)
-      this.ctx.logger('swarm').warn('task %s crashed dispatcher bookkeeping: %s', key, String(err))
-    })
+    if (delayMs > 0) setTimeout(startSpawn, delayMs)
+    else startSpawn()
   }
 
   /**
@@ -618,12 +843,23 @@ export class SwarmService extends Service {
     this.releaseAnchor(runId)
   }
 
-  /** Requeue a failed/blocked task for another attempt (dashboard action). */
-  retryTask(runId: string, taskId: string): void {
+  /** Requeue a failed/blocked task for another attempt (dashboard action or swarm_retry tool). */
+  retryTask(runId: string, taskId: string, actorSessionId?: string): void {
+    const run = this.view().runs.get(runId)
+    if (run === undefined) throw new Error(`unknown run ${runId}`)
+    // A5: the recovery tool is for the dispatching session; the dashboard bypasses the gate.
+    const owner = run.dispatch?.sessionId
+    if (actorSessionId !== undefined && owner !== undefined && actorSessionId !== owner) {
+      throw new Error(`swarm_retry is gated to the dispatching session (${owner}); use the Swarm dashboard instead`)
+    }
     const task = this.view().tasks.get(`${runId}/${taskId}`)
     if (task === undefined) throw new Error(`unknown task ${runId}/${taskId}`)
     if (task.status !== 'failed' && task.status !== 'blocked') {
       throw new Error(`task ${taskId} is ${task.status}; only failed or blocked tasks can be retried`)
+    }
+    // A5: a terminal run comes back to life when one of its tasks is retried.
+    if (run.status === 'failed' || run.status === 'aborted' || run.status === 'completed') {
+      this.events.append('run/resumed', { runId })
     }
     this.events.append('task/failed', { runId, taskId, data: { retry: true, reason: 'manual retry' } })
   }

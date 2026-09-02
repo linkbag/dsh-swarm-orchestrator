@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { type SwarmConfig, Config, PLUGIN_VERSION } from './config.js'
+import { registerSwarmCommand } from './command.js'
 import { registerSwarmRoutes } from './routes.js'
 import { SwarmService } from './service.js'
 import { registerSwarmTools } from './tools/index.js'
@@ -85,4 +86,7 @@ export function apply(ctx: Context, config: SwarmConfig) {
 
   // Model tools (global layer: visible to the lead session and spawned task agents).
   ctx.effect(() => wireWhenAvailable(ctx, 'tools', () => registerSwarmTools(ctx, service)))
+
+  // K5: the /swarm <goal> one-shot command (explicit user action → endorse).
+  ctx.effect(() => wireWhenAvailable(ctx, 'commands', () => registerSwarmCommand(ctx, service)))
 }

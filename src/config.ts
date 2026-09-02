@@ -16,6 +16,8 @@ export interface SwarmConfig {
   maxRetries: number
   reviewLoops: number
   requireManualEndorsement: boolean
+  spawnStaggerMs: number
+  adaptiveConcurrency: boolean
 }
 
 export const Config = Schema.object({
@@ -38,5 +40,13 @@ export const Config = Schema.object({
     'Hard endorsement gate: every run waits for a human Endorse on the Swarm dashboard, '
     + 'even when swarm_dispatch is called with endorse=true. Set true to make the gate '
     + 'impossible to bypass from chat.',
+  ),
+  spawnStaggerMs: Schema.number().default(750).min(0).max(60000).description(
+    'Delay between consecutive task-agent launches in one dispatch wave (C2 spawn stagger; '
+    + 'softens simultaneous provider load).',
+  ),
+  adaptiveConcurrency: Schema.boolean().default(true).description(
+    'K1 adaptive concurrency: shrink the per-run launch capacity on provider-class failures '
+    + '(timeouts/quota) and recover it on completions, within the maxConcurrent ceiling.',
   ),
 })

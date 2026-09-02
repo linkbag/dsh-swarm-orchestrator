@@ -266,6 +266,39 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
                 onChange={(next) => { addFallback(role.id, next.provider, next.model) }}
               />
             </div>
+            <div className="dsh-swarm-field-row">
+              <div className="dsh-swarm-field">
+                <span>effort ladder (A1)</span>
+                <input
+                  className="dsh-swarm-input" placeholder="e.g. high, medium (tried in order)"
+                  value={(role.effortFallbacks ?? []).join(', ')}
+                  onChange={(event) => {
+                    const chain = event.target.value.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
+                    updateRole(role.id, { effortFallbacks: chain.length > 0 ? chain : undefined })
+                  }}
+                />
+              </div>
+              <div className="dsh-swarm-field">
+                <span>role concurrency cap (C3)</span>
+                <input
+                  className="dsh-swarm-input" type="number" min={1} step={1}
+                  value={role.maxConcurrent ?? ''}
+                  placeholder="global default"
+                  onChange={(event) => { updateRole(role.id, { maxConcurrent: event.target.value === '' ? undefined : Number(event.target.value) }) }}
+                />
+              </div>
+            </div>
+            <div className="dsh-swarm-field">
+              <span>tool filter (J1 — deny list for this role's agents)</span>
+              <input
+                className="dsh-swarm-input" placeholder="e.g. bash, write (comma-separated tool names)"
+                value={(role.toolFilter?.deny ?? []).join(', ')}
+                onChange={(event) => {
+                  const deny = event.target.value.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
+                  updateRole(role.id, { toolFilter: deny.length > 0 ? { deny } : undefined })
+                }}
+              />
+            </div>
             <details className="dsh-swarm-persona">
               <summary>persona &amp; description</summary>
               <input

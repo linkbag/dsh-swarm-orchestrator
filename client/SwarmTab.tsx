@@ -13,6 +13,8 @@ function statusColor(status: string): string {
   switch (status) {
     case 'completed': return 'var(--dsh-swarm-ok, rgb(46, 160, 67))'
     case 'running': case 'dispatching': return 'var(--dsh-swarm-info, rgb(56, 139, 253))'
+    case 'reviewing': return 'rgb(210, 153, 34)'
+    case 'paused': return 'rgb(227, 148, 36)'
     case 'retrying': case 'pending': return 'var(--dsh-swarm-dim, rgba(125, 125, 125, 0.9))'
     default: return 'var(--dsh-swarm-warn, rgb(219, 88, 96))'
   }
@@ -63,7 +65,7 @@ export function SwarmTab(): JSX.Element {
     [board, run],
   )
 
-  const runAction = useCallback(async (body: { action: string; runId?: string; taskId?: string }) => {
+  const runAction = useCallback(async (body: { action: string; runId?: string; taskId?: string; verdict?: string }) => {
     setBusy(true)
     setActionError(null)
     try {
@@ -121,6 +123,7 @@ export function SwarmTab(): JSX.Element {
                 <div>
                   <h3>{run.title}</h3>
                   <p className="dsh-swarm-dim">{run.spec.length > 220 ? run.spec.slice(0, 220) + '…' : run.spec}</p>
+                  <p className="dsh-swarm-dim">created {timeAgo(run.createdAt)}{run.completedAt !== undefined && run.createdAt !== undefined ? ` · finished ${timeAgo(run.completedAt)}` : ` · elapsed ${timeAgo(run.createdAt)}`}</p>
                 </div>
                 <div className="dsh-swarm-run-actions">
                   {(run.status === 'planning') && (
@@ -128,13 +131,24 @@ export function SwarmTab(): JSX.Element {
                       ✓ Endorse &amp; Launch
                     </button>
                   )}
-                  {(run.status === 'running' || run.status === 'planning') && (
+                  {(run.status === 'paused' || run.status === 'failed') && (
+                    <button className="dsh-swarm-btn primary" disabled={busy} title="Requeue failed tasks and keep completed ones" onClick={() => { void runAction({ action: 'resume', runId: run.id }) }}>
+                      ↻ Resume
+                    </button>
+                  )}
+                  {(run.status === 'running' || run.status === 'planning' || run.status === 'paused') && (
                     <button className="dsh-swarm-btn danger" disabled={busy} onClick={() => { void runAction({ action: 'abort', runId: run.id }) }}>
                       Abort
                     </button>
                   )}
                 </div>
               </div>
+              {run.status === 'paused' && run.pauseReason !== undefined && (
+                <p className="dsh-swarm-run-banner">⏸ {run.pauseReason}</p>
+              )}
+              {run.status === 'failed' && (
+                <p className="dsh-swarm-run-banner">✖ Run failed — see the Failed/Blocked column. Fix the cause, then Resume to requeue failed tasks (completed tasks are kept).</p>
+              )}
               {actionError !== null && <p className="dsh-swarm-action-error">{actionError}</p>}
 
               {run.report !== undefined && (
@@ -178,11 +192,21 @@ export function SwarmTab(): JSX.Element {
                             {task.attempts > 1 && <em>×{task.attempts}</em>}
                             {task.reviewBy !== undefined && (task.reviewed === true
                               ? <em title={`reviewed by ${task.reviewBy}`}>✓✓</em>
-                              : <em title={`review loop: ${task.reviewBy}`}>↻{task.reviews ?? 0}</em>)}
+                              : task.humanReview === true
+                                ? <em title="awaiting human review">👤</em>
+                                : <em title={`review loop: ${task.reviewBy}`}>↻{task.reviews ?? 0}</em>)}
                           </span>
-                          {task.lastNote !== undefined && (
-                            <span className="dsh-swarm-task-note">{task.lastNote.length > 90 ? task.lastNote.slice(0, 90) + '…' : task.lastNote}</span>
-                          )}
+                          {task.lastNote !== undefined && (() => {
+                            const stale = task.lastNoteAt !== undefined && (Date.now() - task.lastNoteAt) > 10 * 60 * 1000
+                            return (
+                              <span
+                                className={stale ? 'dsh-swarm-task-note stale' : 'dsh-swarm-task-note'}
+                                title={stale && task.lastNoteAt !== undefined ? `note from ${timeAgo(task.lastNoteAt)}` : undefined}
+                              >
+                                {task.lastNote.length > 90 ? task.lastNote.slice(0, 90) + '…' : task.lastNote}
+                              </span>
+                            )
+                          })()}
                         </button>
                       ))}
                       {columnTasks.length === 0 && <p className="dsh-swarm-empty">—</p>}
@@ -236,6 +260,27 @@ export function SwarmTab(): JSX.Element {
                 <>
                   <h4>Latest note</h4>
                   <p className="dsh-swarm-brief">{selectedTask.lastNote}</p>
+                </>
+              )}
+              {(selectedTask.humanReview === true && selectedTask.status === 'reviewing') && (
+                <>
+                  <h4>Human review pending</h4>
+                  <div className="dsh-swarm-tvc-actions">
+                    <button
+                      className="dsh-swarm-btn primary"
+                      disabled={busy}
+                      onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'approve' }).then(() => setSelectedTask(null)) }}
+                    >
+                      ✓ Approve
+                    </button>
+                    <button
+                      className="dsh-swarm-btn danger"
+                      disabled={busy}
+                      onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'reject' }) }}
+                    >
+                      ✖ Reject (send back with feedback)
+                    </button>
+                  </div>
                 </>
               )}
               {(selectedTask.status === 'failed' || selectedTask.status === 'blocked') && (

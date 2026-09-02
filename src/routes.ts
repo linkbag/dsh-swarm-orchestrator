@@ -112,6 +112,19 @@ export function registerSwarmRoutes(ctx: Context, service: SwarmService): (() =>
               service.retryTask(runId, taskId)
               sendJson(res, 200, { ok: true, action, runId, taskId })
               return
+            case 'resume':
+              if (runId === undefined) throw new Error('runId required')
+              service.resumeRun(runId)
+              sendJson(res, 200, { ok: true, action, runId })
+              return
+            case 'review': {
+              if (runId === undefined || taskId === undefined) throw new Error('runId and taskId required')
+              const verdict = typeof body.verdict === 'string' ? body.verdict : ''
+              if (verdict !== 'approve' && verdict !== 'reject') throw new Error('verdict must be approve or reject')
+              service.review(runId, taskId, verdict)
+              sendJson(res, 200, { ok: true, action, runId, taskId, verdict })
+              return
+            }
             case 'set-duty-table': {
               const table = body.table
               if (table === null || typeof table !== 'object') throw new Error('table required')

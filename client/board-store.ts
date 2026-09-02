@@ -11,6 +11,7 @@ export interface BoardRun {
   completedAt?: number
   taskIds: string[]
   report?: RunReport
+  pauseReason?: string
   stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number }
 }
 
@@ -27,11 +28,14 @@ export interface BoardTask {
   agent?: { label: string; provider?: string; model?: string }
   blockedReason?: string
   lastNote?: string
+  lastNoteAt?: number
   summary?: string
   reviews?: number
   reviewFeedback?: string
   reviewed?: boolean
   reviewExhausted?: boolean
+  humanReview?: boolean
+  evidence?: { files?: string[]; commands?: string[] }
   updatedAt: number
 }
 
@@ -52,6 +56,9 @@ export interface BoardRole {
   model?: string
   maxTokens?: number
   reasoningEffort?: string
+  effortFallbacks?: string[]
+  toolFilter?: { deny?: string[]; allow?: string[] }
+  maxConcurrent?: number
   fallbacks: Array<{ provider: string; model: string }>
   persona?: string
 }
@@ -96,9 +103,14 @@ export class BoardStore {
       this.source.onmessage = (event) => {
         try {
           const frame = JSON.parse(event.data) as { seq?: number }
-          if (typeof frame.seq === 'number' && (this.board === null || frame.seq > this.board.seq)) {
-            this.scheduleRefetch()
+          if (typeof frame.seq !== 'number') return
+          // J6 seq-gap resync: a skipped seq means a frame was lost — refetch
+          // unconditionally instead of trusting the stale snapshot.
+          if (this.board !== null && frame.seq > this.board.seq + 1) {
+            void this.refetch()
+            return
           }
+          if (this.board === null || frame.seq > this.board.seq) this.scheduleRefetch()
         } catch {
           this.scheduleRefetch()
         }

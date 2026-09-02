@@ -1,9 +1,17 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { Run, Task } from '../domain/types.js'
+import type { Run, Task, TaskEvidence } from '../domain/types.js'
 import type { RoleConfig } from '../domain/types.js'
 
+/** Extra spawn context: retry-resume hints (A4) and the evidence contract (J2). */
+export interface PromptContext {
+  /** Progress notes from the task's previous attempt(s) — the child resumes from here. */
+  priorNotes?: string[]
+  /** Machine-checked evidence requirements, restated in the prompt. */
+  evidence?: TaskEvidence
+}
+
 /** The prompt every task agent receives: role framing + task + report contract. */
-export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig): string {
+export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context: PromptContext = {}): string {
   return [
     `# Swarm task: ${task.subject}`,
     '',
@@ -25,17 +33,34 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig): string 
     ...(task.reviewBy !== undefined
       ? [`Your output will be reviewed by the **${task.reviewBy}** role before it counts as done — make it verifiable.`]
       : []),
-    ...(task.reviewFeedback !== undefined
+    ...(context.evidence !== undefined
       ? [
-          '## Reviewer feedback on your previous attempt (fix this)',
-          task.reviewFeedback,
           '',
+          '## Evidence contract (the task is NOT done until ALL of this holds)',
+          ...(context.evidence.files ?? []).map((f) => `- File exists and is non-empty: \`${f}\` (relative to the workspace)`),
+          ...(context.evidence.commands ?? []).map((c) => `- Command exits 0: \`${c}\``),
         ]
       : []),
+    ...(task.reviewFeedback !== undefined
+      ? [
+          '',
+          '## Reviewer feedback on your previous attempt (fix this)',
+          task.reviewFeedback,
+        ]
+      : []),
+    ...((context.priorNotes?.length ?? 0) > 0
+      ? [
+          '',
+          '## Notes from your previous attempt(s) — resume from here',
+          'A previous attempt already did part of this task. INSPECT the workspace for its files first and build on that work instead of redoing the research.',
+          ...context.priorNotes!.map((note) => `- ${note}`),
+        ]
+      : []),
+    '',
     '## Working rules',
     '- Work only within this task\'s scope; parallel agents own everything else.',
     '- Verify your own work before finishing (run the checks that exist for what you changed).',
-    '- For interim progress updates visible on the swarm dashboard, call the swarm_report tool with a one-line note.',
+    '- Post a `swarm_report` progress note at least every ~10 minutes or at each milestone, prefixed `progress:`, `blocker:`, or `done:`.',
     '- Finish with a concise final summary: what changed, where, and how it was verified.',
   ].join('\n')
 }
@@ -58,6 +83,14 @@ export function buildReviewPrompt(run: Run, task: Task, reviewerRole: RoleConfig
     '## The task agent\'s final summary',
     task.summary ?? '(no summary provided)',
     '',
+    ...(task.evidence !== undefined
+      ? [
+          '## Evidence contract the task had to satisfy (verify each item yourself)',
+          ...(task.evidence.files ?? []).map((f) => `- File exists and is non-empty: \`${f}\``),
+          ...(task.evidence.commands ?? []).map((c) => `- Command exits 0: \`${c}\``),
+          '',
+        ]
+      : []),
     '## Your job',
     'Inspect the claimed work in the workspace. Check it actually fulfils the task brief and is sound.',
     task.reviewFeedback !== undefined ? `This task already went through ${task.reviews ?? 0} review round(s); the previous feedback was: ${task.reviewFeedback}` : '',
@@ -115,6 +148,7 @@ export interface SpawnDeps {
     signal: AbortSignal
     agentOptions?: { provider?: string; model?: string; maxTokens?: number }
     persona?: string
+    toolFilter?: { deny?: string[]; allow?: string[] }
   }): Promise<{
     id: string
     result: Promise<{
@@ -141,11 +175,17 @@ export async function spawnTaskAgent(
     signal: AbortSignal
     /** Full prompt override (review agents use buildReviewPrompt instead of the task template). */
     prompt?: string
+    /** Per-role tool restriction (J1) passed through to the spawn provider. */
+    toolFilter?: { deny?: string[]; allow?: string[] }
+    /** Retry-resume hints woven into the prompt (A4). */
+    priorNotes?: string[]
+    /** Evidence contract restated in the prompt (J2). */
+    evidence?: TaskEvidence
     onFallback?: (failed: { provider: string; model: string }, next: { provider: string; model: string } | undefined) => void
     onStarted?: (childSessionId: string) => void
   },
 ): Promise<SpawnOutcome> {
-  const prompt = opts.prompt ?? buildTaskPrompt(opts.run, opts.task, opts.role)
+  const prompt = opts.prompt ?? buildTaskPrompt(opts.run, opts.task, opts.role, { priorNotes: opts.priorNotes, evidence: opts.evidence })
   const chain = opts.candidates.length > 0 ? opts.candidates : [{ provider: '', model: '' }]
   let lastReason = 'no model candidates'
   let lastProvider: string | undefined
@@ -166,6 +206,7 @@ export async function spawnTaskAgent(
         signal: opts.signal,
         ...(agentOptions !== undefined ? { agentOptions } : {}),
         ...(opts.role.persona !== undefined ? { persona: opts.role.persona } : {}),
+        ...(opts.toolFilter !== undefined ? { toolFilter: opts.toolFilter } : {}),
       })
     } catch (err) {
       lastReason = String(err instanceof Error ? err.message : err)

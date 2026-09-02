@@ -6,6 +6,7 @@
 // official Models settings page uses).
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import { SwarmTab } from './SwarmTab'
+import { SwarmSettingsSection } from './SwarmSettingsSection'
 import { SwarmDispatchCard } from './ToolDispatchCard'
 import { setApiGetter } from './catalog'
 import css from './swarm.css'
@@ -47,6 +48,56 @@ export function apply(ctx: ClientContext): (() => void) | void {
       SwarmDispatchCard as never,
     ),
   )
+
+  // B1: a root-scope Settings section — the roster/board stay reachable from
+  // any surface, including the new-session page where chat tabs do not render.
+  ctx.slots.inject('settings.section' as never, () =>
+    ctx.slots.register(
+      { name: 'settings.section', id: 'swarm' } as never,
+      SwarmSettingsSection as never,
+    ),
+  )
+
+  // B4: global run badge — a small fixed overlay fed by the board SSE, so run
+  // activity is visible on every surface, not only inside the Swarm tab.
+  if (typeof document !== 'undefined' && typeof EventSource !== 'undefined') {
+    const badge = document.createElement('div')
+    badge.className = 'dsh-swarm-badge'
+    badge.style.display = 'none'
+    document.body.appendChild(badge)
+    const update = (): void => {
+      void fetch('/swarm/board')
+        .then((r) => r.json() as Promise<{ runs: Array<{ status: string }> }>)
+        .then((board) => {
+          const active = board.runs.filter((r) => r.status === 'running' || r.status === 'planning' || r.status === 'paused')
+          const lastBad = board.runs.find((r) => r.status === 'failed' || r.status === 'paused')
+          badge.textContent = active.length > 0
+            ? `🐝 ${active.length} swarm run${active.length === 1 ? '' : 's'} active`
+            : lastBad !== undefined
+              ? `🐝 last swarm run: ${lastBad.status}`
+              : board.runs.length > 0 ? '🐝 swarm idle' : ''
+          badge.className = lastBad !== undefined && active.length === 0 ? 'dsh-swarm-badge alert' : 'dsh-swarm-badge'
+          badge.style.display = badge.textContent.length === 0 ? 'none' : 'block'
+        })
+        .catch(() => { /* host offline — leave the badge as-is */ })
+    }
+    const source = new EventSource('/swarm/events')
+    source.onmessage = update
+    source.onerror = () => { badge.style.display = 'none' }
+    const poll = setInterval(update, 60000)
+    update()
+    // Teardown: closed when the plugin's style element is removed (apply disposer).
+    const observer = new MutationObserver(() => {
+      if (document.head.querySelector('style[data-dsh-swarm-orchestrator]') === null) {
+        source.close()
+        if (poll !== null) clearInterval(poll)
+        badge.remove()
+        observer.disconnect()
+      }
+    })
+    observer.observe(document.head, { childList: true })
+  }
+
   return () => {
     if (style) style.remove()
   }

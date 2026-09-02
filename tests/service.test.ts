@@ -23,8 +23,13 @@ class FakeSubagents {
   script: Record<number, string> = {}
   /** When true, children stay in-flight until release() (mimics a running agent). */
   holdAll = false
+  /** Throw a quota-class error for this many upcoming calls (A3). */
+  quotaCount = 0
+  /** Throw a provider-class error on the first call only (A6 rotation). */
+  failOnce = false
   private readonly held: Array<() => void> = []
   private n = 0
+  private failedOnce = false
 
   start(_provider: string, request: never): unknown {
     const call = request as unknown as StartCall
@@ -33,6 +38,14 @@ class FakeSubagents {
     if (this.unavailableCount > 0) {
       this.unavailableCount -= 1
       throw new Error('no adapter registered for provider zai')
+    }
+    if (this.quotaCount > 0) {
+      this.quotaCount -= 1
+      throw new Error('provider quota exhausted: insufficient balance')
+    }
+    if (this.failOnce && !this.failedOnce) {
+      this.failedOnce = true
+      throw new Error('boom: stream idle timeout')
     }
     this.n += 1
     const id = `sess-${this.n}`
@@ -421,5 +434,172 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(b.blockedReason).toMatch(/upstream task a did not complete/)
     const run = snap.runs.find((r) => r.id === result.runId)!
     expect(run.report?.byStatus).toEqual({ failed: 1, blocked: 1 })
+  })
+
+  it('auto-pauses on quota exhaustion and resumes keeping completed work', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    fake.quotaCount = 1
+
+    const result = service.dispatch({
+      title: 'quota demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'paused', 5000, 'run pauses on quota')
+    const paused = service.snapshot().runs.find((r) => r.id === result.runId)!
+    expect(paused.pauseReason).toMatch(/quota/)
+
+    service.resumeRun(result.runId)
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes after resume')
+  })
+
+  it('retry prompts carry prior-attempt notes and the resume rule', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    const result = service.dispatch({
+      title: 'resume hints',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    // Simulate a first attempt that heartbeated and then died (event injection).
+    service.events.append('task/started', { runId: result.runId, taskId: 'a', data: { label: 'swarm:a' } })
+    service.events.append('task/heartbeat', { runId: result.runId, taskId: 'a', data: { note: 'did half the research, 12 trials verified' } })
+    service.events.append('task/failed', { runId: result.runId, taskId: 'a', data: { retry: true, reason: 'boom: stream idle timeout' } })
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 5000, 'retry spawned')
+    const prompt = fake.calls[0]?.prompt.map((p) => p.text).join('\n') ?? ''
+    expect(prompt).toContain('Notes from your previous attempt(s)')
+    expect(prompt).toContain('did half the research, 12 trials verified')
+    expect(prompt).toContain('at least every ~10 minutes')
+  })
+
+  it('evidence contract gates completion (missing file fails, passing command closes)', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    // FAIL: the required file does not exist.
+    const bad = service.dispatch({
+      title: 'evidence fail',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { files: ['definitely-missing-evidence.txt'] } }],
+    }, makeDispatcher() as never)
+    service.endorse(bad.runId)
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === bad.runId)?.status === 'failed', 5000, 'run failed on evidence')
+    const a = service.snapshot().tasks.find((t) => t.runId === bad.runId && t.id === 'a')!
+    expect(a.lastNote).toMatch(/evidence contract failed/)
+
+    // PASS: a command-based contract that exits 0 (parentless run, process cwd).
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3' }
+    service.setDutyTable(table, 'test')
+    const good = service.dispatch({
+      title: 'evidence pass',
+      spec: 's',
+      tasks: [{ id: 'b', subject: 'B', description: 'd', role: 'builder', evidence: { commands: ['node -e "process.exit(0)"'] } }],
+    }, undefined)
+    service.endorse(good.runId)
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === good.runId)?.status === 'completed', 5000, 'evidence pass completes')
+  })
+
+  it('human-gated reviews park the task until the dashboard verdict', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    const result = service.dispatch({
+      title: 'human review demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', reviewBy: 'reviewer', reviewGate: 'human' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    // The child finishes instantly; the task parks for a human verdict.
+    await waitFor(() => service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'a')?.humanReview === true, 5000, 'human review parked')
+    expect(service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'a')?.status).toBe('reviewing')
+
+    // Reject sends it back; the rework completes and parks for review again.
+    service.review(result.runId, 'a', 'reject')
+    await waitFor(() => fake.calls.length >= 2, 5000, 'rework after human reject')
+    await waitFor(() => service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'a')?.humanReview === true, 5000, 'parked again after rework')
+
+    // Approve closes it.
+    service.review(result.runId, 'a', 'approve')
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes after human approve')
+  })
+
+  it('A6: repeated failures rotate the model chain even for non-model errors', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    fake.failOnce = true
+
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = {
+      ...table.roles.builder,
+      provider: 'zai', model: 'glm-5.3',
+      fallbacks: [{ provider: 'other', model: 'm2' }],
+    }
+    service.setDutyTable(table, 'test')
+
+    const result = service.dispatch({
+      title: 'rotation demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 2, 5000, 'second attempt spawned')
+    // Attempt 1 failed on glm-5.3 (non-model error); attempt 2 rotates to m2.
+    expect(fake.calls[0]?.agentOptions?.model).toBe('glm-5.3')
+    expect(fake.calls[1]?.agentOptions?.model).toBe('m2')
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes on rotated model')
+  })
+
+  it('rescue path: retry after terminal failure resumes the run, unblocks dependents, and completes', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ maxRetries: 0 })
+    contexts.push(ctx)
+    dirs.push(dir)
+    fake.failOnce = true
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3' }
+    service.setDutyTable(table, 'test')
+
+    const result = service.dispatch({
+      title: 'rescue demo',
+      spec: 's',
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder' },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder', blockedBy: ['a'] },
+      ],
+    }, undefined)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'failed', 5000, 'run failed while broken')
+    expect(service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'b')?.status).toBe('blocked')
+
+    // The fix lands (failOnce consumed) and a human retries the dead task —
+    // the run resumes, the dependent unblocks, and everything completes.
+    service.retryTask(result.runId, 'a')
+    const dumpRescue = (): string => service.events.all()
+      .filter((e) => e.runId === result.runId)
+      .map((e) => `${e.kind}:${e.taskId ?? ''}`)
+      .join(' | ')
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 8000, 'run completes after rescue', dumpRescue)
+    const snap = service.snapshot()
+    expect(snap.tasks.find((t) => t.runId === result.runId && t.id === 'a')?.status).toBe('completed')
+    expect(snap.tasks.find((t) => t.runId === result.runId && t.id === 'b')?.status).toBe('completed')
   })
 })

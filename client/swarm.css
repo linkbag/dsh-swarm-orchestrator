@@ -259,3 +259,41 @@
 .dsh-swarm-tvc-tasks { margin: 6px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; }
 .dsh-swarm-tvc-task { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
 .dsh-swarm-tvc-id { opacity: 0.6; font-family: monospace; font-size: 11.5px; flex: none; }
+.dsh-swarm-tvc-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; }
+.dsh-swarm-tvc-dot.live { animation: dsh-swarm-pulse 1.6s ease-in-out infinite; }
+.dsh-swarm-tvc-actions { display: flex; gap: 8px; margin-top: 8px; }
+@keyframes dsh-swarm-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* ── B1 settings section + B4 global badge ─────────────── */
+.dsh-swarm-settings { padding: 4px 0; }
+.dsh-swarm-settings h3 { margin: 0 0 6px; }
+.dsh-swarm-badge {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  z-index: 9999;
+  font: 12px/1.4 system-ui, sans-serif;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(125, 125, 125, 0.35);
+  background: rgba(20, 22, 26, 0.92);
+  color: #e8e8e8;
+  pointer-events: none;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dsh-swarm-badge.alert { border-color: rgb(219, 88, 96); color: rgb(219, 88, 96); }
+.dsh-swarm-task-note.stale { opacity: 0.35; }
+.dsh-swarm-run-banner {
+  margin: 8px 16px 0;
+  border: 1px solid rgba(227, 148, 36, 0.5);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  color: rgb(227, 148, 36);
+}
