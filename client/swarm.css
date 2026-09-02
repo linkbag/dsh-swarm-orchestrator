@@ -212,6 +212,14 @@
   background: transparent; color: inherit; width: 100%; box-sizing: border-box;
 }
 .dsh-swarm-input:focus { outline: 1px solid rgba(56, 139, 253, 0.6); }
+/* Native dropdown popups render white-on-white in light shells (the popup
+   uses its own UA background while options inherit the theme's light text).
+   Force a dark, readable list for the model pickers. */
+.dsh-swarm-input option,
+.dsh-swarm-input optgroup {
+  background: #14161a;
+  color: #e8e8e8;
+}
 .dsh-swarm-fallbacks { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
 .dsh-swarm-fallbacks li { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
 .dsh-swarm-fallback-actions { display: flex; gap: 2px; }
