@@ -15,6 +15,7 @@ export interface SwarmConfig {
   staleTimeoutSeconds: number
   maxRetries: number
   reviewLoops: number
+  requireManualEndorsement: boolean
 }
 
 export const Config = Schema.object({
@@ -32,5 +33,10 @@ export const Config = Schema.object({
   ),
   reviewLoops: Schema.number().default(3).min(0).max(5).description(
     'Maximum reviewer fix loops per task before review gives up and blocks.',
+  ),
+  requireManualEndorsement: Schema.boolean().default(false).description(
+    'Hard endorsement gate: every run waits for a human Endorse on the Swarm dashboard, '
+    + 'even when swarm_dispatch is called with endorse=true. Set true to make the gate '
+    + 'impossible to bypass from chat.',
   ),
 })

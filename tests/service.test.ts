@@ -122,7 +122,7 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, what: string
   throw new Error(`timed out waiting for: ${what}`)
 }
 
-async function bootSwarm(): Promise<{ ctx: Context; service: SwarmService; fake: FakeSubagents; dir: string }> {
+async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx: Context; service: SwarmService; fake: FakeSubagents; dir: string }> {
   const dir = mkdtempSync(join(tmpdir(), 'swarm-service-'))
   const ctx = new Context()
   const fake = new FakeSubagents()
@@ -133,6 +133,7 @@ async function bootSwarm(): Promise<{ ctx: Context; service: SwarmService; fake:
     staleTimeoutSeconds: 14400,
     maxRetries: 2,
     reviewLoops: 3,
+    ...overrides,
   })
   // ctx.get returns a traceable proxy; unwrap to the raw service via symbols.original
   const traced = ctx.get('swarm') as Record<symbol, unknown> | undefined
@@ -367,6 +368,29 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(agents.created.length).toBe(1)
     expect(agents.created[0]?.agentPreset).toBeUndefined()
     expect(fake.calls[0]?.parent).toBe(agents.anchors[0])
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completion')
+  })
+
+  it('requireManualEndorsement hard-gates even endorse=true dispatches', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ requireManualEndorsement: true })
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    const result = service.dispatch({
+      title: 'hard gate demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+      endorse: true,
+    }, makeDispatcher() as never)
+
+    // endorse=true was swallowed by the hard gate: planning, zero spawns.
+    expect(result.status).toBe('planning')
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    expect(fake.calls.length).toBe(0)
+
+    // Only the human dashboard action releases the gate.
+    service.endorse(result.runId)
+    await waitFor(() => fake.calls.length >= 1, 5000, 'spawn after manual endorsement')
     await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completion')
   })
 

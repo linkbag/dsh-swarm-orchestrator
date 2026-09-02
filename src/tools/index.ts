@@ -38,6 +38,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     name: 'swarm_dispatch',
     description:
       'Submit a swarm run: a task DAG executed by parallel role agents (models come from the swarm duty table; check the Swarm dashboard tab). '
+      + 'Use ONLY when the human explicitly asks for a swarm / multi-agent run — never as a default way to work a task. '
       + 'Returns the run id; tasks dispatch once the run is endorsed (the human endorses on the dashboard, or pass endorse=true ONLY when the human already approved spawning).',
     parameters: {
       title: { type: 'string', required: true, description: 'Run title shown on the dashboard' },
@@ -66,7 +67,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
       )
       const status = result.status === 'running'
         ? 'endorsed — dispatching now'
-        : 'awaiting human endorsement on the Swarm dashboard (or re-dispatch with endorse=true once approved)'
+        : 'awaiting human endorsement on the Swarm dashboard'
       return `Run ${result.runId} created with ${result.taskCount} tasks — ${status}. Track with swarm_status or the Swarm tab.`
     },
   })))

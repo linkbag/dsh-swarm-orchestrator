@@ -187,7 +187,7 @@ export class SwarmService extends Service {
       },
     })
     if (parent !== undefined) this.runParents.set(runId, parent)
-    if (input.endorse === true) {
+    if (input.endorse === true && this.swarmConfig.requireManualEndorsement !== true) {
       this.events.append('run/endorsed', { runId })
     }
     this.scheduleTick()
