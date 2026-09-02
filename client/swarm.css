@@ -241,3 +241,21 @@
 .dsh-swarm-report li { line-height: 1.4; }
 .dsh-swarm-report em { opacity: 0.7; font-style: normal; }
 .dsh-swarm-report strong { color: rgb(219, 88, 96); }
+
+/* ── chat toolview card (swarm_dispatch) ───────────────── */
+.dsh-swarm-tvc {
+  margin: 2px 0;
+  border: 1px solid rgba(125, 125, 125, 0.25);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12.5px;
+  max-width: 560px;
+}
+.dsh-swarm-tvc-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dsh-swarm-tvc-title { font-weight: 600; }
+.dsh-swarm-tvc-meta { opacity: 0.6; font-size: 11px; margin-top: 4px; }
+.dsh-swarm-tvc-runid { font-family: monospace; font-size: 11.5px; color: rgb(46, 160, 67); opacity: 1; }
+.dsh-swarm-tvc-error { color: rgb(219, 88, 96); font-size: 12px; margin-top: 4px; white-space: pre-wrap; }
+.dsh-swarm-tvc-tasks { margin: 6px 0 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; }
+.dsh-swarm-tvc-task { display: flex; gap: 6px; align-items: baseline; min-width: 0; }
+.dsh-swarm-tvc-id { opacity: 0.6; font-family: monospace; font-size: 11.5px; flex: none; }

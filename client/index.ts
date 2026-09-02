@@ -6,6 +6,7 @@
 // official Models settings page uses).
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import { SwarmTab } from './SwarmTab'
+import { SwarmDispatchCard } from './ToolDispatchCard'
 import { setApiGetter } from './catalog'
 import css from './swarm.css'
 
@@ -35,6 +36,15 @@ export function apply(ctx: ClientContext): (() => void) | void {
     ctx.slots.register(
       { name: 'conversation.view', id: 'swarm', order: 20, label: 'Swarm' } as never,
       SwarmTab as never,
+    ),
+  )
+  // Keyed toolview: swarm_dispatch calls render as a run card in chat
+  // (title, task DAG, endorsement state, run id) instead of the generic
+  // JSON row — the same per-tool seat ui-skill uses for `skill`.
+  ctx.slots.inject('tool.call.toolview' as never, () =>
+    ctx.slots.register(
+      { name: 'tool.call.toolview', key: 'swarm_dispatch' } as never,
+      SwarmDispatchCard as never,
     ),
   )
   return () => {
