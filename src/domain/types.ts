@@ -36,7 +36,7 @@ export interface DutyTable {
   roles: Record<RoleId, RoleConfig>
 }
 
-export type RunStatus = 'planning' | 'awaiting-endorsement' | 'running' | 'completed' | 'aborted'
+export type RunStatus = 'planning' | 'awaiting-endorsement' | 'running' | 'completed' | 'failed' | 'aborted'
 export type TaskStatus =
   | 'pending' | 'ready' | 'dispatching' | 'running' | 'reviewing'
   | 'retrying' | 'completed' | 'failed' | 'blocked'
@@ -79,6 +79,18 @@ export interface RunReport {
   tasks: Array<{ id: string; role: RoleId; model?: string; status: TaskStatus; reviewed?: boolean; summary?: string }>
 }
 
+/**
+ * Dispatch context captured from the dispatching agent while it is alive, so
+ * the run can spawn task agents after that session is gone (anchor agents
+ * join this preset and route; unpinned duty roles inherit this model).
+ */
+export interface RunDispatchContext {
+  presetId?: string
+  provider?: string
+  model?: string
+  cwd?: string
+}
+
 export interface Run {
   id: string
   title: string
@@ -90,6 +102,7 @@ export interface Run {
   completedAt?: number
   taskIds: string[]
   report?: RunReport
+  dispatch?: RunDispatchContext
   /** Live counters folded from task events. */
   stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number }
 }
@@ -110,6 +123,7 @@ export type SwarmEventKind =
   | 'run/endorsed'
   | 'run/started'
   | 'run/completed'
+  | 'run/failed'
   | 'run/aborted'
   | 'task/started'
   | 'task/agent-started'

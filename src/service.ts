@@ -14,7 +14,7 @@ import { fold, isReady, newState, runningCount, taskKeyOf, type SwarmState } fro
 import type { BoardSnapshot } from './board.js'
 import { buildBoardSnapshot } from './board.js'
 import { spawnTaskAgent, buildReviewPrompt, parseVerdict, type SpawnDeps } from './dispatch/spawn.js'
-import type { DispatchInput, DispatchResult, DutyTable, RoleConfig, Task, TaskSpec } from './domain/types.js'
+import type { DispatchInput, DispatchResult, DutyTable, RoleConfig, Run, Task, TaskSpec } from './domain/types.js'
 
 interface InFlight {
   controller: AbortController
@@ -26,8 +26,47 @@ interface InFlight {
 interface AgentsLike {
   create(options: {
     sessionId: SessionId
-    meta?: { cwd?: string; delegationDepth?: number }
+    meta?: { cwd?: string; delegationDepth?: number; agentPreset?: string }
+    agentOptions?: { provider?: string; model?: string }
+    setup?: (anchorCtx: unknown) => void | Promise<void>
   }): Promise<{ agent: Agent; dispose(): Promise<void> }>
+}
+
+/** Structural view of the agentPresets service for anchor composition. */
+interface PresetsLike {
+  mount(anchorCtx: unknown, id?: string): Promise<unknown>
+}
+
+/**
+ * Capture the dispatching agent's world as plain JSON while it is alive:
+ * its preset, model route, and workspace — everything later spawns need once
+ * the dispatching session is gone. Reads are defensive: a dispatcher whose
+ * fiber already went inactive still answers plain scope-chain reads, and any
+ * failure just drops that field.
+ */
+function captureDispatchContext(parent: Agent | undefined): Partial<Run['dispatch']> {
+  if (parent === undefined) return {}
+  const captured: Partial<Run['dispatch']> = {}
+  try {
+    const options = (parent as { options?: { provider?: string; model?: string } }).options
+    if (typeof options?.provider === 'string' && typeof options.model === 'string'
+      && options.provider.length > 0 && options.model.length > 0) {
+      captured.provider = options.provider
+      captured.model = options.model
+    }
+  } catch { /* route unreadable — leave unset */ }
+  try {
+    const header = (parent as { session?: { header?: { cwd?: string } } }).session?.header
+    if (typeof header?.cwd === 'string' && header.cwd.length > 0) captured.cwd = header.cwd
+  } catch { /* cwd unreadable — leave unset */ }
+  try {
+    const presets = (parent as { ctx?: { get(name: string): unknown } }).ctx?.get('agentPresets') as
+      | { composedPreset(agentCtx: unknown): string | undefined }
+      | undefined
+    const presetId = presets?.composedPreset?.((parent as { ctx?: unknown }).ctx)
+    if (typeof presetId === 'string' && presetId.length > 0) captured.presetId = presetId
+  } catch { /* preset unreadable — leave unset */ }
+  return captured
 }
 
 /**
@@ -140,7 +179,12 @@ export class SwarmService extends Service {
     const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
     this.events.append('run/created', {
       runId,
-      data: { title: input.title, spec: input.spec, tasks },
+      data: {
+        title: input.title,
+        spec: input.spec,
+        tasks,
+        dispatch: captureDispatchContext(parent),
+      },
     })
     if (parent !== undefined) this.runParents.set(runId, parent)
     if (input.endorse === true) {
@@ -226,24 +270,39 @@ export class SwarmService extends Service {
    * subagent callers) or the session closes, every later spawn of the run dies
    * with "cannot create effect on inactive context". A run must outlive its
    * dispatcher, so each run gets a service-owned idle ANCHOR agent created on
-   * first launch — its cwd is captured from the dispatcher's session while the
-   * dispatcher is still alive, and its scope chain is the deployment default
-   * composition, so task agents never depend on the dispatching session's
-   * ad-hoc grants. Hosts without an agents factory (unit tests) fall back to
-   * the dispatching agent.
+   * first launch.
+   *
+   * The anchor joins the dispatch context captured at dispatch() — the
+   * dispatcher's preset (falling back to the deployment default preset) and
+   * model route — because a bare factory agent joins NO preset, and in a
+   * rostered deployment its children then fail prompt assembly ("addressed a
+   * model without joining any agent preset") and inherit no model route. The
+   * durable meta records the same preset so a cold resume rebuilds the same
+   * world. Hosts without an agents factory (unit tests) fall back to the
+   * dispatching agent.
    */
   private async ensureAnchor(runId: string): Promise<Agent | undefined> {
     const existing = this.runAnchors.get(runId)
     if (existing !== undefined) return existing.agent
     const agents = this.ctx.get('agents') as AgentsLike | undefined
-    const dispatcher = this.runParents.get(runId)
-    if (agents === undefined) return dispatcher
-    const header = dispatcher?.session?.header
+    if (agents === undefined) return this.runParents.get(runId)
+    const captured = this.view().runs.get(runId)?.dispatch
     const handle = await agents.create({
       sessionId: SessionId(randomUUID()),
       meta: {
-        ...(header?.cwd !== undefined ? { cwd: header.cwd } : {}),
+        ...(captured?.cwd !== undefined ? { cwd: captured.cwd } : {}),
         delegationDepth: 0,
+        ...(captured?.presetId !== undefined ? { agentPreset: captured.presetId } : {}),
+      },
+      ...(captured?.provider !== undefined && captured.model !== undefined
+        ? { agentOptions: { provider: captured.provider, model: captured.model } }
+        : {}),
+      setup: async (anchorCtx) => {
+        const presets = (anchorCtx as { get(name: string): unknown }).get('agentPresets') as PresetsLike | undefined
+        if (presets !== undefined) {
+          // undefined id = the deployment default preset (recovered runs).
+          await presets.mount(anchorCtx, captured?.presetId)
+        }
       },
     })
     // The run may have gone terminal (abort) while the factory was creating.
@@ -254,6 +313,28 @@ export class SwarmService extends Service {
     this.runAnchors.set(runId, handle)
     this.ctx.logger('swarm').info('run %s anchored to idle agent %s', runId, String(handle.agent.id))
     return handle.agent
+  }
+
+  /**
+   * Model candidate chain for a role, with the run's captured route filling
+   * every "inherit the default" (empty) entry. Undefined when no route at all
+   * is resolvable — the caller then fails the task with an actionable reason.
+   */
+  private resolveCandidates(run: Run, roleId: string): Array<{ provider: string; model: string }> | undefined {
+    const fallback = run.dispatch?.provider !== undefined && run.dispatch?.model !== undefined
+      ? { provider: run.dispatch.provider, model: run.dispatch.model }
+      : undefined
+    const chain = this.duty.resolveChain(roleId).map((candidate) =>
+      (candidate.provider.length === 0 || candidate.model.length === 0) && fallback !== undefined
+        ? fallback
+        : candidate,
+    )
+    // An unpinned role resolves to an EMPTY chain ("inherit the deployment
+    // default") — with a captured run route that default is the route.
+    if (chain.length === 0 && fallback !== undefined) return [fallback]
+    const first = chain[0]
+    if (first === undefined || first.provider.length === 0 || first.model.length === 0) return undefined
+    return chain
   }
 
   /** Dispose a run's anchor once the run reaches a terminal status. */
@@ -287,6 +368,22 @@ export class SwarmService extends Service {
       const tasks = run.taskIds
         .map((id) => state.tasks.get(`${run.id}/${id}`))
         .filter((t): t is Task => t !== undefined)
+      // Cascade: a task whose blocker terminally failed/blocked can never
+      // become ready — block it now so the run can reach a terminal status
+      // instead of hanging in 'running' with a pending task forever.
+      for (const task of tasks) {
+        if (task.status !== 'pending' && task.status !== 'retrying') continue
+        const dead = (task.blockedBy ?? []).find((blocker) => {
+          const status = state.tasks.get(`${run.id}/${blocker}`)?.status
+          return status === 'failed' || status === 'blocked'
+        })
+        if (dead !== undefined) {
+          this.events.append('task/blocked', {
+            runId: run.id, taskId: task.id,
+            data: { reason: `upstream task ${dead} did not complete` },
+          })
+        }
+      }
       let capacity = this.swarmConfig.maxConcurrent - runningCount(state, run.id)
       for (const task of tasks) {
         if (capacity <= 0) break
@@ -307,7 +404,18 @@ export class SwarmService extends Service {
       this.events.append('task/blocked', { runId, taskId: task.id, data: { reason: 'run context unavailable' } })
       return
     }
-    const candidates = this.duty.resolveChain(task.role)
+    const candidates = this.resolveCandidates(run, task.role)
+    if (candidates === undefined) {
+      // No route and nothing to inherit — retrying cannot fix this.
+      this.events.append('task/failed', {
+        runId, taskId: task.id,
+        data: {
+          retry: false,
+          reason: `no model route for role "${task.role}": pin a provider/model in the Swarm Roster, or dispatch from a session with a configured model`,
+        },
+      })
+      return
+    }
     const controller = new AbortController()
     const key = taskKeyOf(task)
     this.inFlight.set(key, { controller, taskKey: key })
@@ -393,7 +501,16 @@ export class SwarmService extends Service {
       this.checkRunCompletion(runId)
       return
     }
-    const candidates = this.duty.resolveChain(reviewerRoleId)
+    const candidates = this.resolveCandidates(run, reviewerRoleId)
+    if (candidates === undefined) {
+      // No reviewer route — fail-open per the review contract.
+      this.events.append('task/reviewed', {
+        runId, taskId,
+        data: { verdict: 'error', feedback: `no model route for reviewer role "${reviewerRoleId}": pin a provider/model in the Swarm Roster` },
+      })
+      this.checkRunCompletion(runId)
+      return
+    }
     const controller = new AbortController()
     this.inFlight.set(key, { controller, taskKey: key })
     // task/review-started must land in the SAME synchronous block as the
@@ -467,10 +584,17 @@ export class SwarmService extends Service {
     const run = state.runs.get(runId)
     if (run === undefined || run.status !== 'running') return
     const tasks = run.taskIds.map((id) => state.tasks.get(`${runId}/${id}`)).filter((t): t is Task => t !== undefined)
-    if (tasks.length === 0 || !tasks.every((t) => t.status === 'completed')) return
+    if (tasks.length === 0) return
+    // A run ends when every task is terminal. All completed → 'completed';
+    // any terminally failed/blocked (after retries and the upstream cascade)
+    // → 'failed' with the same report shape. Runs no longer hang in 'running'
+    // forever behind a task that can never succeed.
+    const terminal = ['completed', 'failed', 'blocked'] as const
+    if (!tasks.every((t) => (terminal as readonly string[]).includes(t.status))) return
+    const succeeded = tasks.every((t) => t.status === 'completed')
     const byStatus: Record<string, number> = {}
     for (const task of tasks) byStatus[task.status] = (byStatus[task.status] ?? 0) + 1
-    this.events.append('run/completed', {
+    this.events.append(succeeded ? 'run/completed' : 'run/failed', {
       runId,
       data: {
         report: {

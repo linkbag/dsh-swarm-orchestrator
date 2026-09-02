@@ -14,29 +14,6 @@ interface StartCall {
   parent?: unknown
 }
 
-/** Fake agents factory: mints service-owned idle anchor agents. */
-class FakeAgents {
-  readonly created: Array<{ sessionId: string; cwd?: string }> = []
-  readonly anchors: unknown[] = []
-  disposeCount = 0
-  private n = 0
-
-  create(options: { sessionId: string; meta?: { cwd?: string } }): Promise<{ agent: unknown; dispose(): Promise<void> }> {
-    this.created.push({ sessionId: options.sessionId, cwd: options.meta?.cwd })
-    this.n += 1
-    const agent = {
-      id: `anchor-${this.n}`,
-      options: {},
-      session: { header: { id: `anchor-${this.n}`, delegationDepth: 0 } },
-    }
-    this.anchors.push(agent)
-    return Promise.resolve({
-      agent,
-      dispose: async () => { this.disposeCount += 1 },
-    })
-  }
-}
-
 /** Fake spawn-provider subagents service with scriptable outcomes. */
 class FakeSubagents {
   readonly calls: StartCall[] = []
@@ -77,6 +54,61 @@ class FakeSubagents {
   /** Resolve all held children. */
   release(): void {
     this.held.splice(0).forEach((fn) => { fn() })
+  }
+}
+
+/** Fake agents factory: mints service-owned idle anchor agents. */
+class FakeAgents {
+  readonly created: Array<{ sessionId: string; cwd?: string; agentPreset?: string; agentOptions?: { provider?: string; model?: string } }> = []
+  readonly anchors: unknown[] = []
+  setupCalls = 0
+  disposeCount = 0
+  private n = 0
+
+  create(options: {
+    sessionId: string
+    meta?: { cwd?: string; agentPreset?: string }
+    agentOptions?: { provider?: string; model?: string }
+    setup?: (anchorCtx: unknown) => void | Promise<void>
+  }): Promise<{ agent: unknown; dispose(): Promise<void> }> {
+    this.created.push({
+      sessionId: options.sessionId,
+      cwd: options.meta?.cwd,
+      agentPreset: options.meta?.agentPreset,
+      agentOptions: options.agentOptions,
+    })
+    this.n += 1
+    const agent = {
+      id: `anchor-${this.n}`,
+      options: { ...options.agentOptions },
+      session: { header: { id: `anchor-${this.n}`, delegationDepth: 0 } },
+    }
+    this.anchors.push(agent)
+    // The real factory awaits setup inside the creation window; mirror that
+    // with a context whose agentPresets is absent (no roster in unit tests).
+    const setupPromise = (async () => {
+      if (options.setup !== undefined) {
+        this.setupCalls += 1
+        await options.setup({ get: () => undefined })
+      }
+    })()
+    return setupPromise.then(() => ({
+      agent,
+      dispose: async () => { this.disposeCount += 1 },
+    }))
+  }
+}
+
+/** Fake dispatching agent: carries a route, session cwd, and a composed preset. */
+function makeDispatcher(): unknown {
+  return {
+    id: 'parent-1',
+    options: { provider: 'zai', model: 'glm-5.3' },
+    session: { header: { id: 'parent-1', cwd: 'D:\\work' } },
+    ctx: {
+      get: (name: string): unknown =>
+        name === 'agentPresets' ? { composedPreset: () => 'standard' } : undefined,
+    },
   }
 }
 
@@ -129,7 +161,7 @@ describe('swarm service (integration, fake subagents)', () => {
     table.roles.reviewer = { ...table.roles.reviewer, provider: 'deepseek-official', model: 'deepseek-v4' }
     service.setDutyTable(table, 'test')
 
-    const parent = { id: 'parent-1' } as never
+    const parent = makeDispatcher() as never
     const result = service.dispatch({
       title: 'demo run',
       spec: 'make a tiny feature',
@@ -184,7 +216,7 @@ describe('swarm service (integration, fake subagents)', () => {
       title: 'fallback demo',
       spec: 's',
       tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
-    }, { id: 'parent-1' } as never)
+    }, makeDispatcher() as never)
     service.endorse(result.runId)
 
     await waitFor(() => fake.calls.length >= 2, 3000, 'fallback spawn')
@@ -214,7 +246,7 @@ describe('swarm service (integration, fake subagents)', () => {
       title: 'review loop demo',
       spec: 's',
       tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', reviewBy: 'reviewer' }],
-    }, { id: 'parent-1' } as never)
+    }, makeDispatcher() as never)
     service.endorse(result.runId)
 
     // reviewer spawns, rejects, the task requeues and the rework spawn carries the feedback
@@ -243,7 +275,7 @@ describe('swarm service (integration, fake subagents)', () => {
       title: 'report demo',
       spec: 's',
       tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
-    }, { id: 'parent-1' } as never)
+    }, makeDispatcher() as never)
     service.endorse(result.runId)
 
     await waitFor(() => service.events.all().some((e) => e.kind === 'task/agent-started'), 3000, 'agent-started event')
@@ -268,7 +300,7 @@ describe('swarm service (integration, fake subagents)', () => {
         { id: 'a', subject: 'A', description: 'd', role: 'builder' },
         { id: 'b', subject: 'B', description: 'd', role: 'builder' },
       ],
-    }, { id: 'parent-1' } as never)
+    }, makeDispatcher() as never)
     service.endorse(result.runId)
     await waitFor(() => fake.calls.length >= 1, 3000, 'spawn before abort')
     service.abort(result.runId)
@@ -283,11 +315,6 @@ describe('swarm service (integration, fake subagents)', () => {
     const agents = new FakeAgents()
     ctx.reflect.provide('agents', agents as never)
 
-    // The dispatcher carries a session header whose cwd the anchor must capture.
-    const dispatcher = {
-      id: 'parent-1',
-      session: { header: { id: 'parent-1', cwd: 'D:\\work' } },
-    } as never
     const result = service.dispatch({
       title: 'anchor demo',
       spec: 's',
@@ -295,15 +322,22 @@ describe('swarm service (integration, fake subagents)', () => {
         { id: 'a', subject: 'A', description: 'd', role: 'builder' },
         { id: 'b', subject: 'B', description: 'd', role: 'builder', blockedBy: ['a'] },
       ],
-    }, dispatcher)
+    }, makeDispatcher() as never)
     service.endorse(result.runId)
 
     await waitFor(() => fake.calls.length >= 2, 5000, 'both tasks spawned')
-    // One anchor per run, cwd captured from the dispatcher, every spawn routed through it.
+    // One anchor per run, composed from the dispatcher's captured world:
+    // its cwd, its preset, and its model route (duty roles are unpinned, so
+    // children inherit the run default through both the anchor and the
+    // explicit agentOptions), and every spawn routed through it.
     expect(agents.created.length).toBe(1)
     expect(agents.created[0]?.cwd).toBe('D:\\work')
+    expect(agents.created[0]?.agentPreset).toBe('standard')
+    expect(agents.created[0]?.agentOptions).toEqual({ provider: 'zai', model: 'glm-5.3' })
+    expect(agents.setupCalls).toBe(1)
     expect(fake.calls[0]?.parent).toBe(agents.anchors[0])
     expect(fake.calls[1]?.parent).toBe(agents.anchors[0])
+    expect(fake.calls[0]?.agentOptions).toEqual({ provider: 'zai', model: 'glm-5.3' })
 
     await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completion')
     // Terminal run releases its anchor.
@@ -317,6 +351,10 @@ describe('swarm service (integration, fake subagents)', () => {
 
     const agents = new FakeAgents()
     ctx.reflect.provide('agents', agents as never)
+    // No dispatcher to inherit from: pin an explicit model so the run is routable.
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3' }
+    service.setDutyTable(table, 'test')
 
     const result = service.dispatch({
       title: 'recovery demo',
@@ -327,7 +365,37 @@ describe('swarm service (integration, fake subagents)', () => {
 
     await waitFor(() => fake.calls.length >= 1, 5000, 'spawn without a dispatching parent')
     expect(agents.created.length).toBe(1)
+    expect(agents.created[0]?.agentPreset).toBeUndefined()
     expect(fake.calls[0]?.parent).toBe(agents.anchors[0])
     await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completion')
+  })
+
+  it('an unroutable run fails its tasks with an actionable reason, cascades to dependents, and ends failed', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    void fake
+
+    // No dispatcher, no pinned models: nothing can route.
+    const result = service.dispatch({
+      title: 'no route demo',
+      spec: 's',
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder' },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder', blockedBy: ['a'] },
+      ],
+    }, undefined)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'failed', 5000, 'run fails terminally')
+    const snap = service.snapshot()
+    const a = snap.tasks.find((t) => t.id === 'a')!
+    const b = snap.tasks.find((t) => t.id === 'b')!
+    expect(a.status).toBe('failed')
+    expect(a.lastNote).toMatch(/no model route for role "builder"/)
+    expect(b.status).toBe('blocked')
+    expect(b.blockedReason).toMatch(/upstream task a did not complete/)
+    const run = snap.runs.find((r) => r.id === result.runId)!
+    expect(run.report?.byStatus).toEqual({ failed: 1, blocked: 1 })
   })
 })

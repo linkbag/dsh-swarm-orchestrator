@@ -61,6 +61,15 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       taskIds: [],
       stats: { fallbacks: 0, retries: 0, reviewsPassed: 0, reviewsRejected: 0 },
     }
+    const dispatch = d.dispatch as Record<string, unknown> | undefined
+    if (dispatch !== null && typeof dispatch === 'object') {
+      const captured: Run['dispatch'] = {}
+      if (typeof dispatch.presetId === 'string') captured.presetId = dispatch.presetId
+      if (typeof dispatch.provider === 'string') captured.provider = dispatch.provider
+      if (typeof dispatch.model === 'string') captured.model = dispatch.model
+      if (typeof dispatch.cwd === 'string') captured.cwd = dispatch.cwd
+      run.dispatch = captured
+    }
     state.runs.set(runId, run)
     const specs = Array.isArray(d.tasks) ? (d.tasks as Record<string, unknown>[]) : []
     for (const spec of specs) {
@@ -98,6 +107,10 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       if (run.status !== 'completed' && run.status !== 'aborted') run.status = 'running'
     } else if (kind === 'run/completed') {
       run.status = 'completed'
+      run.completedAt = event.at
+      if (d.report !== null && typeof d.report === 'object') run.report = d.report as Run['report']
+    } else if (kind === 'run/failed') {
+      run.status = 'failed'
       run.completedAt = event.at
       if (d.report !== null && typeof d.report === 'object') run.report = d.report as Run['report']
     } else if (kind === 'run/aborted') {
