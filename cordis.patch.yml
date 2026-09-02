@@ -1,0 +1,21 @@
+# dsh-swarm-orchestrator bundle patch: the host swarm service row.
+# Applied by the Loader when a profile lists this bundle.
+#
+# The `swarm` row mounts the node half (src/index.ts apply) with its config.
+# The browser half is auto-discovered: this package declares
+# `dsh.client.platform: web` (package.json), so the client-modules node half
+# composes it into window.__DSH_BOOT__ and serves /plugins/<id>/client.js from
+# the package's ./client export (the built lib/client.js bundle).
+#
+# NOTE: `!!js dshHomePath(...)` must stay UNQUOTED — quoting it degrades the
+# expression to a literal string (known footgun from the dsh-swarm project).
+
+- insert:
+    - id: swarm
+      name: dsh-swarm-orchestrator
+      config:
+        storageDir: !!js dshHomePath("storages/swarm")
+        maxConcurrent: 5
+        staleTimeoutSeconds: 14400
+        maxRetries: 2
+        reviewLoops: 3

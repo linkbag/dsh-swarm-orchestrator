@@ -1,0 +1,8 @@
+{
+  "$comment": "Screenshot manifest for the DSH plugin marketplace listing. Capture after live verification, then reference from the registry PR.",
+  "screenshots": [
+    { "path": "docs/screenshots/board.png", "caption": "Swarm board: run list, task columns, drawer" },
+    { "path": "docs/screenshots/roster.png", "caption": "Roster: per-role model pickers from the live catalog" },
+    { "path": "docs/screenshots/report.png", "caption": "Completed run with its report" }
+  ]
+}
