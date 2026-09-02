@@ -15,11 +15,26 @@ const taskItemSchema = {
   },
 }
 
-/** Register the three model-facing swarm tools into the global tools layer. */
+/** The tool registry surface this module uses; mirrors WebServerLike in routes.ts. */
+interface ToolsLike {
+  register(definition: unknown): () => void
+}
+
+/**
+ * Register the three model-facing swarm tools into the global tools layer.
+ *
+ * Resolves the registry with ctx.get('tools') rather than the ctx.tools
+ * property: this plugin declares no `inject` for its optional services, and
+ * cordis throws "cannot get property ... without inject" on property access
+ * alone. ctx.get() is the un-guarded lookup, same as registerSwarmRoutes does
+ * for webServer.
+ */
 export function registerSwarmTools(ctx: Context, service: SwarmService): () => void {
+  const tools = ctx.get('tools') as unknown as ToolsLike | undefined
+  if (tools === undefined) return () => {}
   const disposers: Array<() => void> = []
 
-  disposers.push(ctx.tools.register(defineTool({
+  disposers.push(tools.register(defineTool({
     name: 'swarm_dispatch',
     description:
       'Submit a swarm run: a task DAG executed by parallel role agents (models come from the swarm duty table; check the Swarm dashboard tab). '
@@ -56,7 +71,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     },
   })))
 
-  disposers.push(ctx.tools.register(defineTool({
+  disposers.push(tools.register(defineTool({
     name: 'swarm_status',
     description: 'Report the current swarm board: runs, task states, models in use, and the latest per-task notes.',
     parameters: {
@@ -70,7 +85,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     execute: async (args) => service.statusText(args.runId),
   })))
 
-  disposers.push(ctx.tools.register(defineTool({
+  disposers.push(tools.register(defineTool({
     name: 'swarm_report',
     description:
       'Post an interim progress note from a swarm task agent to the dashboard (one line: what you are doing or just finished). '

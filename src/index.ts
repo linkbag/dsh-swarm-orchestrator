@@ -12,6 +12,8 @@ export { Config, PLUGIN_VERSION }
  * yet at apply time (cordis injection order). Poll ctx.get until it appears,
  * then run the wiring once; the fn may return its own disposer, which the
  * outer disposer chains. Effect-scoped: all timers clean up on unload.
+ * The wiring call is guarded: a wiring failure logs and degrades — it must
+ * never throw out of a timer callback (that would kill the whole process).
  */
 function wireWhenAvailable(
   ctx: Context,
@@ -19,10 +21,19 @@ function wireWhenAvailable(
   fn: () => (() => void) | void,
   timeoutMs = 60000,
 ): () => void {
+  const logger = ctx.logger('swarm')
+  const guarded = (): (() => void) | void => {
+    try {
+      return fn()
+    } catch (err) {
+      logger.error('wiring %s failed (degraded until next reload): %s', serviceName, String(err))
+      return undefined
+    }
+  }
   let inner: (() => void) | void
   let settled = false
   if (ctx.get(serviceName) !== undefined) {
-    inner = fn()
+    inner = guarded()
     settled = true
     return () => { if (inner !== undefined) inner() }
   }
@@ -30,7 +41,7 @@ function wireWhenAvailable(
     if (ctx.get(serviceName) !== undefined) {
       clearInterval(timer)
       clearTimeout(to)
-      inner = fn()
+      inner = guarded()
       settled = true
     }
   }, 500)
@@ -43,8 +54,16 @@ function wireWhenAvailable(
 }
 
 export function apply(ctx: Context, config: SwarmConfig) {
-  // cordis 4: the Service constructor registers itself under 'swarm'.
-  const service = new SwarmService(ctx, config)
+  const logger = ctx.logger('swarm')
+  // A swarm startup failure (e.g. unwritable storage dir) must degrade this
+  // plugin only — never abort the whole loader tree and kill the host boot.
+  let service: SwarmService
+  try {
+    service = new SwarmService(ctx, config)
+  } catch (err) {
+    logger.error('swarm service failed to start (plugin disabled this session): %s', String(err))
+    return
+  }
 
   // Per-role reasoning effort: AgentOptions has no effort field, so pin it
   // per LLM request through the agent/request waterfall, scoped to tracked

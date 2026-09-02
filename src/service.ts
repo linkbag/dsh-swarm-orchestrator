@@ -262,15 +262,17 @@ export class SwarmService extends Service {
       },
     })
 
-    const deps: SpawnDeps = {
-      start: (request) => this.ctx.subagents.start('spawn', request as never) as never,
-    }
+    const deps = this.spawnDeps()
     void spawnTaskAgent(deps, {
       parent, run, task, role, candidates, signal: controller.signal,
-      onFallback: (candidate) => {
+      onFallback: (failed, next) => {
         this.events.append('task/model-fallback', {
           runId, taskId: task.id,
-          data: { from: `${candidate.provider}/${candidate.model}`, reason: 'unavailable' },
+          data: {
+            from: `${failed.provider}/${failed.model}`,
+            ...(next !== undefined ? { provider: next.provider, model: next.model } : {}),
+            reason: 'unavailable',
+          },
         })
       },
       onStarted: (childSessionId) => {
@@ -326,20 +328,22 @@ export class SwarmService extends Service {
     this.inFlight.set(key, { controller, taskKey: key })
     this.events.append('task/review-started', { runId, taskId, data: { reviewer: reviewerRoleId } })
 
-    const deps: SpawnDeps = {
-      start: (request) => this.ctx.subagents.start('spawn', request as never) as never,
-    }
+    const deps = this.spawnDeps()
     const task = this.view().tasks.get(key)
     if (task === undefined) { this.inFlight.delete(key); return }
-    const prompt = buildReviewPrompt(run, task, reviewerRole)
     let outcome
     try {
       outcome = await spawnTaskAgent(deps, {
         parent, run, task, role: reviewerRole, candidates, signal: controller.signal,
-        onFallback: (candidate) => {
+        prompt: buildReviewPrompt(run, task, reviewerRole),
+        onFallback: (failed, next) => {
           this.events.append('task/model-fallback', {
             runId, taskId,
-            data: { from: `${candidate.provider}/${candidate.model}`, reason: 'unavailable' },
+            data: {
+              from: `${failed.provider}/${failed.model}`,
+              ...(next !== undefined ? { provider: next.provider, model: next.model } : {}),
+              reason: 'unavailable',
+            },
           })
         },
         onStarted: (childSessionId) => {
@@ -430,5 +434,21 @@ export class SwarmService extends Service {
   /** Per-request reasoning effort for a tracked child (undefined = leave untouched). */
   effortFor(agentId: string): string | undefined {
     return this.sessionTasks.get(agentId)?.effort
+  }
+
+  /**
+   * Spawn-provider deps resolved with ctx.get(): cordis throws
+   * "cannot get property … without inject" on the ctx.subagents property,
+   * and this plugin deliberately keeps subagents optional (profiles without
+   * it still get roster/board; dispatch reports a clear per-task error).
+   */
+  private spawnDeps(): SpawnDeps {
+    return {
+      start: (request) => {
+        const subagents = this.ctx.get('subagents') as { start(provider: string, request: unknown): unknown } | undefined
+        if (subagents === undefined) throw new Error('subagents service unavailable in this host (spawn provider not mounted?)')
+        return subagents.start('spawn', request as never) as never
+      },
+    }
   }
 }

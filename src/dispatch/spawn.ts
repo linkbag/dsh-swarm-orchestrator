@@ -22,6 +22,9 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig): string 
       ? `Depends on completed tasks: ${task.blockedBy.join(', ')} (their outputs are already in the workspace).`
       : 'This task has no dependencies; other tasks run in parallel — never touch their scope.',
     '',
+    ...(task.reviewBy !== undefined
+      ? [`Your output will be reviewed by the **${task.reviewBy}** role before it counts as done — make it verifiable.`]
+      : []),
     ...(task.reviewFeedback !== undefined
       ? [
           '## Reviewer feedback on your previous attempt (fix this)',
@@ -136,11 +139,13 @@ export async function spawnTaskAgent(
     role: RoleConfig
     candidates: Array<{ provider: string; model: string }>
     signal: AbortSignal
-    onFallback?: (candidate: { provider: string; model: string }) => void
+    /** Full prompt override (review agents use buildReviewPrompt instead of the task template). */
+    prompt?: string
+    onFallback?: (failed: { provider: string; model: string }, next: { provider: string; model: string } | undefined) => void
     onStarted?: (childSessionId: string) => void
   },
 ): Promise<SpawnOutcome> {
-  const prompt = buildTaskPrompt(opts.run, opts.task, opts.role)
+  const prompt = opts.prompt ?? buildTaskPrompt(opts.run, opts.task, opts.role)
   const chain = opts.candidates.length > 0 ? opts.candidates : [{ provider: '', model: '' }]
   let lastReason = 'no model candidates'
   let lastProvider: string | undefined
@@ -164,12 +169,10 @@ export async function spawnTaskAgent(
       })
     } catch (err) {
       lastReason = String(err instanceof Error ? err.message : err)
-      if (isModelUnavailableError(err) && candidate !== chain[chain.length - 1]) {
-        opts.onFallback?.(candidate)
-        continue
-      }
       if (isModelUnavailableError(err)) {
-        opts.onFallback?.(candidate)
+        const next = chain[chain.indexOf(candidate) + 1]
+        opts.onFallback?.(candidate, next)
+        if (next !== undefined) continue
         return { ok: false, reason: `all model candidates unavailable (last: ${lastReason})` }
       }
       return { ok: false, reason: lastReason }
