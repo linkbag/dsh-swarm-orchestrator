@@ -1,8 +1,10 @@
+import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-subagent'
 import { PLUGIN_VERSION, type SwarmConfig } from './config.js'
 import { validateDag } from './domain/dag.js'
@@ -20,6 +22,14 @@ interface InFlight {
   childSessionId?: string
 }
 
+/** Structural view of ctx.agents for anchor creation (see ensureAnchor). */
+interface AgentsLike {
+  create(options: {
+    sessionId: SessionId
+    meta?: { cwd?: string; delegationDepth?: number }
+  }): Promise<{ agent: Agent; dispose(): Promise<void> }>
+}
+
 /**
  * The host-side swarm service: duty table + JSONL event store + dispatcher.
  * State is folded from the event log on every change; the dispatcher launches
@@ -34,7 +44,10 @@ export class SwarmService extends Service {
   private state: SwarmState = newState()
   private stateDirty = true
   private readonly inFlight = new Map<string, InFlight>()
+  /** The dispatching agent per run — provenance and cwd source, never the spawn route (see ensureAnchor). */
   private readonly runParents = new Map<string, Agent>()
+  /** Service-owned idle anchor agents every spawn of a run is routed through. */
+  private readonly runAnchors = new Map<string, { agent: Agent; dispose(): Promise<void> }>()
   private readonly sessionTasks = new Map<string, { taskKey: string; effort?: string }>()
   private tickScheduled = false
 
@@ -156,6 +169,7 @@ export class SwarmService extends Service {
       }
     }
     this.events.append('run/aborted', { runId })
+    this.releaseAnchor(runId)
   }
 
   /** Heartbeat from a task agent, authenticated by its child session id. */
@@ -204,6 +218,54 @@ export class SwarmService extends Service {
 
   // ── dispatcher ───────────────────────────────────────────────────────────
 
+  /**
+   * The live agent every task-agent spawn for a run is routed through.
+   *
+   * Spawning through the DISPATCHING agent couples the run's lifetime to that
+   * agent's context: when its turn ends and its session unloads (one-shot
+   * subagent callers) or the session closes, every later spawn of the run dies
+   * with "cannot create effect on inactive context". A run must outlive its
+   * dispatcher, so each run gets a service-owned idle ANCHOR agent created on
+   * first launch — its cwd is captured from the dispatcher's session while the
+   * dispatcher is still alive, and its scope chain is the deployment default
+   * composition, so task agents never depend on the dispatching session's
+   * ad-hoc grants. Hosts without an agents factory (unit tests) fall back to
+   * the dispatching agent.
+   */
+  private async ensureAnchor(runId: string): Promise<Agent | undefined> {
+    const existing = this.runAnchors.get(runId)
+    if (existing !== undefined) return existing.agent
+    const agents = this.ctx.get('agents') as AgentsLike | undefined
+    const dispatcher = this.runParents.get(runId)
+    if (agents === undefined) return dispatcher
+    const header = dispatcher?.session?.header
+    const handle = await agents.create({
+      sessionId: SessionId(randomUUID()),
+      meta: {
+        ...(header?.cwd !== undefined ? { cwd: header.cwd } : {}),
+        delegationDepth: 0,
+      },
+    })
+    // The run may have gone terminal (abort) while the factory was creating.
+    if (this.view().runs.get(runId)?.status !== 'running') {
+      void handle.dispose().catch(() => {})
+      return undefined
+    }
+    this.runAnchors.set(runId, handle)
+    this.ctx.logger('swarm').info('run %s anchored to idle agent %s', runId, String(handle.agent.id))
+    return handle.agent
+  }
+
+  /** Dispose a run's anchor once the run reaches a terminal status. */
+  private releaseAnchor(runId: string): void {
+    const handle = this.runAnchors.get(runId)
+    if (handle === undefined) return
+    this.runAnchors.delete(runId)
+    void handle.dispose().catch((err) => {
+      this.ctx.logger('swarm').warn('anchor for run %s failed to dispose: %s', runId, String(err))
+    })
+  }
+
   private scheduleTick(): void {
     if (this.tickScheduled) return
     this.tickScheduled = true
@@ -222,8 +284,6 @@ export class SwarmService extends Service {
     const state = this.view()
     for (const run of state.runs.values()) {
       if (run.status !== 'running') continue
-      const parent = this.runParents.get(run.id)
-      if (parent === undefined) continue
       const tasks = run.taskIds
         .map((id) => state.tasks.get(`${run.id}/${id}`))
         .filter((t): t is Task => t !== undefined)
@@ -243,8 +303,7 @@ export class SwarmService extends Service {
   private launchTask(runId: string, task: Task): void {
     const role: RoleConfig | undefined = this.duty.role(task.role)
     const run = this.view().runs.get(runId)
-    const parent = this.runParents.get(runId)
-    if (run === undefined || parent === undefined || role === undefined) {
+    if (run === undefined || role === undefined) {
       this.events.append('task/blocked', { runId, taskId: task.id, data: { reason: 'run context unavailable' } })
       return
     }
@@ -263,23 +322,35 @@ export class SwarmService extends Service {
     })
 
     const deps = this.spawnDeps()
-    void spawnTaskAgent(deps, {
-      parent, run, task, role, candidates, signal: controller.signal,
-      onFallback: (failed, next) => {
-        this.events.append('task/model-fallback', {
+    void this.ensureAnchor(runId).then(async (parent) => {
+      if (parent === undefined) {
+        this.inFlight.delete(key)
+        this.events.append('task/failed', {
           runId, taskId: task.id,
           data: {
-            from: `${failed.provider}/${failed.model}`,
-            ...(next !== undefined ? { provider: next.provider, model: next.model } : {}),
-            reason: 'unavailable',
+            retry: task.attempts <= this.swarmConfig.maxRetries,
+            reason: 'no spawn anchor available (agents service absent and the dispatching session is gone)',
           },
         })
-      },
-      onStarted: (childSessionId) => {
-        this.trackChildSession(childSessionId, key, role.reasoningEffort)
-        this.events.append('task/agent-started', { runId, taskId: task.id, data: { sessionId: childSessionId } })
-      },
-    }).then((outcome) => {
+        return
+      }
+      const outcome = await spawnTaskAgent(deps, {
+        parent, run, task, role, candidates, signal: controller.signal,
+        onFallback: (failed, next) => {
+          this.events.append('task/model-fallback', {
+            runId, taskId: task.id,
+            data: {
+              from: `${failed.provider}/${failed.model}`,
+              ...(next !== undefined ? { provider: next.provider, model: next.model } : {}),
+              reason: 'unavailable',
+            },
+          })
+        },
+        onStarted: (childSessionId) => {
+          this.trackChildSession(childSessionId, key, role.reasoningEffort)
+          this.events.append('task/agent-started', { runId, taskId: task.id, data: { sessionId: childSessionId } })
+        },
+      })
       this.inFlight.delete(key)
       if (outcome.childSessionId !== undefined) this.forgetChildSession(outcome.childSessionId)
       const fresh = this.view().tasks.get(key)
@@ -317,8 +388,7 @@ export class SwarmService extends Service {
     const key = `${runId}/${taskId}`
     const reviewerRole = this.duty.role(reviewerRoleId)
     const run = this.view().runs.get(runId)
-    const parent = this.runParents.get(runId)
-    if (reviewerRole === undefined || run === undefined || parent === undefined) {
+    if (reviewerRole === undefined || run === undefined) {
       this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'error', feedback: `reviewer role "${reviewerRoleId}" or run context unavailable` } })
       this.checkRunCompletion(runId)
       return
@@ -326,7 +396,18 @@ export class SwarmService extends Service {
     const candidates = this.duty.resolveChain(reviewerRoleId)
     const controller = new AbortController()
     this.inFlight.set(key, { controller, taskKey: key })
+    // task/review-started must land in the SAME synchronous block as the
+    // task/completed append that scheduled this review: if an await separated
+    // them, an interleaving dispatcher tick would see every task completed and
+    // end the run before the review (let alone a reject-requeue) could run.
     this.events.append('task/review-started', { runId, taskId, data: { reviewer: reviewerRoleId } })
+    const parent = await this.ensureAnchor(runId)
+    if (parent === undefined) {
+      this.inFlight.delete(key)
+      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'error', feedback: 'no spawn anchor available (agents service absent and the dispatching session is gone)' } })
+      this.checkRunCompletion(runId)
+      return
+    }
 
     const deps = this.spawnDeps()
     const task = this.view().tasks.get(key)
@@ -410,6 +491,7 @@ export class SwarmService extends Service {
         },
       },
     })
+    this.releaseAnchor(runId)
   }
 
   /** Requeue a failed/blocked task for another attempt (dashboard action). */

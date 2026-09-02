@@ -11,6 +11,30 @@ interface StartCall {
   prompt: Array<{ type: string; text: string }>
   agentOptions?: { provider?: string; model?: string; maxTokens?: number }
   persona?: string
+  parent?: unknown
+}
+
+/** Fake agents factory: mints service-owned idle anchor agents. */
+class FakeAgents {
+  readonly created: Array<{ sessionId: string; cwd?: string }> = []
+  readonly anchors: unknown[] = []
+  disposeCount = 0
+  private n = 0
+
+  create(options: { sessionId: string; meta?: { cwd?: string } }): Promise<{ agent: unknown; dispose(): Promise<void> }> {
+    this.created.push({ sessionId: options.sessionId, cwd: options.meta?.cwd })
+    this.n += 1
+    const agent = {
+      id: `anchor-${this.n}`,
+      options: {},
+      session: { header: { id: `anchor-${this.n}`, delegationDepth: 0 } },
+    }
+    this.anchors.push(agent)
+    return Promise.resolve({
+      agent,
+      dispose: async () => { this.disposeCount += 1 },
+    })
+  }
 }
 
 /** Fake spawn-provider subagents service with scriptable outcomes. */
@@ -249,5 +273,61 @@ describe('swarm service (integration, fake subagents)', () => {
     await waitFor(() => fake.calls.length >= 1, 3000, 'spawn before abort')
     service.abort(result.runId)
     expect(service.snapshot().runs.find((r) => r.id === result.runId)?.status).toBe('aborted')
+  })
+
+  it('spawns through a service-owned anchor, so the run survives its dispatching session', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+
+    // The dispatcher carries a session header whose cwd the anchor must capture.
+    const dispatcher = {
+      id: 'parent-1',
+      session: { header: { id: 'parent-1', cwd: 'D:\\work' } },
+    } as never
+    const result = service.dispatch({
+      title: 'anchor demo',
+      spec: 's',
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder' },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder', blockedBy: ['a'] },
+      ],
+    }, dispatcher)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 2, 5000, 'both tasks spawned')
+    // One anchor per run, cwd captured from the dispatcher, every spawn routed through it.
+    expect(agents.created.length).toBe(1)
+    expect(agents.created[0]?.cwd).toBe('D:\\work')
+    expect(fake.calls[0]?.parent).toBe(agents.anchors[0])
+    expect(fake.calls[1]?.parent).toBe(agents.anchors[0])
+
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completion')
+    // Terminal run releases its anchor.
+    await waitFor(() => agents.disposeCount === 1, 3000, 'anchor disposal')
+  })
+
+  it('a parentless run (host restart recovery) still spawns through a fresh anchor', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+
+    const result = service.dispatch({
+      title: 'recovery demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, undefined)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 5000, 'spawn without a dispatching parent')
+    expect(agents.created.length).toBe(1)
+    expect(fake.calls[0]?.parent).toBe(agents.anchors[0])
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completion')
   })
 })
