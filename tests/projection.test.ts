@@ -160,6 +160,69 @@ describe('dag validation', () => {
     ])
     expect(good.valid).toBe(true)
   })
+
+  // J5 legality: adversarial replays must not produce illegal states.
+  describe('event-log legality', () => {
+    const base = [
+      { seq: 1, at: 1, kind: 'run/created', runId: 'r', data: { title: 't', spec: 's', tasks: [{ id: 'a', subject: 'A', description: '', role: 'builder' }] } },
+      { seq: 2, at: 2, kind: 'run/endorsed', runId: 'r' },
+      { seq: 3, at: 3, kind: 'task/started', runId: 'r', taskId: 'a', data: { label: 'swarm:a' } },
+    ]
+
+    it('an endorse cannot resurrect an aborted run', () => {
+      const state = fold([
+        ...base,
+        { seq: 4, at: 4, kind: 'run/aborted', runId: 'r' },
+        { seq: 5, at: 5, kind: 'run/endorsed', runId: 'r' },
+      ], newState())
+      expect(state.runs.get('r')?.status).toBe('aborted')
+    })
+
+    it('a terminal run freezes its tasks against replayed task events', () => {
+      for (const terminal of ['run/aborted', 'run/failed', 'run/completed', 'run/paused']) {
+        const state = fold([
+          ...base,
+          { seq: 4, at: 4, kind: terminal, runId: 'r', data: {} },
+          { seq: 5, at: 5, kind: 'task/started', runId: 'r', taskId: 'a', data: { label: 'swarm:a' } },
+          { seq: 6, at: 6, kind: 'task/completed', runId: 'r', taskId: 'a', data: { summary: 'ghost' } },
+        ], newState())
+        const task = state.tasks.get('r/a')!
+        expect(task.status).toBe('running')
+        expect(task.summary).toBeUndefined()
+      }
+    })
+
+    it('run/resumed is the only path back from a terminal state', () => {
+      const state = fold([
+        ...base,
+        { seq: 4, at: 4, kind: 'run/failed', runId: 'r', data: {} },
+        { seq: 5, at: 5, kind: 'run/resumed', runId: 'r' },
+      ], newState())
+      expect(state.runs.get('r')?.status).toBe('running')
+    })
+
+    it('paused runs expose their reason and resume clears it', () => {
+      const state = fold([
+        ...base,
+        { seq: 4, at: 4, kind: 'run/paused', runId: 'r', data: { reason: 'provider quota exhausted' } },
+      ], newState())
+      expect(state.runs.get('r')?.status).toBe('paused')
+      expect(state.runs.get('r')?.pauseReason).toContain('quota')
+      const resumed = fold([{ seq: 9, at: 9, kind: 'run/resumed', runId: 'r' }], state)
+      expect(resumed.runs.get('r')?.status).toBe('running')
+      expect(resumed.runs.get('r')?.pauseReason).toBeUndefined()
+    })
+
+    it('heartbeats timestamp notes for stale-note ageing', () => {
+      const state = fold([
+        ...base,
+        { seq: 4, at: 4000, kind: 'task/heartbeat', runId: 'r', taskId: 'a', data: { note: 'halfway' } },
+      ], newState())
+      const task = state.tasks.get('r/a')!
+      expect(task.lastNote).toBe('halfway')
+      expect(task.lastNoteAt).toBe(4000)
+    })
+  })
 })
 
 void created
