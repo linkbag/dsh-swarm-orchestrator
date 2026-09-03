@@ -7,6 +7,7 @@
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import { SwarmTab } from './SwarmTab'
 import { SwarmSettingsSection } from './SwarmSettingsSection'
+import { SwarmHeaderButton } from './SwarmHeaderButton'
 import { SwarmDispatchCard } from './ToolDispatchCard'
 import { setApiGetter } from './catalog'
 import css from './swarm.css'
@@ -55,6 +56,14 @@ export function apply(ctx: ClientContext): (() => void) | void {
     ctx.slots.register(
       { name: 'settings.section', id: 'swarm' } as never,
       SwarmSettingsSection as never,
+    ),
+  )
+
+  // B1: 🐝 status button in every session header (live popover).
+  ctx.slots.inject('conversation.session.header.actions' as never, () =>
+    ctx.slots.register(
+      { name: 'conversation.session.header.actions', id: 'swarm-status' } as never,
+      SwarmHeaderButton as never,
     ),
   )
 

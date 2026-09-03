@@ -288,6 +288,24 @@
   white-space: nowrap;
 }
 .dsh-swarm-badge.alert { border-color: rgb(219, 88, 96); color: rgb(219, 88, 96); }
+.dsh-swarm-hbtn-wrap { position: relative; display: inline-flex; }
+.dsh-swarm-hbtn {
+  font: inherit; font-size: 14px; line-height: 1;
+  padding: 4px 7px; border-radius: 8px;
+  border: 1px solid rgba(125, 125, 125, 0.35);
+  background: transparent; color: inherit; cursor: pointer;
+}
+.dsh-swarm-hbtn:hover { background: rgba(125, 125, 125, 0.15); }
+.dsh-swarm-hpop {
+  position: absolute; right: 0; top: calc(100% + 6px);
+  z-index: 9999; width: 320px;
+  background: rgba(20, 22, 26, 0.97); color: #e8e8e8;
+  border: 1px solid rgba(125, 125, 125, 0.35); border-radius: 10px;
+  padding: 10px 12px; font-size: 12.5px;
+  display: flex; flex-direction: column; gap: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.dsh-swarm-hpop-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .dsh-swarm-task-note.stale { opacity: 0.35; }
 .dsh-swarm-run-banner {
   margin: 8px 16px 0;
