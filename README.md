@@ -1,101 +1,115 @@
 # dsh-swarm-orchestrator
 
-Role-based AI swarm orchestration for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH).
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-A **duty table** pins each role (architect / builder / reviewer / integrator — or your own) to any model configured in DSH,
-tasks execute as a parallel DAG of one-shot subagents with optional review loops, and a live **Swarm** dashboard tab in the web GUI
-shows the org structure, task flow, per-agent progress, and per-role model pickers fed by your live model catalog.
+Role-based AI swarms for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Give it a goal, get a team: an architect breaks the work into a task graph, parallel builders execute it, reviewers hold the line, and an integrator ships the result — while you watch the whole thing move on a live kanban board.
 
-Inspired by [OpenClaw Swarm v4](https://github.com/linkbag/epic-ai-swarm-orchestration) — re-architected native to DSH:
-no daemon, no separate process; the orchestrator is a Cordis plugin inside your `dsh web` host, and task agents are real DSH subagents.
+It runs **inside** your `dsh web` host. No daemon, no second process, no glue scripts. Task agents are ordinary DSH subagents with your tool access and your models; the orchestrator is just a well-behaved Cordis plugin.
 
-## Features
+It has already shipped real work: the first production run reverse-engineered a biotech research dashboard and rebuilt it as a **six-indication suite** (680 curated clinical trials across six cancers) in a single afternoon — five data-curation agents working in parallel, every deliverable machine-verified.
 
-- **Duty table with model pinning** — per-role provider/model, ordered fallback chain, reasoning effort, max tokens, persona.
-  Models come from whatever providers you have configured in DSH (DeepSeek official, GLM, Kimi, Claude, …) — same list as the Models settings page.
-- **Task DAG, parallel one-shot agents** — independent tasks run concurrently (bounded by `maxConcurrent`), blocked tasks wait on their blockers.
-- **Review loops** — a task with `reviewBy: reviewer` gets its output judged by the reviewer role; rejections loop back with feedback, capped at `reviewLoops`.
-- **Model fallback** — if the pinned model is unavailable, the role's fallback chain is tried silently before the task fails (and failing tasks retry up to `maxRetries`).
-- **Endorsement gate** — runs start in *planning*; you endorse them on the dashboard (or pass `endorse: true` when the human already approved).
-- **Live dashboard** — Swarm tab in the web GUI: run list, task columns (Queued / Running / Done / Failed), task drawer with briefs, notes, summaries, reviewer feedback, and per-task retry.
-- **Run reports** — end-of-run report with per-task summaries, models used, fallback/retry/review stats.
-- **Event-sourced state** — everything is an append-only JSONL event log under `$DSH_HOME/storages/swarm`; host restarts recover mid-flight tasks.
-- **Watchdog** — silent task agents are aborted and requeued after `staleTimeoutSeconds`.
+---
 
-## Tools the model sees
+## Why not just ask one agent?
 
-| Tool | Purpose |
-| --- | --- |
-| `swarm_dispatch` | Submit a run: title, objective spec, task DAG (id / subject / description / role / blockedBy / reviewBy). |
-| `swarm_status` | Compact board report (runs, task states, models, latest notes). |
-| `swarm_report` | Task agents post one-line interim progress notes to the dashboard. |
+Because one agent serializes. Long research tasks queue behind quick edits, context fills up, quality drifts, and nothing checks the output but the same model that wrote it.
 
-Example dispatch:
+This plugin takes the coordination seriously so you don't have to:
 
-```json
-{
-  "title": "Add settings export",
-  "spec": "Add an export button to the settings page that downloads current settings as JSON.",
-  "tasks": [
-    { "id": "design", "subject": "Design the export format", "description": "Decide the JSON schema …", "role": "architect" },
-    { "id": "impl", "subject": "Implement export", "description": "Add the button + handler …", "role": "builder", "blockedBy": ["design"], "reviewBy": "reviewer" },
-    { "id": "docs", "subject": "Document it", "description": "Update the user guide …", "role": "builder", "blockedBy": ["impl"] }
-  ]
-}
-```
+- **Parallel by construction.** Tasks declare dependencies (`blockedBy`); everything independent runs at once, bounded by a concurrency cap that adapts when the provider struggles.
+- **Every role gets its own model.** Pin DeepSeek, GLM, Kimi, Claude — any model configured in DSH — to any role, with an ordered fallback chain and a per-role reasoning-effort ladder. The picker reads your live model catalog, so new providers show up automatically.
+- **Review before "done" means done.** Tasks tagged `reviewBy` are judged by a reviewer agent against the task brief; a rejection loops back to the builder with the feedback attached. Want the last word yourself? Set `reviewGate: "human"` and approve from the dashboard.
+- **Failure is a state, not a mystery.** Provider timeouts, quota exhaustion, bad evidence — each is detected, reported plainly, and handled: retries with resume hints, run pause/resume instead of burn-down, automatic model rotation after repeated failures.
+- **Nothing starts without you.** Runs sit in *planning* until you endorse them on the board. A server-side option (`requireManualEndorsement`) makes that gate impossible to bypass from chat, even by a model that decides to be helpful.
 
-The run appears on the Swarm tab immediately; endorse it there to launch.
+## The dashboard
+
+A **Swarm** tab lives next to Chat in the web GUI:
+
+- **Board** — runs on the left, task columns (Queued / Running / Done / Failed) front and center. Click a task for its full brief, model, attempt count, interim agent notes, reviewer feedback, and retry. Completed runs fold into a report with per-task summaries and fallback/retry/review stats.
+- **Roster** — the duty-table editor: per-role model pickers fed by your live catalog, fallback-chain ordering, effort ladder, concurrency caps, tool filters, personas, custom roles, and an override lock for "hands off my table".
+- **Everywhere else** — a 🐝 status button in every session header, a small badge for active runs, and a live progress card right in chat where the run was dispatched.
+
+## How a run works
+
+1. **Dispatch** — tell your agent what you want; it calls `swarm_dispatch` with a task graph. Runs start gated: *planning*, zero agents spawned.
+2. **Endorse** — you review the plan on the board and hit **Endorse**. (Approved it in chat already? The agent can pass `endorse: true`.)
+3. **Execute** — the dispatcher spawns task agents through a service-owned anchor, so the run keeps going even if the chat that started it is long gone.
+4. **Review** — tasks with a reviewer get judged; rejections requeue with feedback. Tasks with an evidence contract must produce the files and passing commands they promised.
+5. **Report** — the run closes with a report: who did what, on which models, with fallback/retry/review stats. The whole history is an append-only JSONL event log you can replay.
 
 ## Install
 
-Once published to the marketplace:
+From this GitHub repo (pnpm will run the package's `prepare` script to build from source):
 
 ```sh
-dsh plugin --profile web add dsh-swarm-orchestrator
+dsh plugin --profile web add github:linkbag/dsh-swarm-orchestrator
 ```
 
-From a checkout:
+pnpm ≥ 10 asks you to allow that build first — add the exact key it prints to the profile's `pnpm-workspace.yaml`:
+
+```yaml
+allowBuilds:
+  dsh-swarm-orchestrator: true
+```
+
+and re-run the `add`. (That allowance executes this package's code on your machine at install time — the usual trust rule applies; pin a commit if you prefer: `github:linkbag/dsh-swarm-orchestrator#<sha>`.)
+
+From a source checkout:
 
 ```sh
 pnpm install && pnpm build
 dsh plugin --profile web add ./dsh-swarm-orchestrator
 ```
 
-Then restart `dsh web` (or reload the profile) and open the **Swarm** tab next to Chat / Trajectory.
+Then restart `dsh web` and open the **Swarm** tab next to Chat.
+
+## Talking to it
+
+Everything is driven from normal chat — no config files to hand-edit:
+
+> *"Spawn a swarm: audit every package.json in this repo for stale deps, one task per package, then an integrator compiles a summary table. Review the integrator's output."*
+
+or the one-shot form: `/swarm build a landing page for this project` (plans it, then executes it).
+
+| Tool | What it does |
+| --- | --- |
+| `swarm_dispatch` | Submit a run: title, objective, task DAG (id / subject / description / role / blockedBy / reviewBy / reviewGate / model / evidence). |
+| `swarm_status` | The board in text: runs, task states, models in use, latest notes. |
+| `swarm_wait` | Block until the board changes or a timeout hits — supervision without sleep-polling. |
+| `swarm_retry` | Requeue a failed/blocked task after you've fixed the cause (dispatching session only). |
+| `swarm_report` | Task agents post interim notes to the board (authenticated to their own task). |
+
+Tasks also accept an **evidence contract** — `evidence: { files: [...], commands: [...] }` — that is machine-checked before a task may close, and a **human review gate** that parks the verdict on the dashboard.
 
 ## Configuration
 
-Row in `cordis.patch.yml` (defaults shown):
+Everything has a default; override in your profile's `cordis.patch.yml`:
 
 ```yaml
 - id: swarm
   require: dsh-swarm-orchestrator
   config:
-    storageDir: !!js dshHomePath("storages/swarm")   # keep unquoted
-    maxConcurrent: 5        # simultaneous task agents
-    staleTimeoutSeconds: 14400
-    maxRetries: 2           # per task
-    reviewLoops: 3          # max review rejections per task
+    storageDir: !!js dshHomePath("storages/swarm")   # event log + duty table
+    maxConcurrent: 5            # simultaneous task agents
+    adaptiveConcurrency: true   # shrink on provider pain, recover on success
+    spawnStaggerMs: 750         # pace launches within a wave
+    staleTimeoutSeconds: 14400  # watchdog: silent agents get reclaimed
+    maxRetries: 2               # per task
+    reviewLoops: 3              # review rejections per task
+    requireManualEndorsement: false  # true = the endorse gate cannot be bypassed from chat
 ```
 
-## Dashboard
+## Under the hood
 
-- **Board** — run list on the left; selected run shows task columns, and a task drawer with the full brief, model, attempts, reviewer feedback, and retry/endorse/abort actions. Completed runs carry a run report.
-- **Roster** — the duty-table editor: per-role model picker (live catalog, grouped by provider), fallback-chain ordering, effort, max tokens, persona, custom roles, and a manual override lock that freezes the table against edits.
+- **Host half** (Node): a `SwarmService` — duty-table store, append-only JSONL event store, projection fold, the dispatcher (parallel one-shot subagents behind a service-owned anchor agent), review loop, watchdog, pause/resume, and `/swarm/*` HTTP + SSE routes.
+- **Client half** (browser): the Swarm tab, the chat progress card, the header popover, and the Settings section — all fed by board snapshots over SSE. Model pickers use the same LLM RPCs as the Models settings page.
+- **Per-role reasoning effort** rides DSH's `agent/request` waterfall, scoped to tracked swarm children only.
+- **Deterministic replay**: state is a fold over the event log, with legality guards — a hostile or duplicated event stream cannot resurrect an aborted run or complete a task twice.
 
-## Architecture
+## Status
 
-- Host half (Node): `SwarmService` — duty-table store, JSONL event store, projection fold, dispatcher (spawn provider subagents, bounded concurrency), review loop, watchdog, `/swarm/*` HTTP + SSE routes.
-- Client half (browser): the Swarm tab (board + roster), fed by board snapshots over SSE pings; model catalog via the same llm RPCs the Models settings page uses.
-- Per-role reasoning effort is applied per-request through the `agent/request` waterfall (DSH `AgentOptions` has no effort field) and scoped to tracked swarm children only.
-
-## Development
-
-```sh
-pnpm typecheck   # tsc --noEmit
-pnpm test        # vitest
-pnpm build       # lib/ (host half) + lib/client.js (browser half)
-```
+v0.3.0, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (38 tests: dispatch, endorsement, review loops, fallbacks, quota pause, rescue paths, evidence contracts, event-log legality), plus live verification on a real deployment.
 
 ## License
 
@@ -103,54 +117,4 @@ MIT © linkbag
 
 ---
 
-# dsh-swarm-orchestrator（中文）
-
-面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的角色化 AI 群体编排插件。
-
-**职责表（duty table）**为每个角色（架构 / 施工 / 评审 / 集成，或自定义角色）指定 DSH 中已配置的任意模型；
-任务以并行 DAG 的方式由一次性子代理执行，可选评审回环；Web GUI 中的 **Swarm** 仪表盘标签页实时展示组织结构、
-任务流转、各代理进度，以及基于实时模型目录的角色模型选择器。
-
-灵感来自 [OpenClaw Swarm v4](https://github.com/linkbag/epic-ai-swarm-orchestration)，并按 DSH 原生架构重新实现：
-没有守护进程、没有额外进程——编排器就是 `dsh web` 宿主内的一个 Cordis 插件，任务代理是真正的 DSH 子代理。
-
-## 特性
-
-- **职责表模型锁定**：按角色配置 provider/模型、有序回退链、思考等级、max tokens、人设；模型列表来自 DSH 已配置的所有 provider（DeepSeek 官方、GLM、Kimi、Claude……），与“模型设置”页一致。
-- **任务 DAG + 并行一次性代理**：无依赖任务并发执行（`maxConcurrent` 限流），被阻塞任务等待前置完成。
-- **评审回环**：带 `reviewBy` 的任务完成后由评审角色判定；驳回则携带反馈回到队列，上限 `reviewLoops` 次。
-- **模型回退**：主模型不可用时静默尝试回退链；任务失败按 `maxRetries` 重试。
-- **人工背书门**：运行先处于 planning 状态，在仪表盘点“背书”后才启动。
-- **实时仪表盘**：运行列表、任务四列看板、任务抽屉（简报 / 备注 / 总结 / 评审反馈）、失败重试。
-- **运行报告**：运行结束时生成含各任务总结、所用模型、回退/重试/评审统计的报告。
-- **事件溯源**：全部状态是 `$DSH_HOME/storages/swarm` 下的 JSONL 追加日志；宿主重启自动恢复中断任务。
-- **看门狗**：超过 `staleTimeoutSeconds` 无进展的任务代理被中止并重新排队。
-
-## 模型可见的工具
-
-| 工具 | 用途 |
-| --- | --- |
-| `swarm_dispatch` | 提交运行：标题、目标说明、任务 DAG（id / subject / description / role / blockedBy / reviewBy）。 |
-| `swarm_status` | 紧凑看板汇报（运行、任务状态、模型、最新备注）。 |
-| `swarm_report` | 任务代理向仪表盘发送单行进度备注。 |
-
-## 安装
-
-发布到插件市场后：
-
-```sh
-dsh plugin --profile web add dsh-swarm-orchestrator
-```
-
-或从源码目录安装：
-
-```sh
-pnpm install && pnpm build
-dsh plugin --profile web add ./dsh-swarm-orchestrator
-```
-
-重启 `dsh web` 后，在 Chat / Trajectory 旁打开 **Swarm** 标签页。
-
-## 许可证
-
-MIT © linkbag
+简体中文文档见 [README.zh-CN.md](README.zh-CN.md)。
