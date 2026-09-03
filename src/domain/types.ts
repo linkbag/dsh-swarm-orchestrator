@@ -70,6 +70,8 @@ export interface TaskSpec {
   evidence?: TaskEvidence
   /** 'human' routes the review verdict to a dashboard Approve/Reject instead of an agent reviewer (J7). */
   reviewGate?: 'agent' | 'human'
+  /** Files this task may write (exclusive scope). Overlapping scopes between concurrent tasks produce a dispatch warning. */
+  writes?: string[]
 }
 
 /** Task state folded from the event log. */
@@ -90,6 +92,8 @@ export interface Task extends TaskSpec {
   humanReview?: boolean
   /** Timestamp of the last heartbeat — the board greys stale notes (B2). */
   lastNoteAt?: number
+  /** Timestamp of the last watchdog silence nudge. */
+  nudgedAt?: number
   updatedAt: number
 }
 
@@ -162,6 +166,7 @@ export type SwarmEventKind =
   | 'task/failed'
   | 'task/blocked'
   | 'task/unblocked'
+  | 'task/nudged'
   | 'task/review-started'
   | 'task/reviewed'
   | 'duty/updated'
@@ -180,4 +185,6 @@ export interface DispatchResult {
   status: RunStatus
   taskCount: number
   invalid?: string[]
+  /** Non-fatal notices (e.g. concurrent tasks declaring overlapping write scopes). */
+  warnings?: string[]
 }

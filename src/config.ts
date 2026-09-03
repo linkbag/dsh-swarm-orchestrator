@@ -2,7 +2,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-export const PLUGIN_VERSION = '0.2.0'
+export const PLUGIN_VERSION = '0.3.1'
 
 function defaultStorageDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -18,6 +18,7 @@ export interface SwarmConfig {
   requireManualEndorsement: boolean
   spawnStaggerMs: number
   adaptiveConcurrency: boolean
+  nudgeAfterMinutes: number
 }
 
 export const Config = Schema.object({
@@ -48,5 +49,9 @@ export const Config = Schema.object({
   adaptiveConcurrency: Schema.boolean().default(true).description(
     'K1 adaptive concurrency: shrink the per-run launch capacity on provider-class failures '
     + '(timeouts/quota) and recover it on completions, within the maxConcurrent ceiling.',
+  ),
+  nudgeAfterMinutes: Schema.number().default(20).min(0).max(240).description(
+    'Watchdog early-warning tier: a running task with no progress note for this many minutes '
+    + 'gets a nudged marker on the board (0 = off). The full stale timeout still applies after.',
   ),
 })

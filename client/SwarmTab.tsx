@@ -21,6 +21,8 @@ function statusColor(status: string): string {
 }
 
 function timeAgo(at: number): string {
+  // Clock skew (manual time changes, TZ shifts) can make timestamps land in
+  // the "future" — clamp so nothing reads as a negative age.
   const seconds = Math.max(0, Math.round((Date.now() - at) / 1000))
   if (seconds < 60) return `${seconds}s ago`
   if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`
@@ -195,6 +197,9 @@ export function SwarmTab(): JSX.Element {
                               : task.humanReview === true
                                 ? <em title="awaiting human review">👤</em>
                                 : <em title={`review loop: ${task.reviewBy}`}>↻{task.reviews ?? 0}</em>)}
+                            {task.nudgedAt !== undefined && (
+                              <em title={`no progress note recently — the watchdog is watching this task`} style={{ color: 'rgb(227, 148, 36)' }}>🔕</em>
+                            )}
                           </span>
                           {task.lastNote !== undefined && (() => {
                             const stale = task.lastNoteAt !== undefined && (Date.now() - task.lastNoteAt) > 10 * 60 * 1000
@@ -237,6 +242,11 @@ export function SwarmTab(): JSX.Element {
                 {selectedTask.reviewBy !== undefined && (
                   <>
                     <dt>Reviewed by</dt><dd><kbd>{selectedTask.reviewBy}</kbd>{selectedTask.reviewed === true ? ' ✓' : ''}{(selectedTask.reviews ?? 0) > 0 ? ` (${selectedTask.reviews} round${selectedTask.reviews === 1 ? '' : 's'})` : ''}{selectedTask.reviewExhausted === true ? ' — loop exhausted, output stands' : ''}</dd>
+                  </>
+                )}
+                {selectedTask.writes !== undefined && selectedTask.writes.length > 0 && (
+                  <>
+                    <dt>Write scope</dt><dd>{selectedTask.writes.map((f) => <code key={f}>{f}</code>).join(' ')}</dd>
                   </>
                 )}
                 <dt>Attempts</dt><dd>{selectedTask.attempts}</dd>

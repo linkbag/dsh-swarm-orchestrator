@@ -602,4 +602,64 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(snap.tasks.find((t) => t.runId === result.runId && t.id === 'a')?.status).toBe('completed')
     expect(snap.tasks.find((t) => t.runId === result.runId && t.id === 'b')?.status).toBe('completed')
   })
+
+  it('warns when concurrent tasks declare overlapping write scopes', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    void fake
+
+    const overlapping = service.dispatch({
+      title: 'overlap demo',
+      spec: 's',
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder', writes: ['core.js'] },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder', writes: ['core.js', 'ui.js'] },
+      ],
+    }, makeDispatcher() as never)
+    expect(overlapping.warnings?.length).toBe(1)
+    expect(overlapping.warnings?.[0]).toContain('both declare write scope over "core.js"')
+
+    // A dependency makes the same scopes legal — no warning.
+    const chained = service.dispatch({
+      title: 'chained demo',
+      spec: 's',
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder', writes: ['core.js'] },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder', writes: ['core.js'], blockedBy: ['a'] },
+      ],
+    }, makeDispatcher() as never)
+    expect(chained.warnings).toBeUndefined()
+
+    service.abort(overlapping.runId)
+    service.abort(chained.runId)
+  })
+
+  it('the watchdog nudges silent running tasks before the stale reclaim', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ nudgeAfterMinutes: 1 })
+    contexts.push(ctx)
+    dirs.push(dir)
+    fake.holdAll = true
+
+    const result = service.dispatch({
+      title: 'nudge demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+    await waitFor(() => service.events.all().some((e) => e.kind === 'task/agent-started'), 5000, 'child running')
+
+    // Simulate 21 silent minutes: the nudge fires once. An immediate second
+    // sweep inside the same silent window must not re-nudge (dedupe).
+    service.watchdog(Date.now() + 21 * 60 * 1000)
+    const nudges = () => service.events.all().filter((e) => e.kind === 'task/nudged')
+    expect(nudges().length).toBe(1)
+    expect((nudges()[0]?.data as { silentMinutes?: number } | undefined)?.silentMinutes).toBeGreaterThanOrEqual(20)
+    service.watchdog(Date.now() + 21 * 60 * 1000)
+    expect(nudges().length).toBe(1)
+
+    // Release the child; the run completes despite the nudge.
+    fake.release()
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes after release')
+  })
 })

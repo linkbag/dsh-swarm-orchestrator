@@ -203,6 +203,9 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
           task.blockedReason = undefined
         }
         break
+      case 'task/nudged':
+        task.nudgedAt = event.at
+        break
       case 'task/review-started':
         if (task.status === 'completed') task.status = 'reviewing'
         if (d.human === true) task.humanReview = true

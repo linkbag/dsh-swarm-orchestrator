@@ -36,6 +36,8 @@ export interface BoardTask {
   reviewExhausted?: boolean
   humanReview?: boolean
   evidence?: { files?: string[]; commands?: string[] }
+  writes?: string[]
+  nudgedAt?: number
   updatedAt: number
 }
 

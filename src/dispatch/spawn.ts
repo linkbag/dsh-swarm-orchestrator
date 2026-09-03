@@ -30,6 +30,9 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context:
       ? `Depends on completed tasks: ${task.blockedBy.join(', ')} (their outputs are already in the workspace).`
       : 'This task has no dependencies; other tasks run in parallel — never touch their scope.',
     '',
+    ...(task.writes !== undefined && task.writes.length > 0
+      ? [`Exclusive write scope: ${task.writes.join(', ')} — do not modify files outside this list.`]
+      : []),
     ...(task.reviewBy !== undefined
       ? [`Your output will be reviewed by the **${task.reviewBy}** role before it counts as done — make it verifiable.`]
       : []),

@@ -101,6 +101,8 @@ export class SwarmService extends Service {
   private readonly runAnchors = new Map<string, { agent: Agent; dispose(): Promise<void> }>()
   /** K1: per-run adaptive launch capacity (shrinks on provider-class failures, recovers on completions). */
   private readonly adaptiveLimits = new Map<string, number>()
+  /** Last silence-nudge timestamp per in-flight task (dedupes re-nudges). */
+  private readonly nudgedAt = new Map<string, number>()
   private readonly sessionTasks = new Map<string, { taskKey: string; effort?: string }>()
   private tickScheduled = false
 
@@ -156,10 +158,17 @@ export class SwarmService extends Service {
     if (recovered) this.ctx.logger('swarm').info('recovered orphaned running tasks after restart')
   }
 
-  /** Abort in-flight agents whose task shows no progress within the stale timeout. */
-  private watchdog(): void {
+  /**
+   * Watchdog sweep. Two tiers over a running task's silence:
+   * past `nudgeAfterMinutes` without a note → a `task/nudged` marker on the
+   * board (early warning, re-nudged per additional silent window); past
+   * `staleTimeoutSeconds` → the agent is aborted and the task requeued.
+   * `now` is injectable for tests.
+   */
+  watchdog(now = Date.now()): void {
     const state = this.view()
     const staleMs = this.swarmConfig.staleTimeoutSeconds * 1000
+    const nudgeMs = this.swarmConfig.nudgeAfterMinutes * 60000
     for (const [key, flight] of [...this.inFlight]) {
       const task = state.tasks.get(key)
       if (task === undefined) {
@@ -167,7 +176,7 @@ export class SwarmService extends Service {
         continue
       }
       if (this.view().runs.get(task.runId)?.status === 'aborted') continue
-      if (Date.now() - task.updatedAt > staleMs) {
+      if (now - task.updatedAt > staleMs) {
         this.inFlight.delete(key)
         flight.controller.abort()
         this.events.append('task/failed', {
@@ -175,11 +184,61 @@ export class SwarmService extends Service {
           data: { retry: task.attempts <= this.swarmConfig.maxRetries, reason: `stale: no progress for ${Math.round(staleMs / 1000)}s (watchdog)` },
         })
         this.ctx.logger('swarm').warn('watchdog aborted stale task %s', key)
+        continue
+      }
+      // Early-warning tier: surface long silences long before the reclaim.
+      if (nudgeMs > 0 && task.status === 'running') {
+        const last = task.lastNoteAt ?? task.updatedAt
+        const silentMs = now - last
+        const lastNudge = this.nudgedAt.get(key) ?? 0
+        if (silentMs > nudgeMs && now - lastNudge > nudgeMs) {
+          this.nudgedAt.set(key, now)
+          this.events.append('task/nudged', {
+            runId: task.runId, taskId: task.id,
+            data: { silentMinutes: Math.round(silentMs / 60000) },
+          })
+        }
       }
     }
   }
 
   // ── actions ──────────────────────────────────────────────────────────────
+
+  /**
+   * Detect concurrent tasks claiming the same exclusive write scope: two tasks
+   * that share a `writes` entry and have no dependency path between them may
+   * edit the same file at the same time. Non-fatal — surfaced as warnings.
+   */
+  private writeOverlapWarnings(tasks: TaskSpec[]): string[] {
+    const reach = new Map<string, Set<string>>()
+    for (const task of tasks) {
+      const seen = new Set<string>()
+      const stack = [...(task.blockedBy ?? [])]
+      while (stack.length > 0) {
+        const current = stack.pop()!
+        if (seen.has(current)) continue
+        seen.add(current)
+        const upstream = tasks.find((t) => t.id === current)
+        if (upstream !== undefined) stack.push(...(upstream.blockedBy ?? []))
+      }
+      reach.set(task.id, seen)
+    }
+    const warnings: string[] = []
+    for (let i = 0; i < tasks.length; i++) {
+      const a = tasks[i]!
+      if (a.writes === undefined || a.writes.length === 0) continue
+      for (let j = i + 1; j < tasks.length; j++) {
+        const b = tasks[j]!
+        if (b.writes === undefined || b.writes.length === 0) continue
+        const shared = a.writes.find((f) => b.writes!.some((g) => g.toLowerCase() === f.toLowerCase()))
+        if (shared === undefined) continue
+        if (reach.get(a.id)?.has(b.id) || reach.get(b.id)?.has(a.id)) continue
+        warnings.push(`tasks "${a.id}" and "${b.id}" may run concurrently and both declare write scope over "${shared}" — consider blockedBy or narrower scopes`)
+        if (warnings.length >= 5) return warnings
+      }
+    }
+    return warnings
+  }
 
   dispatch(input: DispatchInput, parent: Agent | undefined): DispatchResult {
     const tasks: TaskSpec[] = input.tasks
@@ -189,6 +248,7 @@ export class SwarmService extends Service {
     const known = Object.keys(this.duty.get().roles)
     const unknownRoles = [...new Set(tasks.map((t) => t.role).filter((r) => !known.includes(r)))]
     if (unknownRoles.length > 0) throw new Error(`unknown roles ${unknownRoles.join(', ')} — known: ${known.join(', ')}`)
+    const writeWarnings = this.writeOverlapWarnings(tasks)
 
     const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
     this.events.append('run/created', {
@@ -205,7 +265,12 @@ export class SwarmService extends Service {
       this.events.append('run/endorsed', { runId })
     }
     this.scheduleTick()
-    return { runId, status: this.view().runs.get(runId)?.status ?? 'planning', taskCount: tasks.length }
+    return {
+      runId,
+      status: this.view().runs.get(runId)?.status ?? 'planning',
+      taskCount: tasks.length,
+      ...(writeWarnings.length > 0 ? { warnings: writeWarnings } : {}),
+    }
   }
 
   endorse(runId: string): void {

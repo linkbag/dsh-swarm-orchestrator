@@ -1,6 +1,6 @@
 {
   "name": "dsh-swarm-orchestrator",
-  "version": "0.2.0",
+  "version": "0.3.1",
   "description": "Role-based AI swarm orchestration for DeepSeek Harness: duty-table model pinning per role, parallel task DAG with review loops, and a live Swarm dashboard tab in the web GUI.",
   "license": "MIT",
   "author": "linkbag",

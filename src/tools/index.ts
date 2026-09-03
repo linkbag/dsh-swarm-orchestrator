@@ -13,6 +13,7 @@ const taskItemSchema = {
     blockedBy: { type: 'array' as const, items: { type: 'string' as const }, description: 'Task ids that must complete before this one starts' },
     reviewBy: { type: 'string' as const, description: 'Role that reviews this task\'s output after completion (e.g. reviewer); rejections loop back with feedback up to reviewLoops times' },
     reviewGate: { type: 'string' as const, description: '\'agent\' (default) or \'human\' — human routes the verdict to dashboard Approve/Reject buttons' },
+    writes: { type: 'array' as const, items: { type: 'string' as const }, description: 'Files this task may write (exclusive scope). Overlapping concurrent scopes produce a dispatch warning.' },
     model: {
       type: 'object' as const,
       additionalProperties: true,
@@ -80,6 +81,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
             ...(task.blockedBy !== undefined && task.blockedBy.length > 0 ? { blockedBy: task.blockedBy } : {}),
             ...(task.reviewBy !== undefined && task.reviewBy.length > 0 ? { reviewBy: task.reviewBy } : {}),
             ...(task.reviewGate === 'human' ? { reviewGate: 'human' as const } : {}),
+            ...(task.writes !== undefined && task.writes.length > 0 ? { writes: task.writes } : {}),
             ...(task.model !== undefined && typeof task.model === 'object'
               && typeof (task.model as { provider?: unknown }).provider === 'string'
               && typeof (task.model as { model?: unknown }).model === 'string'
