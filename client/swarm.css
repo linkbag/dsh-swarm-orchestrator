@@ -272,17 +272,17 @@
 .dsh-swarm-settings h3 { margin: 0 0 6px; }
 .dsh-swarm-badge {
   position: fixed;
-  left: 12px;
+  right: 12px;
   bottom: 12px;
   z-index: 9999;
-  font: 12px/1.4 system-ui, sans-serif;
-  padding: 4px 10px;
+  font: 11px/1.4 system-ui, sans-serif;
+  padding: 3px 9px;
   border-radius: 999px;
   border: 1px solid rgba(125, 125, 125, 0.35);
-  background: rgba(20, 22, 26, 0.92);
+  background: rgba(20, 22, 26, 0.82);
   color: #e8e8e8;
   pointer-events: none;
-  max-width: 340px;
+  max-width: 300px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
