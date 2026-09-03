@@ -54,7 +54,7 @@ export function apply(ctx: ClientContext): (() => void) | void {
   // any surface, including the new-session page where chat tabs do not render.
   ctx.slots.inject('settings.section' as never, () =>
     ctx.slots.register(
-      { name: 'settings.section', id: 'swarm' } as never,
+      { name: 'settings.section', id: 'swarm', order: 30, label: 'AI Swarm' } as never,
       SwarmSettingsSection as never,
     ),
   )
