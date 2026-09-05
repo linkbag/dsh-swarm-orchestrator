@@ -31,7 +31,7 @@ function timeAgo(at: number): string {
   return `${Math.round(seconds / 86400)}d ago`
 }
 
-export function SwarmTab(): JSX.Element {
+export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
   const [board, setBoard] = useState<Board | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
@@ -39,6 +39,31 @@ export function SwarmTab(): JSX.Element {
   const [view, setView] = useState<'board' | 'flow' | 'roster'>('board')
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+
+  // Workspace scoping (v0.4.0): default to this chat's workspace; "All" is one click away.
+  const [scope, setScope] = useState<'workspace' | 'all'>(() =>
+    localStorage.getItem('dsh-swarm-workspace-scope') === 'all' ? 'all' : 'workspace')
+  const [chatCwd, setChatCwd] = useState<string | null>(null)
+  const [cwdUnresolvable, setCwdUnresolvable] = useState(false)
+
+  const switchScope = useCallback((next: 'workspace' | 'all') => {
+    setScope(next)
+    localStorage.setItem('dsh-swarm-workspace-scope', next)
+  }, [])
+
+  useEffect(() => {
+    if (sessionId === undefined || sessionId.length === 0) { setCwdUnresolvable(true); return }
+    let cancelled = false
+    void fetch(`/swarm/workspace?session=${encodeURIComponent(sessionId)}`)
+      .then((r) => r.json() as Promise<{ cwd?: string; unresolvable?: boolean }>)
+      .then((info) => {
+        if (cancelled) return
+        if (typeof info.cwd === 'string' && info.cwd.length > 0) setChatCwd(info.cwd)
+        else setCwdUnresolvable(true)
+      })
+      .catch(() => { if (!cancelled) setCwdUnresolvable(true) })
+    return () => { cancelled = true }
+  }, [sessionId])
 
   useEffect(() => {
     const store = boardStore()
@@ -53,7 +78,19 @@ export function SwarmTab(): JSX.Element {
     }
   }, [])
 
-  const runs = board?.runs ?? []
+  const normalizeWorkspace = (p: string): string => p.replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
+  const workspaceOf = (r: { dispatch?: { cwd?: string } }): string | null => r.dispatch?.cwd ?? null
+
+  const runs = useMemo(() => {
+    const all = board?.runs ?? []
+    if (scope !== 'workspace' || chatCwd === null) return all
+    const norm = normalizeWorkspace(chatCwd)
+    return all.filter((r) => {
+      const cwd = r.dispatch?.cwd
+      return cwd !== undefined && normalizeWorkspace(cwd) === norm
+    })
+  }, [board, scope, chatCwd])
+
   const run = useMemo(() => {
     if (selectedRunId !== null) {
       const found = runs.find((r) => r.id === selectedRunId)
@@ -89,13 +126,35 @@ export function SwarmTab(): JSX.Element {
           <button className={view === 'flow' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('flow') }}>Flow</button>
           <button className={view === 'roster' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('roster') }}>Roster</button>
         </div>
+  // Workspace scope switch: visible whenever the tab knows which chat it is in.
+  {sessionId !== undefined && (
+    <div className="dsh-swarm-segments" role="tablist" title="Which runs this tab shows">
+      <button
+        className={scope === 'workspace' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'}
+        disabled={cwdUnresolvable}
+        title={cwdUnresolvable ? "Couldn't resolve this chat's workspace — showing all runs" : 'Show runs from this workspace'}
+        onClick={() => { switchScope('workspace') }}
+      >This workspace</button>
+      <button
+        className={scope === 'all' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'}
+        onClick={() => { switchScope('all') }}
+      >All</button>
+    </div>
+  )}
         <span className={error !== null ? 'dsh-swarm-pill warn' : 'dsh-swarm-pill'}>
           {error !== null ? 'host offline' : board !== null ? `v${board.version} · seq ${board.seq} · ${runs.length} run${runs.length === 1 ? '' : 's'}` : 'connecting…'}
         </span>
       </header>
 
       {view === 'roster' ? (
-        <DutyTableEditor board={board} onSaved={() => {}} />
+        <>
+          {cwdUnresolvable && sessionId !== undefined && (
+            <p className="dsh-swarm-dim" style={{ padding: '8px 16px 0' }}>
+              Couldn't resolve this chat's workspace — showing the shared roster for all workspaces.
+            </p>
+          )}
+          <DutyTableEditor board={board} onSaved={() => {}} />
+        </>
       ) : view === 'flow' ? (
         run !== null ? (
           <FlowChart run={run} tasks={tasks} />

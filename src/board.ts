@@ -11,11 +11,19 @@ export interface BoardSnapshot {
   roles: DutyTable['roles']
   override?: DutyTable['override']
   at: number
+  /** Workspace scope of this snapshot (present when the request asked for one). */
+  scope?: { cwd?: string; unresolvable?: boolean }
 }
 
 const MAX_RUNS = 50
 
-export function buildBoardSnapshot(state: SwarmState, duty: DutyTable, seq: number, version: string): BoardSnapshot {
+export function buildBoardSnapshot(
+  state: SwarmState,
+  duty: DutyTable,
+  seq: number,
+  version: string,
+  scope?: { cwd?: string; unresolvable?: boolean },
+): BoardSnapshot {
   const runs = [...state.runs.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_RUNS)
   const runIds = new Set(runs.map((run) => run.id))
   const tasks = [...state.tasks.values()].filter((task) => runIds.has(task.runId))
@@ -27,6 +35,7 @@ export function buildBoardSnapshot(state: SwarmState, duty: DutyTable, seq: numb
     tasks,
     roles: duty.roles,
     ...(duty.override !== undefined ? { override: duty.override } : {}),
+    ...(scope !== undefined && (scope.cwd !== undefined || scope.unresolvable === true) ? { scope } : {}),
     at: Date.now(),
   }
 }

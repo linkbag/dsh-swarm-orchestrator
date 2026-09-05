@@ -12,6 +12,7 @@ export interface BoardRun {
   taskIds: string[]
   report?: RunReport
   pauseReason?: string
+  dispatch?: { cwd?: string; presetId?: string }
   stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number }
 }
 

@@ -84,7 +84,22 @@ export function registerSwarmRoutes(ctx: Context, service: SwarmService): (() =>
           return
         }
         if (req.method === 'GET' && url.startsWith('/swarm/board')) {
-          sendJson(res, 200, service.snapshot())
+          const params = new URL(url, 'http://localhost').searchParams
+          sendJson(res, 200, service.snapshot({
+            ...(params.has('session') ? { session: params.get('session') ?? undefined } : {}),
+            ...(params.has('cwd') ? { cwd: params.get('cwd') ?? undefined } : {}),
+          }))
+          return
+        }
+        if (req.method === 'GET' && url.startsWith('/swarm/workspace')) {
+          const params = new URL(url, 'http://localhost').searchParams
+          const session = params.get('session') ?? ''
+          if (session.length === 0) {
+            sendJson(res, 400, { error: 'session required' })
+            return
+          }
+          const cwd = service.resolveSessionWorkspace(session)
+          sendJson(res, 200, cwd === undefined ? { session, unresolvable: true } : { session, cwd })
           return
         }
         if (req.method === 'GET' && url.startsWith('/swarm/events')) {

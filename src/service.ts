@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { exec } from 'node:child_process'
-import { mkdirSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
+import { zstdDecompressSync } from 'node:zlib'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
@@ -27,6 +28,32 @@ function classifyFailure(reason: string): 'quota' | 'provider' | 'other' {
   return 'other'
 }
 
+/** Canonical workspace compare: forward slashes, no trailing separator, case-folded on Windows. */
+function normalizePath(p: string): string {
+  const trimmed = p.replace(/[\\/]+$/, '').replace(/\\/g, '/')
+  return process.platform === 'win32' ? trimmed.toLowerCase() : trimmed
+}
+
+/**
+ * Read the durable session header's cwd without booting the session: the log's
+ * first zstd frame is the header event itself, so decode exactly that frame.
+ */
+function decodeSessionHeaderCwd(logPath: string): string | undefined {
+  try {
+    const buf = readFileSync(logPath)
+    const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+    const start = buf.indexOf(magic)
+    if (start === -1) return undefined
+    let end = buf.indexOf(magic, start + 1)
+    if (end === -1) end = buf.length
+    const text = zstdDecompressSync(buf.subarray(start, end)).toString('utf8')
+    const header = JSON.parse(text.split('\n')[0]) as { cwd?: unknown }
+    return typeof header.cwd === 'string' && header.cwd.length > 0 ? header.cwd : undefined
+  } catch {
+    return undefined
+  }
+}
+
 interface InFlight {
   controller: AbortController
   taskKey: string
@@ -41,6 +68,8 @@ interface AgentsLike {
     agentOptions?: { provider?: string; model?: string }
     setup?: (anchorCtx: unknown) => void | Promise<void>
   }): Promise<{ agent: Agent; dispose(): Promise<void> }>
+  /** Live-agent lookup by session id (workspace resolution). */
+  get?(id: string): { session?: { header?: { cwd?: string } } } | undefined
 }
 
 /** Structural view of the agentPresets service for anchor composition. */
@@ -317,9 +346,61 @@ export class SwarmService extends Service {
     return saved
   }
 
-  snapshot(): BoardSnapshot {
+  /**
+   * Resolve the workspace (cwd) a session belongs to: the live agent's
+   * session header first, then the persisted session log's durable header.
+   * Undefined = unresolvable (the caller falls back to the unfiltered view).
+   */
+  resolveSessionWorkspace(sessionId: string): string | undefined {
+    if (sessionId.length === 0) return undefined
+    try {
+      const agents = this.ctx.get('agents') as AgentsLike | undefined
+      const live = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
+      const liveCwd = (live as { session?: { header?: { cwd?: string } } } | undefined)?.session?.header?.cwd
+      if (typeof liveCwd === 'string' && liveCwd.length > 0) return liveCwd
+    } catch { /* live lookup unavailable — fall through to the durable header */ }
+    try {
+      // $DSH_HOME/sessions/<workspace-dir>/<sessionId>/session.jsonl.zstd
+      const sessionsRoot = join(dirname(dirname(this.swarmConfig.storageDir)), 'sessions')
+      for (const entry of readdirSync(sessionsRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue
+        const logPath = join(sessionsRoot, entry.name, sessionId, 'session.jsonl.zstd')
+        if (!existsSync(logPath)) continue
+        return decodeSessionHeaderCwd(logPath)
+      }
+    } catch { /* best effort */ }
+    return undefined
+  }
+
+  snapshot(filter?: { session?: string; cwd?: string }): BoardSnapshot {
     const state = this.view()
-    return buildBoardSnapshot(state, this.duty.get(), this.events.seq, PLUGIN_VERSION)
+    let effective = state
+    let scopeCwd: string | undefined
+    let scopeUnresolvable = false
+    if (filter?.cwd !== undefined || filter?.session !== undefined) {
+      const cwd = filter?.cwd !== undefined
+        ? filter.cwd
+        : (filter?.session !== undefined ? this.resolveSessionWorkspace(filter.session) : undefined)
+      if (cwd === undefined) {
+        // Couldn't tie the request to a workspace: serve the unfiltered board
+        // and say so, rather than showing an empty screen.
+        scopeUnresolvable = true
+      } else {
+        scopeCwd = cwd
+        const norm = normalizePath(cwd)
+        const keep = new Set<string>()
+        for (const run of state.runs.values()) {
+          const runCwd = run.dispatch?.cwd
+          // Runs without a recorded workspace (legacy) stay in the global view only.
+          if (runCwd !== undefined && normalizePath(runCwd) === norm) keep.add(run.id)
+        }
+        effective = {
+          runs: new Map([...state.runs.entries()].filter(([id]) => keep.has(id))),
+          tasks: new Map([...state.tasks.entries()].filter(([, t]) => keep.has(t.runId))),
+        }
+      }
+    }
+    return buildBoardSnapshot(effective, this.duty.get(), this.events.seq, PLUGIN_VERSION, { cwd: scopeCwd, unresolvable: scopeUnresolvable })
   }
 
   statusText(runId?: string): string {
