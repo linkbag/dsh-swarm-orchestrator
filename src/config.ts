@@ -2,7 +2,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-export const PLUGIN_VERSION = '0.3.1'
+export const PLUGIN_VERSION = '0.4.0'
 
 function defaultStorageDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
