@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { boardStore, type Board, type BoardTask } from './board-store'
 import { DutyTableEditor } from './DutyTableEditor'
+import { FlowChart } from './FlowChart'
 
 const STATUS_COLUMNS: Array<{ key: string; label: string; statuses: string[] }> = [
   { key: 'queued', label: 'Queued', statuses: ['pending', 'retrying'] },
@@ -35,7 +36,7 @@ export function SwarmTab(): JSX.Element {
   const [error, setError] = useState<string | null>(null)
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
   const [selectedTask, setSelectedTask] = useState<BoardTask | null>(null)
-  const [view, setView] = useState<'board' | 'roster'>('board')
+  const [view, setView] = useState<'board' | 'flow' | 'roster'>('board')
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -85,6 +86,7 @@ export function SwarmTab(): JSX.Element {
         <h2>Swarm</h2>
         <div className="dsh-swarm-segments" role="tablist">
           <button className={view === 'board' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('board') }}>Board</button>
+          <button className={view === 'flow' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('flow') }}>Flow</button>
           <button className={view === 'roster' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('roster') }}>Roster</button>
         </div>
         <span className={error !== null ? 'dsh-swarm-pill warn' : 'dsh-swarm-pill'}>
@@ -94,6 +96,12 @@ export function SwarmTab(): JSX.Element {
 
       {view === 'roster' ? (
         <DutyTableEditor board={board} onSaved={() => {}} />
+      ) : view === 'flow' ? (
+        run !== null ? (
+          <FlowChart run={run} tasks={tasks} />
+        ) : (
+          <div className="dsh-swarm-placeholder"><p>No run selected — dispatch a run or pick one on the Board first.</p></div>
+        )
       ) : board === null && error === null ? (
         <div className="dsh-swarm-placeholder"><p>Connecting to the swarm host…</p></div>
       ) : runs.length === 0 ? (
