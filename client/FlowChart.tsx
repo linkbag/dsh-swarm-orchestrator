@@ -113,11 +113,13 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
         {layout.ranks.map((r) => {
           const row = layout.byRank.get(r) ?? []
           const parallel = row.length > 1
+          // The label pill sits centered in the gap ABOVE its wave, clear of
+          // the node boxes (the row band starts at (r+1) * rowStride).
           return (
             <div
               key={`wave-${r}`}
               className="dsh-swarm-flow-wave"
-              style={{ left: 0, top: centerY(r + 1) - 12, width: layout.width + 32 }}
+              style={{ left: '50%', top: (r + 1) * (NODE_H + GAP_Y) - 23, transform: 'translateX(-50%)' }}
             >
               wave {r + 1}{parallel ? ` — ${row.length} in parallel` : ''}
             </div>

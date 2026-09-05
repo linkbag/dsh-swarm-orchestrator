@@ -295,10 +295,14 @@
 .dsh-swarm-flow-node-writes { font-size: 10.5px; opacity: 0.6; margin-top: 2px; }
 .dsh-swarm-flow-wave {
   position: absolute;
+  z-index: 1;
   font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
-  opacity: 0.45; text-align: center;
-  border-top: 1px dashed rgba(125, 125, 125, 0.3);
-  padding-top: 4px;
+  opacity: 0.9; white-space: nowrap;
+  padding: 2px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(125, 125, 125, 0.3);
+  background: rgba(20, 22, 26, 0.85);
+  color: rgba(232, 232, 232, 0.85);
 }
 .dsh-swarm-flow-edges { position: absolute; left: 0; top: 0; pointer-events: none; }
 .dsh-swarm-flow-edge { fill: none; stroke: rgba(125, 125, 125, 0.55); stroke-width: 1.5; }
