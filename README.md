@@ -21,14 +21,17 @@ This plugin takes the coordination seriously so you don't have to:
 - **Review before "done" means done.** Tasks tagged `reviewBy` are judged by a reviewer agent against the task brief; a rejection loops back to the builder with the feedback attached. Want the last word yourself? Set `reviewGate: "human"` and approve from the dashboard.
 - **Failure is a state, not a mystery.** Provider timeouts, quota exhaustion, bad evidence — each is detected, reported plainly, and handled: retries with resume hints, run pause/resume instead of burn-down, automatic model rotation after repeated failures.
 - **Nothing starts without you.** Runs sit in *planning* until you endorse them on the board. A server-side option (`requireManualEndorsement`) makes that gate impossible to bypass from chat, even by a model that decides to be helpful.
+- **Scoped to where you are.** Each chat's Swarm tab shows the runs for that chat's workspace; a persisted switch reveals everything on the machine when you want the full picture.
 
 ## The dashboard
 
-A **Swarm** tab lives next to Chat in the web GUI:
+A **Swarm** tab lives next to Chat in the web GUI, in three views:
 
 - **Board** — runs on the left, task columns (Queued / Running / Done / Failed) front and center. Click a task for its full brief, model, attempt count, interim agent notes, reviewer feedback, and retry. Completed runs fold into a report with per-task summaries and fallback/retry/review stats.
+- **Flow** — the task DAG as a living flow chart: the scheduler at the top, tasks fanned out into parallel waves (same wave = runs concurrently), dependency arrows turning green as blockers complete, reviewer and write-scope hints on each node, all converging into the run report. You can see at a glance what ran in parallel, what ran in sequence, and exactly how far the run has gotten.
 - **Roster** — the duty-table editor: per-role model pickers fed by your live catalog, fallback-chain ordering, effort ladder, concurrency caps, tool filters, personas, custom roles, and an override lock for "hands off my table".
 - **Everywhere else** — a 🐝 status button in every session header, a small badge for active runs, and a live progress card right in chat where the run was dispatched.
+- **Workspace-aware** — each chat's Swarm tab shows the runs for that chat's workspace; an **All** switch reveals every run on the machine. The roster stays global (one table, all workspaces).
 
 ## How a run works
 
@@ -74,13 +77,13 @@ or the one-shot form: `/swarm build a landing page for this project` (plans it, 
 
 | Tool | What it does |
 | --- | --- |
-| `swarm_dispatch` | Submit a run: title, objective, task DAG (id / subject / description / role / blockedBy / reviewBy / reviewGate / model / evidence). |
+| `swarm_dispatch` | Submit a run: title, objective, task DAG (id / subject / description / role / blockedBy / reviewBy / reviewGate / model / evidence / writes). |
 | `swarm_status` | The board in text: runs, task states, models in use, latest notes. |
 | `swarm_wait` | Block until the board changes or a timeout hits — supervision without sleep-polling. |
 | `swarm_retry` | Requeue a failed/blocked task after you've fixed the cause (dispatching session only). |
 | `swarm_report` | Task agents post interim notes to the board (authenticated to their own task). |
 
-Tasks also accept an **evidence contract** — `evidence: { files: [...], commands: [...] }` — that is machine-checked before a task may close, and a **human review gate** that parks the verdict on the dashboard.
+Tasks also accept an **evidence contract** — `evidence: { files: [...], commands: [...] }` — that is machine-checked before a task may close; a **write scope** — `writes: [files]` — that keeps concurrent builders out of each other's files (the dispatcher warns on overlap); and a **human review gate** that parks the verdict on the dashboard.
 
 ## Configuration
 
@@ -94,6 +97,7 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
     maxConcurrent: 5            # simultaneous task agents
     adaptiveConcurrency: true   # shrink on provider pain, recover on success
     spawnStaggerMs: 750         # pace launches within a wave
+    nudgeAfterMinutes: 20       # board marker for long-silent tasks (0 = off)
     staleTimeoutSeconds: 14400  # watchdog: silent agents get reclaimed
     maxRetries: 2               # per task
     reviewLoops: 3              # review rejections per task
@@ -109,7 +113,7 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
 
 ## Status
 
-v0.3.0, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (38 tests: dispatch, endorsement, review loops, fallbacks, quota pause, rescue paths, evidence contracts, event-log legality), plus live verification on a real deployment.
+v0.4.0, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (40 tests: dispatch, endorsement, review loops, human gates, fallback rotation, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality), plus live verification on a real deployment.
 
 ## License
 

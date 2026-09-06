@@ -21,14 +21,17 @@
 - **先过评审，才算完成。** 标了 `reviewBy` 的任务由评审代理对照任务简报裁决；驳回就带着反馈回到队列返工。想自己拍板？`reviewGate: "human"`，裁决权回到看板上的你。
 - **失败是状态，不是谜语。** provider 超时、配额耗尽、证据缺失——每一类都会被识别、直白地报告，并各有各的处理：带续作提示的重试、整体暂停后一键恢复、反复失败后自动换模型。
 - **没有你点头，什么都不跑。** 运行先停在 *planning*，在看板上人工放行才启动。还提供 `requireManualEndorsement` 服务端开关——打开之后，连模型自己都无法从聊天里绕过这道门。
+- **只看你所在的战场。** 每个聊天的 Swarm 标签页默认只显示该工作区的运行；一个常驻开关随时切到"全部运行"。
 
 ## 看板
 
-**Swarm** 标签页就在 Web GUI 里 Chat 旁边：
+**Swarm** 标签页就在 Web GUI 里 Chat 旁边，共三个视图：
 
 - **Board** —— 左侧运行列表，中间任务四列看板（Queued / Running / Done / Failed）。点开任务：完整简报、所用模型、尝试次数、过程中的代理备注、评审反馈、重试按钮。跑完的运行折叠成报告：谁做了什么、用了哪个模型、回退/重试/评审统计。
+- **Flow** —— 任务 DAG 的实时流程图：顶部调度器、任务按波次扇出（同一波 = 并行执行）、依赖箭头在前置完成时变绿、节点上带评审与写入范围提示，最终汇入运行报告。谁并行、谁串行、跑到哪一步，一眼可见。
 - **Roster** —— 分工表编辑器：按角色选模型（实时目录、按 provider 分组）、回退链排序、思考等级阶梯、角色并发上限、工具过滤、人设、自定义角色，还有一个"锁定分工表"的覆盖开关。
 - **其他地方也能看到** —— 每个会话头部有 🐝 状态按钮，全局有活跃运行徽标，派发运行的那个聊天里直接长出实时进度卡片。
+- **工作区感知** —— 每个聊天的 Swarm 标签页只显示该工作区的运行；**All** 开关随时查看机器上的全部运行。Roster 保持全局（一张分工表，管所有工作区）。
 
 ## 一次运行的生命周期
 
@@ -74,13 +77,13 @@ dsh plugin --profile web add ./dsh-swarm-orchestrator
 
 | 工具 | 用途 |
 | --- | --- |
-| `swarm_dispatch` | 提交运行：标题、目标、任务图（id / subject / description / role / blockedBy / reviewBy / reviewGate / model / evidence）。 |
+| `swarm_dispatch` | 提交运行：标题、目标、任务图（id / subject / description / role / blockedBy / reviewBy / reviewGate / model / evidence / writes）。 |
 | `swarm_status` | 文字版看板：运行、任务状态、所用模型、最新备注。 |
 | `swarm_wait` | 阻塞等待看板变化或超时——监督运行不再需要 sleep 轮询。 |
 | `swarm_retry` | 排障之后重新入队失败/阻塞的任务（限派发会话）。 |
 | `swarm_report` | 任务代理向看板发送过程备注（按任务鉴权）。 |
 
-任务还支持**证据合约**——`evidence: { files: [...], commands: [...] }`，机器校验通过任务才算关闭；也可以开**人工评审门**，裁决权交还看板。
+任务还支持**证据合约**——`evidence: { files: [...], commands: [...] }`，机器校验通过任务才算关闭；**写入范围**——`writes: [files]`，并发建造者互不越界（调度器会对重叠范围给出警告）；以及**人工评审门**，裁决权交还看板。
 
 ## 配置
 
@@ -94,6 +97,7 @@ dsh plugin --profile web add ./dsh-swarm-orchestrator
     maxConcurrent: 5            # 同时运行的任务代理数
     adaptiveConcurrency: true   # provider 吃紧时收缩，恢复后回升
     spawnStaggerMs: 750         # 同一波派发的启动间隔
+    nudgeAfterMinutes: 20       # 长时间静默的任务在看板上打点（0 = 关闭）
     staleTimeoutSeconds: 14400  # 看门狗：静默任务被回收
     maxRetries: 2               # 每个任务的重试次数
     reviewLoops: 3              # 每个任务的评审驳回上限
@@ -109,7 +113,7 @@ dsh plugin --profile web add ./dsh-swarm-orchestrator
 
 ## 状态
 
-v0.3.0，日常使用中。测试覆盖调度器对假 spawn provider 的端到端行为（38 个用例：派发、放行、评审循环、模型回退、配额暂停、救援路径、证据合约、事件日志合法性），并已在真实部署上完成在线验证。
+v0.4.0，日常使用中。测试覆盖调度器对假 spawn provider 的端到端行为（40 个用例：派发、放行、评审循环、人工评审门、模型回退轮换、配额暂停/恢复、救援路径、证据合约、写入范围警告、事件日志合法性），并已在真实部署上完成在线验证。
 
 ## 许可证
 
