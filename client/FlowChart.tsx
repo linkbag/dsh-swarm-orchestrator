@@ -13,7 +13,7 @@ const NODE_H = 68        // uniform — deterministic layout
 const SCHEDULER_H = 48
 const REPORT_H = 48
 const GAP_X = 40         // horizontal gap between parallel nodes
-const GAP_Y = 64         // vertical gap between ranks (space for edge + wave label)
+const GAP_Y = 32         // vertical gap between ranks — short arrows, tight layout
 const CANVAS_PAD = 16    // left/right padding inside the canvas
 
 function statusColor(status: string): string {
@@ -216,7 +216,7 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
           {layout.ranks.map((r) => {
             const row = layout.byRank.get(r) ?? []
             const parallel = row.length > 1
-            const labelY = layout.schedBottom + r * layout.rowStride - GAP_Y / 2 - 8
+            const labelY = layout.schedBottom + r * layout.rowStride - GAP_Y / 2 - 6
             return (
               <div
                 key={`wave-${r}`}
