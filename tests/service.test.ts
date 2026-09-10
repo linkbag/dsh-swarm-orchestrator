@@ -718,6 +718,7 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(service.snapshot().tasks.filter((t) => t.runId === optedOut.runId).length).toBe(1)
 
     // Duty table without an architect role → degraded with a notice, never a throw.
+    const originalTable = structuredClone(service.duty.get())
     const table = structuredClone(service.duty.get())
     delete table.roles.architect
     service.setDutyTable(table, 'test')
@@ -731,7 +732,7 @@ describe('swarm service (integration, fake subagents)', () => {
 
     // A dispatched task already owning the id 'architect-review' must not
     // silently cancel the review — the injected root takes a fresh id.
-    service.setDutyTable(structuredClone(service.duty.get()), 'restore')
+    service.setDutyTable(originalTable, 'restore')
     const collides = service.dispatch({
       title: 'id collision',
       spec: 's',
