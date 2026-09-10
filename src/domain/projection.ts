@@ -64,6 +64,7 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
     const dispatch = d.dispatch as Record<string, unknown> | undefined
     if (dispatch !== null && typeof dispatch === 'object') {
       const captured: Run['dispatch'] = {}
+      if (typeof dispatch.sessionId === 'string') captured.sessionId = dispatch.sessionId
       if (typeof dispatch.presetId === 'string') captured.presetId = dispatch.presetId
       if (typeof dispatch.provider === 'string') captured.provider = dispatch.provider
       if (typeof dispatch.model === 'string') captured.model = dispatch.model
@@ -85,6 +86,7 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         blockedBy: Array.isArray(spec.blockedBy) ? (spec.blockedBy as string[]) : undefined,
         reviewBy: typeof spec.reviewBy === 'string' ? spec.reviewBy : undefined,
         reviewGate: spec.reviewGate === 'human' ? 'human' : undefined,
+        writes: Array.isArray(spec.writes) ? (spec.writes as string[]).filter((w) => typeof w === 'string') : undefined,
         model: spec.model !== null && typeof spec.model === 'object'
           && typeof (spec.model as Record<string, unknown>).provider === 'string'
           && typeof (spec.model as Record<string, unknown>).model === 'string'

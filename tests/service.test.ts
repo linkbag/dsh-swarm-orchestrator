@@ -665,4 +665,128 @@ describe('swarm service (integration, fake subagents)', () => {
     fake.release()
     await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes after release')
   })
+
+  it('injects an architect-review root when enabled and no architect task exists', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ requireArchitectReview: true })
+    contexts.push(ctx)
+    dirs.push(dir)
+    void fake
+
+    const result = service.dispatch({
+      title: 'injection demo',
+      spec: 's',
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder', writes: ['x.js'] },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder', blockedBy: ['a'] },
+      ],
+    }, makeDispatcher() as never)
+
+    expect(result.taskCount).toBe(3) // architect-review + the two dispatched tasks
+    const tasks = service.snapshot().tasks.filter((t) => t.runId === result.runId)
+    const arch = tasks.find((t) => t.id === 'architect-review')!
+    expect(arch.role).toBe('architect')
+    expect(arch.evidence?.files).toContain('PLAN.md')
+    expect(arch.description).toContain('injection demo')
+    expect(arch.description).toContain('REVIEW and REFINE')
+    // every dispatched task is gated behind the review, original edges preserved
+    expect(tasks.find((t) => t.id === 'a')?.blockedBy).toEqual(['architect-review'])
+    expect(tasks.find((t) => t.id === 'b')?.blockedBy).toEqual(['architect-review', 'a'])
+    service.abort(result.runId)
+  })
+
+  it('architect injection: explicit architect task wins, opt-out respected, missing role degrades to a notice', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ requireArchitectReview: true })
+    contexts.push(ctx)
+    dirs.push(dir)
+    void fake
+
+    // Explicit architect task in the DAG → no injection.
+    const explicit = service.dispatch({
+      title: 'explicit architect',
+      spec: 's',
+      tasks: [{ id: 'plan', subject: 'P', description: 'd', role: 'architect' }],
+    }, undefined)
+    expect(service.snapshot().tasks.filter((t) => t.runId === explicit.runId && t.id === 'architect-review').length).toBe(0)
+
+    // Per-dispatch opt-out → no injection.
+    const optedOut = service.dispatch({
+      title: 'opt out',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+      architectReview: false,
+    }, undefined)
+    expect(service.snapshot().tasks.filter((t) => t.runId === optedOut.runId).length).toBe(1)
+
+    // Duty table without an architect role → degraded with a notice, never a throw.
+    const table = structuredClone(service.duty.get())
+    delete table.roles.architect
+    service.setDutyTable(table, 'test')
+    const degraded = service.dispatch({
+      title: 'no architect role',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, undefined)
+    expect(degraded.warnings?.some((w) => w.includes('architect review skipped'))).toBe(true)
+    expect(service.snapshot().tasks.filter((t) => t.runId === degraded.runId).length).toBe(1)
+  })
+
+  it('warns when a workspace already has an active run, and names overlapping writes', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ workspaceRunPolicy: 'warn' })
+    contexts.push(ctx)
+    dirs.push(dir)
+    void fake
+
+    const first = service.dispatch({
+      title: 'first run',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', writes: ['core.js'] }],
+    }, makeDispatcher() as never)
+    expect(first.warnings).toBeUndefined() // first dispatch in the workspace: clean
+
+    const second = service.dispatch({
+      title: 'second run',
+      spec: 's',
+      tasks: [{ id: 'x', subject: 'X', description: 'd', role: 'builder', writes: ['core.js'] }],
+    }, makeDispatcher() as never)
+    expect(second.warnings?.some((w) => w.includes('already active in this workspace') && w.includes('"core.js"'))).toBe(true)
+
+    // A run in a DIFFERENT workspace is not a sibling.
+    const elsewhere = {
+      id: 'p2',
+      options: { provider: 'zai', model: 'glm-5.3' },
+      session: { header: { id: 'p2', cwd: 'D:\\elsewhere' } },
+      ctx: { get: (): undefined => undefined },
+    } as never
+    const third = service.dispatch({ title: 'other workspace', spec: 's', tasks: [{ id: 'y', subject: 'Y', description: 'd', role: 'builder' }] }, elsewhere)
+    expect(third.warnings).toBeUndefined()
+  })
+
+  it("block policy rejects dispatches that would run beside an active sibling", async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ workspaceRunPolicy: 'block' })
+    contexts.push(ctx)
+    dirs.push(dir)
+    void fake
+
+    service.dispatch({ title: 'first', spec: 's', tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }] }, makeDispatcher() as never)
+    expect(() => service.dispatch({ title: 'second', spec: 's', tasks: [{ id: 'b', subject: 'B', description: 'd', role: 'builder' }] }, makeDispatcher() as never))
+      .toThrow(/workspace already has an active run/)
+  })
+
+  it('captures the dispatcher session id from the agent object when the header lacks it', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    void fake
+
+    const parent = {
+      id: 'agent-has-id',
+      options: { provider: 'zai', model: 'glm-5.3' },
+      session: { header: { cwd: 'D:\\work' } }, // header present but no id field
+      ctx: { get: (): undefined => undefined },
+    } as never
+    const result = service.dispatch({ title: 'sid demo', spec: 's', tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }] }, parent)
+    const run = service.snapshot().runs.find((r) => r.id === result.runId)!
+    expect(run.dispatch?.sessionId).toBe('agent-has-id')
+    expect(run.dispatch?.cwd).toBe('D:\\work')
+  })
 })
