@@ -1,6 +1,6 @@
 # dsh-swarm-orchestrator
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+[English](README.md) · [简体中文](https://github.com/linkbag/dsh-swarm-orchestrator/blob/main/docs/zh-CN.md)
 
 Role-based AI swarms for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). Give it a goal, get a team: an architect breaks the work into a task graph, parallel builders execute it, reviewers hold the line, and an integrator ships the result — while you watch the whole thing move on a live kanban board.
 
@@ -206,4 +206,4 @@ MIT © linkbag
 
 ---
 
-简体中文文档见 [README.zh-CN.md](README.zh-CN.md)。
+简体中文文档见 [docs/zh-CN.md](https://github.com/linkbag/dsh-swarm-orchestrator/blob/main/docs/zh-CN.md)。

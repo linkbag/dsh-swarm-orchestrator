@@ -1,6 +1,6 @@
 # dsh-swarm-orchestrator
 
-[简体中文](README.zh-CN.md) · [English](README.md)
+[简体中文](https://github.com/linkbag/dsh-swarm-orchestrator/blob/main/docs/zh-CN.md) · [English](https://github.com/linkbag/dsh-swarm-orchestrator/blob/main/README.md)
 
 给 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）装上一个角色化 AI 蜂群：你出目标，它出团队。架构师拆解任务，多个施工代理并行干活，评审代理把关质量，集成代理负责收尾——整个过程在看板上实时可见。
 
