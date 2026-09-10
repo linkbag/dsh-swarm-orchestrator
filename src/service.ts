@@ -244,11 +244,24 @@ export class SwarmService extends Service {
       const task = state.tasks.get(key)
       if (task === undefined) {
         this.inFlight.delete(key)
+        this.nudgeCount.delete(key)
+        this.nudgedAt.delete(key)
+        continue
+      }
+      // A task that left the running state (completed, failed, blocked) while
+      // still holding an inFlight slot (settle handler racing the sweep) —
+      // clean the tracking Maps to avoid stale entries.
+      if (task.status !== 'running' && task.status !== 'dispatching' && task.status !== 'reviewing') {
+        this.inFlight.delete(key)
+        this.nudgeCount.delete(key)
+        this.nudgedAt.delete(key)
         continue
       }
       if (this.view().runs.get(task.runId)?.status === 'aborted') continue
       if (now - task.updatedAt > staleMs) {
         this.inFlight.delete(key)
+        this.nudgeCount.delete(key)
+        this.nudgedAt.delete(key)
         flight.controller.abort()
         this.events.append('task/failed', {
           runId: task.runId, taskId: task.id,
