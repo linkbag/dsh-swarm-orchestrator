@@ -347,15 +347,19 @@ export class SwarmService extends Service {
     const wantsReview = input.architectReview ?? this.swarmConfig.requireArchitectReview
     let effectiveTasks = tasks
     if (wantsReview && !tasks.some((t) => t.role === 'architect')) {
+      // Uniquify the injected id: a dispatched task may already own the name
+      // 'architect-review' — the review must still happen, under a fresh id.
+      let reviewId = 'architect-review'
+      for (let n = 2; tasks.some((t) => t.id === reviewId); n += 1) reviewId = `architect-review-${n}`
       const injectedDag: TaskSpec[] = [
         {
-          id: 'architect-review',
+          id: reviewId,
           subject: 'Review and refine the proposed plan',
           description: architectReviewPrompt(input.title, input.spec, tasks),
           role: 'architect',
           evidence: { files: ['PLAN.md'] },
         },
-        ...tasks.map((t) => ({ ...t, blockedBy: ['architect-review', ...(t.blockedBy ?? [])] })),
+        ...tasks.map((t) => ({ ...t, blockedBy: [reviewId, ...(t.blockedBy ?? [])] })),
       ]
       const injectedKnown = [...new Set(injectedDag.map((t) => t.role))].every((r) => known.includes(r))
       const injectedValid = validateDag(injectedDag).valid

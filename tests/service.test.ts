@@ -728,6 +728,19 @@ describe('swarm service (integration, fake subagents)', () => {
     }, undefined)
     expect(degraded.warnings?.some((w) => w.includes('architect review skipped'))).toBe(true)
     expect(service.snapshot().tasks.filter((t) => t.runId === degraded.runId).length).toBe(1)
+
+    // A dispatched task already owning the id 'architect-review' must not
+    // silently cancel the review — the injected root takes a fresh id.
+    service.setDutyTable(structuredClone(service.duty.get()), 'restore')
+    const collides = service.dispatch({
+      title: 'id collision',
+      spec: 's',
+      tasks: [{ id: 'architect-review', subject: 'mine', description: 'd', role: 'builder' }],
+    }, undefined)
+    const collisionTasks = service.snapshot().tasks.filter((t) => t.runId === collides.runId)
+    const review = collisionTasks.find((t) => t.role === 'architect')!
+    expect(review.id).toBe('architect-review-2')
+    expect(collisionTasks.find((t) => t.id === 'architect-review')?.blockedBy).toEqual(['architect-review-2'])
   })
 
   it('warns when a workspace already has an active run, and names overlapping writes', async () => {
