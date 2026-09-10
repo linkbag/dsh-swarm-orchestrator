@@ -10,6 +10,37 @@ It has already shipped real work: the first production run reverse-engineered a 
 
 ---
 
+## At a glance
+
+**dsh-swarm-orchestrator** turns one goal into a supervised agent team inside DeepSeek Harness: an architect reviews your plan into `PLAN.md`, parallel builders execute it as a task DAG, reviewers gate quality, an integrator ships. Every run is endorsed by you before anything spawns, every role runs a model you pin from your live catalog, every deliverable can be machine-verified, and the whole pipeline is visible on a live kanban + flow chart.
+
+```text
+        you ── "spawn a swarm: ⟨goal⟩"
+         │
+         ▼
+   your chat agent            (free to plan/research on its own —
+         │  swarm_dispatch     its plan becomes the proposal)
+         ▼
+  ▣ ENDORSEMENT GATE          run sits in *planning*, nothing spawns,
+         │                     until you click Endorse on the Swarm tab
+         ▼
+  ┌─────────────────┐
+  │ architect-review │  deep-reviews the proposal against the repo,
+  │  → PLAN.md       │  consolidates parallel workstreams (evidence-checked)
+  └────────┬────────┘
+    ┌──────┼──────┐
+    ▼      ▼      ▼
+ builder builder builder    ▸ parallel wave — one model per role,
+    │      │      │           fallback chains, exclusive write scopes
+    ▼      ▼      ▼
+ reviewer reviewer (human)   ▸ rejections loop back with feedback;
+    └──────┼──────┘            `reviewGate: "human"` parks it on you
+           ▼
+       integrator             ▸ merges, verifies, ships
+           ▼
+       📄 run report          ▸ per-task summaries · models used · stats
+```
+
 ## Why not just ask one agent?
 
 Because one agent serializes. Long research tasks queue behind quick edits, context fills up, quality drifts, and nothing checks the output but the same model that wrote it.
@@ -42,7 +73,9 @@ A **Swarm** tab lives next to Chat in the web GUI, in three views:
 4. **Review** — tasks with a reviewer get judged; rejections requeue with feedback. Tasks with an evidence contract must produce the files and passing commands they promised.
 5. **Report** — the run closes with a report: who did what, on which models, with fallback/retry/review stats. The whole history is an append-only JSONL event log you can replay.
 
-## Install
+## Getting started (~5 minutes)
+
+### 1 · Install
 
 From this GitHub repo (pnpm will run the package's `prepare` script to build from source):
 
@@ -59,14 +92,63 @@ allowBuilds:
 
 and re-run the `add`. (That allowance executes this package's code on your machine at install time — the usual trust rule applies; pin a commit if you prefer: `github:linkbag/dsh-swarm-orchestrator#<sha>`.)
 
-From a source checkout:
+Or install prebuilt from npm — no build allowance needed:
 
 ```sh
-pnpm install && pnpm build
-dsh plugin --profile web add ./dsh-swarm-orchestrator
+dsh plugin --profile web add dsh-swarm-orchestrator
 ```
 
-Then restart `dsh web` and open the **Swarm** tab next to Chat.
+Then restart `dsh web` (or reload the profile). You should see the **Swarm** tab next to Chat, a 🐝 button in every session header, and **Settings → AI Swarm** (the title shows the running version — a quick way to confirm the install).
+
+### 2 · Assign models to roles
+
+Open the **Swarm** tab in any chat and switch to **Roster** — or open **Settings → AI Swarm**, the same editor reachable from anywhere. The four built-in roles:
+
+| Role | What it does |
+| --- | --- |
+| **architect** | Reviews the proposal, refines it into `PLAN.md` |
+| **builder** | Implements one task to completion, with verification |
+| **reviewer** | Judges completed work against the task brief |
+| **integrator** | Merges parallel work and ships the result |
+
+For each role, pick a model from the dropdown. It lists **every provider configured in DSH** (DeepSeek, GLM, Kimi, Claude, …), grouped by provider — the same live catalog as the Models settings page. Leave a role on **inherit deployment default** to use whatever model the dispatching chat runs on.
+
+Optional, per role (all have sane defaults):
+
+- **Fallback chain** — models tried in order if the primary is unavailable.
+- **Effort + effort ladder** — reasoning effort for the role, downgrading per retry.
+- **Concurrency cap** — limit simultaneous agents of this role.
+- **Tool filter** — deny specific tools to this role's agents (e.g. a read-only reviewer).
+- **Persona** — the role's standing instructions.
+
+Missing a model? Add the provider in DSH **Settings → Models** first, then hit **refresh catalog** in the Roster.
+
+### 3 · Dispatch your first swarm
+
+In any chat, just ask:
+
+> *"Spawn a swarm: audit every package.json in this repo for stale deps, one task per package, then an integrator compiles a summary table. Review the integrator's output."*
+
+or the one-shot form:
+
+```text
+/swarm build a landing page for this project
+```
+
+Your agent will call `swarm_dispatch` with a task DAG. (It may plan first itself — that's fine: an architect agent reviews and refines whatever plan it sends.)
+
+### 4 · Endorse and watch
+
+- The new run sits in **planning** — open the **Swarm** tab and click **Endorse**. Nothing spawns before you do.
+- **Board** shows the kanban; **Flow** shows the same run as a workflow chart (scheduler → parallel waves → report); click any task for its drawer — brief, model, interim notes, reviewer feedback, retry.
+- Tasks with `reviewGate: "human"` park on the board for your Approve/Reject.
+- The dispatching chat gets a live progress card; the 🐝 header button and the bottom-right badge track active runs from anywhere.
+
+### 5 · Read the report
+
+When the run finishes it folds into a report: per-task summaries, models used, fallback/retry/review stats. The whole history is an append-only event log you can replay.
+
+> **Defaults worth knowing:** every run starts with an architect review of the plan (skip per dispatch with `architectReview: false`); dispatching into a workspace that already has an active run raises a warning — parallel workstreams belong in one DAG; the roster, badge, and header button are global across workspaces.
 
 ## Talking to it
 
