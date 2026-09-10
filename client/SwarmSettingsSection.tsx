@@ -27,7 +27,10 @@ export function SwarmSettingsSection(): JSX.Element {
 
   return (
     <div className="dsh-swarm-settings">
-      <h3>🐝 Swarm orchestration</h3>
+      <h3>
+        🐝 Swarm orchestration
+        {board !== null && <span className="dsh-swarm-dim" style={{ marginLeft: 8, fontWeight: 400, fontSize: '0.8em' }}>v{board.version}</span>}
+      </h3>
       <p className="dsh-swarm-dim">
         Role-based multi-agent runs. Open any chat's <b>Swarm</b> tab for the live board;
         this section manages the model roster everywhere.
