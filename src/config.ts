@@ -19,6 +19,9 @@ export interface SwarmConfig {
   spawnStaggerMs: number
   adaptiveConcurrency: boolean
   nudgeAfterMinutes: number
+  /** 'warn' (default) | 'block' | 'off' — normalized at use; any other value behaves as 'warn'. */
+  workspaceRunPolicy: string
+  requireArchitectReview: boolean
 }
 
 export const Config = Schema.object({
@@ -53,5 +56,16 @@ export const Config = Schema.object({
   nudgeAfterMinutes: Schema.number().default(20).min(0).max(240).description(
     'Watchdog early-warning tier: a running task with no progress note for this many minutes '
     + 'gets a nudged marker on the board (0 = off). The full stale timeout still applies after.',
+  ),
+  workspaceRunPolicy: Schema.string().default('warn').description(
+    'One-run-per-goal guard for a workspace that already has an active (planning/running/paused) run: '
+    + "'warn' (default) — dispatch succeeds, the run banner names the sibling; 'block' — reject the "
+    + 'dispatch; \'off\' — no guard. Parallel workstreams belong in ONE DAG, not in sibling runs.',
+  ),
+  requireArchitectReview: Schema.boolean().default(true).description(
+    "Inject an architect-review task as the mandatory first step of every run whose DAG has no "
+    + 'architect task: it deep-reviews the dispatching agent\'s plan against the repo, consolidates '
+    + 'workstreams into one DAG, and must produce PLAN.md before any builder starts. '
+    + 'Per-dispatch opt-out: architectReview: false.',
   ),
 })

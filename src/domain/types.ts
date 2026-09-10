@@ -178,6 +178,8 @@ export interface DispatchInput {
   tasks: TaskSpec[]
   endorse?: boolean
   parentSessionId?: string
+  /** Force (true) or skip (false) the architect-review first task, overriding requireArchitectReview. */
+  architectReview?: boolean
 }
 
 export interface DispatchResult {

@@ -96,8 +96,16 @@ function captureDispatchContext(parent: Agent | undefined): Partial<Run['dispatc
     }
   } catch { /* route unreadable — leave unset */ }
   try {
-    const header = (parent as { session?: { header?: { id?: string; cwd?: string } } }).session?.header
-    if (typeof header?.id === 'string' && header.id.length > 0) captured.sessionId = header.id
+    const header = (parent as { session?: { header?: { id?: string; sessionId?: string; cwd?: string } } }).session?.header
+    // Session id with fallbacks: some dispatch paths expose it only on the agent
+    // object itself (live capture bug found in the LinguaLens runs — header.id
+    // can be blank while the agent's own id is the session id).
+    const fromHeader = typeof header?.id === 'string' && header.id.length > 0 ? header.id
+      : typeof header?.sessionId === 'string' && header.sessionId.length > 0 ? header.sessionId
+        : undefined
+    const fromAgent = (parent as { id?: unknown }).id
+    const sessionId = fromHeader ?? (typeof fromAgent === 'string' && fromAgent.length > 0 ? fromAgent : undefined)
+    if (sessionId !== undefined) captured.sessionId = sessionId
     if (typeof header?.cwd === 'string' && header.cwd.length > 0) captured.cwd = header.cwd
   } catch { /* header unreadable — leave unset */ }
   try {
