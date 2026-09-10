@@ -1,21 +1,20 @@
 // Flow view: the run's task DAG as a top-down flow chart — scheduler node,
 // parallel waves (same rank = runs in parallel), dependency arrows, reviewer
-// chips, live status colors. Pure client-side layout over the board snapshot;
-// no graph libraries, no host changes.
+// chips, live status colors. Pure client-side layout over the board snapshot.
 //
-// Geometry: task nodes have variable content (writes hints, wrapped phase
-// labels), so each rank's vertical stride is the max estimated node height in
-// that rank — boxes can never overlap the wave below or the report row. The
-// canvas scales to fit the pane width (never above 1:1), recomputed on resize.
+// Layout is deterministic: every node gets a FIXED height (content truncated
+// to fit), so boxes never overlap and arrows always anchor correctly
+// (bottom-center → top-center). The canvas scales to fit the pane.
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { BoardRun, BoardTask } from './board-store'
 
-const NODE_W = 210
-const GAP_X = 28
-const GAP_Y = 46
-const SCHEDULER_H = 56
-const FIRST_ROW_Y = 96
-const REPORT_H = 56
+const NODE_W = 200
+const NODE_H = 68        // uniform — deterministic layout
+const SCHEDULER_H = 48
+const REPORT_H = 48
+const GAP_X = 40         // horizontal gap between parallel nodes
+const GAP_Y = 64         // vertical gap between ranks (space for edge + wave label)
+const CANVAS_PAD = 16    // left/right padding inside the canvas
 
 function statusColor(status: string): string {
   if (status === 'completed') return 'rgb(46, 160, 67)'
@@ -29,33 +28,24 @@ function statusColor(status: string): string {
 function phaseLabel(task: BoardTask): string {
   switch (task.status) {
     case 'completed': return task.reviewed === true ? 'done · reviewed' : 'done'
-    case 'reviewing': return task.humanReview === true ? 'awaiting human review' : `review · ${task.reviewBy ?? ''}`
+    case 'reviewing': return task.humanReview === true ? 'human review' : `review · ${task.reviewBy ?? ''}`
     case 'running': return 'running'
     case 'dispatching': return 'dispatching'
     case 'retrying': return `retrying (attempt ${task.attempts + 1})`
     case 'failed': return 'failed'
-    case 'blocked': return task.blockedReason ?? 'blocked'
-    default: return (task.blockedBy ?? []).length > 0 ? 'waiting on blockers' : 'queued'
+    case 'blocked': return 'blocked'
+    default: return (task.blockedBy ?? []).length > 0 ? 'waiting' : 'queued'
   }
-}
-
-/** Conservative on-screen height for one node: padding + title + optional wrapped sub + writes hint. */
-function estimateNodeHeight(task: BoardTask): number {
-  let h = 52
-  if (phaseLabel(task).length > 24) h += 14
-  if ((task.writes ?? []).length > 0) h += 15
-  return h
 }
 
 export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] }): JSX.Element {
   const layout = useMemo(() => {
-    // Longest-path ranking: tasks with no blockers sit in wave 0, a task's wave
-    // is one past its deepest blocker. Same wave = runs in parallel.
+    // Longest-path ranking: tasks with no blockers sit in wave 0.
     const rankOf = new Map<string, number>()
     const rank = (id: string, seen: string[] = []): number => {
       const cached = rankOf.get(id)
       if (cached !== undefined) return cached
-      if (seen.includes(id)) return 0 // cycle guard (validated at dispatch anyway)
+      if (seen.includes(id)) return 0
       const t = tasks.find((x) => x.id === id)
       if (t === undefined) return 0
       const blockers = t.blockedBy ?? []
@@ -73,36 +63,37 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
     }
     const ranks = [...byRank.keys()].sort((a, b) => a - b)
 
-    // Stack rows on per-rank max heights: no box can ever reach the wave below.
-    const positioned: Array<{ task: BoardTask; x: number; y: number; h: number }> = []
-    const pills: Array<{ rank: number; y: number }> = []
-    let y = FIRST_ROW_Y
+    // Uniform heights — deterministic, boxes never overlap
+    const positions = new Map<string, { x: number; y: number; rank: number; lane: number }>()
+    const rowStride = NODE_H + GAP_Y
+    const schedBottom = SCHEDULER_H + GAP_Y
     for (const r of ranks) {
       const row = byRank.get(r)!
-      const rowH = Math.max(...row.map((t) => estimateNodeHeight(t)))
-      pills.push({ rank: r, y: y - 23 })
       row.forEach((task, lane) => {
-        positioned.push({ task, x: lane * (NODE_W + GAP_X), y, h: estimateNodeHeight(task) })
+        positions.set(task.id, {
+          x: CANVAS_PAD + lane * (NODE_W + GAP_X),
+          y: schedBottom + r * rowStride,
+          rank: r,
+          lane,
+        })
       })
-      y += rowH + GAP_Y
     }
-    const reportY = y
-    const maxLane = Math.max(0, ...ranks.map((r) => (byRank.get(r)?.length ?? 1) - 1))
-    const width = (maxLane + 1) * (NODE_W + GAP_X)
-    const height = reportY + REPORT_H + 24
-    return { positioned, pills, ranks, byRank, width, height, reportY }
+
+    const maxLanes = Math.max(1, ...ranks.map((r) => byRank.get(r)?.length ?? 1))
+    const width = CANVAS_PAD * 2 + maxLanes * NODE_W + (maxLanes - 1) * GAP_X
+    const reportY = schedBottom + ranks.length * rowStride
+    const height = reportY + REPORT_H + CANVAS_PAD
+    return { positions, ranks, byRank, width, height, reportY, rowStride, schedBottom }
   }, [tasks])
 
-  // Fit the canvas to the pane: full size when it fits, scaled down when it
-  // doesn't (never scaled up), recomputed on resize.
+  // Fit-to-pane scaling
   const wrapRef = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(1)
   useEffect(() => {
     const el = wrapRef.current
     if (el === null) return
     const update = (): void => {
-      const needed = layout.width + 32
-      setScale(Math.min(1, Math.max(0.35, el.clientWidth / needed)))
+      setScale(Math.min(1, Math.max(0.3, el.clientWidth / layout.width)))
     }
     update()
     const observer = new ResizeObserver(update)
@@ -110,13 +101,19 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
     return () => { observer.disconnect() }
   }, [layout.width])
 
-  const schedulerX = layout.width / 2 - NODE_W / 2
   const sinks = tasks.filter((t) => !tasks.some((other) => (other.blockedBy ?? []).includes(t.id)))
+  const schedulerX = layout.width / 2 - NODE_W / 2
 
-  const edgePath = (fromX: number, fromY: number, toX: number, toY: number): string => {
-    const midY = (fromY + toY) / 2
-    return `M ${fromX} ${fromY} C ${fromX} ${midY}, ${toX} ${midY}, ${toX} ${toY}`
+  // S-curve edge: from bottom-center of source to top-center of target
+  const edgePath = (sx: number, sy: number, tx: number, ty: number): string => {
+    const c1y = sy + (ty - sy) * 0.4
+    const c2y = sy + (ty - sy) * 0.6
+    return `M ${sx} ${sy} C ${sx} ${c1y}, ${tx} ${c2y}, ${tx} ${ty}`
   }
+
+  // Anchor helpers: bottom-center and top-center of a node
+  const bottomCx = (x: number): number => x + NODE_W / 2
+  const topCx = (x: number): number => x + NODE_W / 2
 
   const schedulerStatus = run.status === 'planning' ? 'awaiting endorsement' : run.status
 
@@ -124,50 +121,127 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
     <div className="dsh-swarm-flow">
       <div className="dsh-swarm-flow-legend">
         <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('completed') }} /> done</span>
-        <span><span className="dsh-swarm-tvc-dot live" style={{ background: statusColor('running') }} /> running (parallel within a wave)</span>
+        <span><span className="dsh-swarm-tvc-dot live" style={{ background: statusColor('running') }} /> running</span>
         <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('reviewing') }} /> review</span>
-        <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('failed') }} /> failed / blocked</span>
+        <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('failed') }} /> failed</span>
         <span><span className="dsh-swarm-tvc-dot" style={{ background: 'rgba(125, 125, 125, 0.6)' }} /> queued</span>
       </div>
       <div ref={wrapRef} className="dsh-swarm-flow-fit" style={{ height: Math.round(layout.height * scale) }}>
         <div
           className="dsh-swarm-flow-canvas"
           style={{
-            width: layout.width + 32,
+            width: layout.width,
             height: layout.height,
             margin: '0 auto',
             transform: `scale(${scale})`,
             transformOrigin: 'top center',
           }}
         >
+          {/* SVG edges (rendered UNDER the nodes so arrows don't cross boxes) */}
+          <svg
+            className="dsh-swarm-flow-edges"
+            width={layout.width}
+            height={layout.height}
+            style={{ position: 'absolute', left: 0, top: 0, pointerEvents: 'none', zIndex: 0 }}
+          >
+            <defs>
+              <marker id="dsh-swarm-arrow" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto">
+                <path d="M 0 0 L 7 3.5 L 0 7 z" fill="rgba(125, 125, 125, 0.7)" />
+              </marker>
+              <marker id="dsh-swarm-arrow-done" markerWidth="7" markerHeight="7" refX="5.5" refY="3.5" orient="auto">
+                <path d="M 0 0 L 7 3.5 L 0 7 z" fill="rgba(46, 160, 67, 0.7)" />
+              </marker>
+            </defs>
+            {/* scheduler → wave-0 tasks */}
+            {(layout.byRank.get(0) ?? []).map((t) => {
+              const pos = layout.positions.get(t.id)!
+              return (
+                <path
+                  key={`s-${t.id}`}
+                  d={edgePath(
+                    layout.width / 2, SCHEDULER_H,
+                    topCx(pos.x), pos.y,
+                  )}
+                  className="dsh-swarm-flow-edge"
+                  markerEnd="url(#dsh-swarm-arrow)"
+                />
+              )
+            })}
+            {/* dependency edges: bottom-center of blocker → top-center of dependent */}
+            {tasks.map((t) => (t.blockedBy ?? []).map((b) => {
+              const from = layout.positions.get(b)
+              const to = layout.positions.get(t.id)
+              if (from === undefined || to === undefined) return null
+              const done = tasks.find((x) => x.id === b)?.status === 'completed'
+              return (
+                <path
+                  key={`${b}-${t.id}`}
+                  d={edgePath(
+                    bottomCx(from.x), from.y + NODE_H,
+                    topCx(to.x), to.y,
+                  )}
+                  className={done ? 'dsh-swarm-flow-edge done' : 'dsh-swarm-flow-edge'}
+                  markerEnd={done ? 'url(#dsh-swarm-arrow-done)' : 'url(#dsh-swarm-arrow)'}
+                />
+              )
+            }))}
+            {/* sinks → report */}
+            {sinks.map((t) => {
+              const pos = layout.positions.get(t.id)
+              if (pos === undefined) return null
+              return (
+                <path
+                  key={`r-${t.id}`}
+                  d={edgePath(
+                    bottomCx(pos.x), pos.y + NODE_H,
+                    layout.width / 2, layout.reportY,
+                  )}
+                  className={t.status === 'completed' ? 'dsh-swarm-flow-edge done' : 'dsh-swarm-flow-edge'}
+                  markerEnd={t.status === 'completed' ? 'url(#dsh-swarm-arrow-done)' : 'url(#dsh-swarm-arrow)'}
+                />
+              )
+            })}
+          </svg>
+
           {/* scheduler node */}
-          <div className="dsh-swarm-flow-node scheduler" style={{ left: schedulerX + 16, top: 0 }}>
+          <div
+            className="dsh-swarm-flow-node scheduler"
+            style={{ left: schedulerX, top: 0, width: NODE_W, height: SCHEDULER_H, zIndex: 1 }}
+          >
             <div className="dsh-swarm-flow-node-title">⌘ scheduler</div>
             <div className="dsh-swarm-flow-node-sub">{schedulerStatus}</div>
           </div>
-          {/* wave pills */}
-          {layout.pills.map((pill) => {
-            const row = layout.byRank.get(pill.rank) ?? []
+
+          {/* wave labels (between rows, in the gap) */}
+          {layout.ranks.map((r) => {
+            const row = layout.byRank.get(r) ?? []
             const parallel = row.length > 1
+            const labelY = layout.schedBottom + r * layout.rowStride - GAP_Y / 2 - 8
             return (
               <div
-                key={`wave-${pill.rank}`}
+                key={`wave-${r}`}
                 className="dsh-swarm-flow-wave"
-                style={{ left: '50%', top: pill.y, transform: 'translateX(-50%)' }}
+                style={{ left: layout.width / 2, top: labelY, transform: 'translateX(-50%)', zIndex: 1 }}
               >
-                wave {pill.rank + 1}{parallel ? ` — ${row.length} in parallel` : ''}
+                wave {r + 1}{parallel ? ` · ${row.length} parallel` : ''}
               </div>
             )
           })}
-          {/* task nodes */}
-          {layout.positioned.map(({ task, x, y }) => {
+
+          {/* task nodes (uniform height, content truncated to fit) */}
+          {tasks.map((task) => {
+            const pos = layout.positions.get(task.id)
+            if (pos === undefined) return null
             const color = statusColor(task.status)
+            const writeHint = (task.writes ?? []).length > 0
+              ? `✎ ${(task.writes ?? []).slice(0, 2).join(', ')}${(task.writes ?? []).length > 2 ? '…' : ''}`
+              : ''
             return (
               <div
                 key={task.id}
                 className="dsh-swarm-flow-node"
-                style={{ left: x + 16, top: y, borderColor: color }}
-                title={task.description}
+                style={{ left: pos.x, top: pos.y, width: NODE_W, height: NODE_H, borderColor: color, zIndex: 1 }}
+                title={`${task.subject}${(task.writes ?? []).length > 0 ? `\nwrites: ${(task.writes ?? []).join(', ')}` : ''}`}
               >
                 <div className="dsh-swarm-flow-node-title">
                   <span className="dsh-swarm-flow-dot" style={{ background: color }} />
@@ -175,65 +249,19 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
                   <span className="dsh-swarm-flow-role">{task.role}</span>
                 </div>
                 <div className="dsh-swarm-flow-node-sub">{phaseLabel(task)}</div>
-                {(task.writes ?? []).length > 0 && (
-                  <div className="dsh-swarm-flow-node-writes">✎ {(task.writes ?? []).join(', ')}</div>
-                )}
+                {writeHint !== '' && <div className="dsh-swarm-flow-node-writes">{writeHint}</div>}
               </div>
             )
           })}
+
           {/* report node */}
-          <div className="dsh-swarm-flow-node report" style={{ left: layout.width / 2 - NODE_W / 2 + 16, top: layout.reportY }}>
+          <div
+            className="dsh-swarm-flow-node report"
+            style={{ left: layout.width / 2 - NODE_W / 2, top: layout.reportY, width: NODE_W, height: REPORT_H, zIndex: 1 }}
+          >
             <div className="dsh-swarm-flow-node-title">📄 run report</div>
-            <div className="dsh-swarm-flow-node-sub">{run.status === 'completed' ? 'generated' : run.status === 'failed' ? 'failed run' : 'on completion'}</div>
+            <div className="dsh-swarm-flow-node-sub">{run.status === 'completed' ? 'generated' : run.status === 'failed' ? 'failed' : 'on completion'}</div>
           </div>
-          {/* edges */}
-          <svg className="dsh-swarm-flow-edges" width={layout.width + 32} height={layout.height}>
-            <defs>
-              <marker id="dsh-swarm-arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
-                <path d="M 0 0 L 8 4 L 0 8 z" fill="rgba(125, 125, 125, 0.8)" />
-              </marker>
-            </defs>
-            {/* scheduler → wave-0 tasks */}
-            {(layout.byRank.get(0) ?? []).map((t) => {
-              const node = layout.positioned.find((p) => p.task.id === t.id)!
-              return (
-                <path
-                  key={`s-${t.id}`}
-                  d={edgePath(layout.width / 2 + 16, SCHEDULER_H, node.x + 16 + NODE_W / 2, node.y)}
-                  className="dsh-swarm-flow-edge"
-                  markerEnd="url(#dsh-swarm-arrow)"
-                />
-              )
-            })}
-            {/* dependency edges */}
-            {tasks.map((t) => (t.blockedBy ?? []).map((b) => {
-              const from = layout.positioned.find((p) => p.task.id === b)
-              const to = layout.positioned.find((p) => p.task.id === t.id)
-              if (from === undefined || to === undefined) return null
-              const done = tasks.find((x) => x.id === b)?.status === 'completed'
-              return (
-                <path
-                  key={`${b}-${t.id}`}
-                  d={edgePath(from.x + 16 + NODE_W / 2, from.y + from.h, to.x + 16 + NODE_W / 2, to.y)}
-                  className={done ? 'dsh-swarm-flow-edge done' : 'dsh-swarm-flow-edge'}
-                  markerEnd="url(#dsh-swarm-arrow)"
-                />
-              )
-            }))}
-            {/* sinks → report */}
-            {sinks.map((t) => {
-              const node = layout.positioned.find((p) => p.task.id === t.id)
-              if (node === undefined) return null
-              return (
-                <path
-                  key={`r-${t.id}`}
-                  d={edgePath(node.x + 16 + NODE_W / 2, node.y + node.h, layout.width / 2 + 16, layout.reportY)}
-                  className={t.status === 'completed' ? 'dsh-swarm-flow-edge done' : 'dsh-swarm-flow-edge'}
-                  markerEnd="url(#dsh-swarm-arrow)"
-                />
-              )
-            })}
-          </svg>
         </div>
       </div>
     </div>

@@ -695,7 +695,7 @@ describe('swarm service (integration, fake subagents)', () => {
     const tasks = service.snapshot().tasks.filter((t) => t.runId === result.runId)
     const arch = tasks.find((t) => t.id === 'architect-review')!
     expect(arch.role).toBe('architect')
-    expect(arch.evidence?.files).toContain('PLAN.md')
+    expect((arch.evidence?.files ?? [])[0]).toMatch(/^PLAN-run-.+\.md$/)
     expect(arch.description).toContain('injection demo')
     expect(arch.description).toContain('REVIEW and REFINE')
     // every dispatched task is gated behind the review, original edges preserved

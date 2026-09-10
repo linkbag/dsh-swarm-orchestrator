@@ -275,38 +275,43 @@
 .dsh-swarm-flow-canvas { position: relative; margin: 0 auto; }
 .dsh-swarm-flow-node {
   position: absolute;
-  width: 210px; box-sizing: border-box;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
   border: 1px solid rgba(125, 125, 125, 0.45);
   border-radius: 10px;
-  background: var(--dsh-swarm-node-bg, rgba(20, 22, 26, 0.85));
-  padding: 8px 10px;
+  background: var(--dsh-swarm-node-bg, rgba(20, 22, 26, 0.88));
+  padding: 6px 10px;
   font-size: 12px;
+  overflow: hidden;
 }
 .dsh-swarm-flow-node.scheduler {
   border-style: dashed;
   border-color: rgba(125, 125, 125, 0.6);
-  text-align: center;
+  align-items: center;
 }
-.dsh-swarm-flow-node.report { border-color: rgba(46, 160, 67, 0.5); text-align: center; }
-.dsh-swarm-flow-node-title { display: flex; align-items: center; gap: 6px; font-weight: 600; min-width: 0; }
-.dsh-swarm-flow-node-title code { font-size: 11.5px; opacity: 0.75; }
-.dsh-swarm-flow-role { font-size: 10.5px; padding: 1px 6px; border-radius: 999px; border: 1px solid rgba(125, 125, 125, 0.4); opacity: 0.8; margin-left: auto; }
+.dsh-swarm-flow-node.report { border-color: rgba(46, 160, 67, 0.5); align-items: center; }
+.dsh-swarm-flow-node-title { display: flex; align-items: center; gap: 5px; font-weight: 600; min-width: 0; overflow: hidden; }
+.dsh-swarm-flow-node-title code { font-size: 11px; opacity: 0.75; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsh-swarm-flow-role { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 1px solid rgba(125, 125, 125, 0.4); opacity: 0.8; margin-left: auto; flex: none; }
 .dsh-swarm-flow-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
-.dsh-swarm-flow-node-sub { font-size: 11px; opacity: 0.7; margin-top: 3px; }
-.dsh-swarm-flow-node-writes { font-size: 10.5px; opacity: 0.6; margin-top: 2px; }
+.dsh-swarm-flow-node-sub { font-size: 10.5px; opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsh-swarm-flow-node-writes { font-size: 10px; opacity: 0.55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dsh-swarm-flow-wave {
   position: absolute;
   z-index: 1;
-  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
   opacity: 0.9; white-space: nowrap;
-  padding: 2px 12px;
+  padding: 2px 10px;
   border-radius: 999px;
   border: 1px solid rgba(125, 125, 125, 0.3);
   background: rgba(20, 22, 26, 0.85);
   color: rgba(232, 232, 232, 0.85);
 }
-.dsh-swarm-flow-edges { position: absolute; left: 0; top: 0; pointer-events: none; }
-.dsh-swarm-flow-edge { fill: none; stroke: rgba(125, 125, 125, 0.55); stroke-width: 1.5; }
+.dsh-swarm-flow-edges { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 0; }
+.dsh-swarm-flow-edge { fill: none; stroke: rgba(125, 125, 125, 0.5); stroke-width: 1.5; }
 .dsh-swarm-flow-edge.done { stroke: rgba(46, 160, 67, 0.6); }
 
 /* ── B1 settings section + B4 global badge ─────────────── */

@@ -86,7 +86,7 @@ interface PresetsLike {
  * the dispatching agent's proposal verbatim and reviews/refines it — never
  * replaces it — with PLAN.md as the enforced artifact.
  */
-function architectReviewPrompt(title: string, spec: string, tasks: TaskSpec[]): string {
+function architectReviewPrompt(title: string, spec: string, tasks: TaskSpec[], planFile: string): string {
   const proposal = [
     `Title: ${title}`,
     `Objective: ${spec}`,
@@ -104,8 +104,8 @@ function architectReviewPrompt(title: string, spec: string, tasks: TaskSpec[]): 
     '1. Deep-research the proposal against the actual repository: verify every assumption (files, dependencies, build setup, existing code) before trusting it.',
     '2. Check interdependencies: every blockedBy must be real, and anything that runs in parallel must be safe to run concurrently — no shared files without narrower write scopes.',
     '3. If the proposal splits parallel workstreams across separate runs, consolidate them into ONE task DAG in your plan.',
-    '4. Write the refined plan to PLAN.md in the workspace root: final task-by-task plan with per-task write scopes, verification steps, flagged risks, and explicit deviations from the proposal.',
-    '5. PLAN.md must exist and be non-empty before you finish — the evidence contract enforces it.',
+    `4. Write the refined plan to ${planFile} in the workspace root: final task-by-task plan with per-task write scopes, verification steps, flagged risks, and explicit deviations from the proposal.`,
+    `5. ${planFile} must exist and be non-empty before you finish — the evidence contract enforces it. (Use this exact filename; other runs in the same workspace have their own plan files.)`,
   ].join('\n')
 }
 
@@ -350,18 +350,23 @@ export class SwarmService extends Service {
     // architect role or a DAG that fails validation degrades to a notice.
     const wantsReview = input.architectReview ?? this.swarmConfig.requireArchitectReview
     let effectiveTasks = tasks
+    let reviewPlanFile: string | undefined
     if (wantsReview && !tasks.some((t) => t.role === 'architect')) {
       // Uniquify the injected id: a dispatched task may already own the name
       // 'architect-review' — the review must still happen, under a fresh id.
       let reviewId = 'architect-review'
       for (let n = 2; tasks.some((t) => t.id === reviewId); n += 1) reviewId = `architect-review-${n}`
+      // Run-specific plan file: parallel runs in the same workspace each get
+      // their own plan artifact instead of overwriting each other's PLAN.md.
+      const preRunId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+      reviewPlanFile = `PLAN-${preRunId}.md`
       const injectedDag: TaskSpec[] = [
         {
           id: reviewId,
           subject: 'Review and refine the proposed plan',
-          description: architectReviewPrompt(input.title, input.spec, tasks),
+          description: architectReviewPrompt(input.title, input.spec, tasks, reviewPlanFile),
           role: 'architect',
-          evidence: { files: ['PLAN.md'] },
+          evidence: { files: [reviewPlanFile] },
         },
         ...tasks.map((t) => ({ ...t, blockedBy: [reviewId, ...(t.blockedBy ?? [])] })),
       ]

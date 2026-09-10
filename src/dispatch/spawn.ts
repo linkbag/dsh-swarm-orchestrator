@@ -33,8 +33,8 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context:
     ...(task.writes !== undefined && task.writes.length > 0
       ? [`Exclusive write scope: ${task.writes.join(', ')} — do not modify files outside this list.`]
       : []),
-    ...((task.blockedBy ?? []).includes('architect-review')
-      ? ['PLAN.md in the workspace is the refined plan of record — where it conflicts with this brief, follow PLAN.md and note the deviation in your summary.']
+    ...((task.blockedBy ?? []).some((b) => b.startsWith('architect-review'))
+      ? ['The architect\'s plan file (matching PLAN-*.md in the workspace root) is the refined plan of record — where it conflicts with this brief, follow the plan and note the deviation in your summary.']
       : []),
     ...(task.reviewBy !== undefined
       ? [`Your output will be reviewed by the **${task.reviewBy}** role before it counts as done — make it verifiable.`]
