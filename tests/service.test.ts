@@ -146,6 +146,9 @@ async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx
     staleTimeoutSeconds: 14400,
     maxRetries: 2,
     reviewLoops: 3,
+    // v0.5.0 guards default ON in production; tests opt out unless exercising them.
+    requireArchitectReview: false,
+    workspaceRunPolicy: 'off',
     ...overrides,
   })
   // ctx.get returns a traceable proxy; unwrap to the raw service via symbols.original

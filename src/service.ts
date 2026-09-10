@@ -17,7 +17,7 @@ import { fold, isReady, newState, runningCount, taskKeyOf, type SwarmState } fro
 import type { BoardSnapshot } from './board.js'
 import { buildBoardSnapshot } from './board.js'
 import { spawnTaskAgent, buildReviewPrompt, parseVerdict, type SpawnDeps } from './dispatch/spawn.js'
-import type { DispatchInput, DispatchResult, DutyTable, ModelRef, RoleConfig, Run, Task, TaskSpec } from './domain/types.js'
+import type { DispatchInput, DispatchResult, DutyTable, ModelRef, RoleConfig, Run, RunDispatchContext, Task, TaskSpec } from './domain/types.js'
 
 const execAsync = promisify(exec)
 
@@ -78,15 +78,43 @@ interface PresetsLike {
 }
 
 /**
+ * P2: the standing brief for the injected architect-review task. It receives
+ * the dispatching agent's proposal verbatim and reviews/refines it — never
+ * replaces it — with PLAN.md as the enforced artifact.
+ */
+function architectReviewPrompt(title: string, spec: string, tasks: TaskSpec[]): string {
+  const proposal = [
+    `Title: ${title}`,
+    `Objective: ${spec}`,
+    '',
+    'Proposed tasks:',
+    ...tasks.map((t) => `- ${t.id} (${t.role})${t.writes !== undefined ? ` [writes: ${t.writes.join(', ')}]` : ''}: ${t.subject} — ${t.description}`),
+  ].join('\n')
+  return [
+    'The dispatching agent has already proposed the plan below. Your job is to REVIEW and REFINE it — verify it against the repository, do not start from scratch.',
+    '',
+    '## The proposal (as dispatched)',
+    proposal,
+    '',
+    '## Your review procedure',
+    '1. Deep-research the proposal against the actual repository: verify every assumption (files, dependencies, build setup, existing code) before trusting it.',
+    '2. Check interdependencies: every blockedBy must be real, and anything that runs in parallel must be safe to run concurrently — no shared files without narrower write scopes.',
+    '3. If the proposal splits parallel workstreams across separate runs, consolidate them into ONE task DAG in your plan.',
+    '4. Write the refined plan to PLAN.md in the workspace root: final task-by-task plan with per-task write scopes, verification steps, flagged risks, and explicit deviations from the proposal.',
+    '5. PLAN.md must exist and be non-empty before you finish — the evidence contract enforces it.',
+  ].join('\n')
+}
+
+/**
  * Capture the dispatching agent's world as plain JSON while it is alive:
  * its preset, model route, and workspace — everything later spawns need once
  * the dispatching session is gone. Reads are defensive: a dispatcher whose
  * fiber already went inactive still answers plain scope-chain reads, and any
  * failure just drops that field.
  */
-function captureDispatchContext(parent: Agent | undefined): Partial<Run['dispatch']> {
+function captureDispatchContext(parent: Agent | undefined): Partial<RunDispatchContext> {
   if (parent === undefined) return {}
-  const captured: Partial<Run['dispatch']> = {}
+  const captured: Partial<RunDispatchContext> = {}
   try {
     const options = (parent as { options?: { provider?: string; model?: string } }).options
     if (typeof options?.provider === 'string' && typeof options.model === 'string'
@@ -285,7 +313,61 @@ export class SwarmService extends Service {
     const known = Object.keys(this.duty.get().roles)
     const unknownRoles = [...new Set(tasks.map((t) => t.role).filter((r) => !known.includes(r)))]
     if (unknownRoles.length > 0) throw new Error(`unknown roles ${unknownRoles.join(', ')} — known: ${known.join(', ')}`)
-    const writeWarnings = this.writeOverlapWarnings(tasks)
+
+    const captured = captureDispatchContext(parent)
+    const notices: string[] = []
+
+    // P1: one-run-per-goal guard. A workspace with an active sibling run is a
+    // governance smell — parallel workstreams belong in ONE DAG. Warn by
+    // default; 'block' rejects; 'off' (and unrecognized values normalize to
+    // 'warn', so a bad config value can never disable the guard silently...
+    // except 'off' itself) does nothing.
+    const policy = this.swarmConfig.workspaceRunPolicy
+    if (policy !== 'off' && captured.cwd !== undefined) {
+      const norm = normalizePath(captured.cwd)
+      const siblings = [...this.view().runs.values()].filter((r) =>
+        (r.status === 'planning' || r.status === 'running' || r.status === 'paused')
+        && r.dispatch?.cwd !== undefined && normalizePath(r.dispatch.cwd) === norm)
+      if (siblings.length > 0) {
+        const overlap = this.crossRunWriteOverlap(tasks, siblings.map((s) => s.id))
+        const message = `run ${siblings[0]!.id} ("${siblings[0]!.title}") is already active in this workspace`
+          + (overlap !== undefined ? ` and both declare writes over "${overlap}"` : '')
+          + ' — parallel workstreams belong in ONE run: consolidate into it, or endorse this run only after it finishes'
+        if (policy === 'block') {
+          throw new Error(`workspace already has an active run: ${message}`)
+        }
+        notices.push(message)
+      }
+    }
+
+    // P2: mandatory architect review. When enabled and the DAG has no architect
+    // task, an architect-review root is injected and every dispatched task is
+    // gated behind it. Injection can never throw: a duty table without the
+    // architect role or a DAG that fails validation degrades to a notice.
+    const wantsReview = input.architectReview ?? this.swarmConfig.requireArchitectReview
+    let effectiveTasks = tasks
+    if (wantsReview && !tasks.some((t) => t.role === 'architect')) {
+      const injectedDag: TaskSpec[] = [
+        {
+          id: 'architect-review',
+          subject: 'Review and refine the proposed plan',
+          description: architectReviewPrompt(input.title, input.spec, tasks),
+          role: 'architect',
+          evidence: { files: ['PLAN.md'] },
+        },
+        ...tasks.map((t) => ({ ...t, blockedBy: ['architect-review', ...(t.blockedBy ?? [])] })),
+      ]
+      const injectedKnown = [...new Set(injectedDag.map((t) => t.role))].every((r) => known.includes(r))
+      const injectedValid = validateDag(injectedDag).valid
+      if (injectedKnown && injectedValid) {
+        effectiveTasks = injectedDag
+      } else {
+        notices.push(`architect review skipped (${injectedKnown ? 'injected DAG failed validation' : 'the duty table has no architect role'})`)
+      }
+    }
+
+    const writeWarnings = this.writeOverlapWarnings(effectiveTasks)
+    const allWarnings = [...notices, ...writeWarnings]
 
     const runId = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
     this.events.append('run/created', {
@@ -293,8 +375,8 @@ export class SwarmService extends Service {
       data: {
         title: input.title,
         spec: input.spec,
-        tasks,
-        dispatch: captureDispatchContext(parent),
+        tasks: effectiveTasks,
+        dispatch: captured,
       },
     })
     if (parent !== undefined) this.runParents.set(runId, parent)
@@ -305,9 +387,25 @@ export class SwarmService extends Service {
     return {
       runId,
       status: this.view().runs.get(runId)?.status ?? 'planning',
-      taskCount: tasks.length,
-      ...(writeWarnings.length > 0 ? { warnings: writeWarnings } : {}),
+      taskCount: effectiveTasks.length,
+      ...(allWarnings.length > 0 ? { warnings: allWarnings } : {}),
     }
+  }
+
+  /** P1b: the first file both an incoming task and any active sibling run's task declare as written. */
+  private crossRunWriteOverlap(incoming: TaskSpec[], siblingRunIds: string[]): string | undefined {
+    const siblingWrites = new Set<string>()
+    for (const task of this.view().tasks.values()) {
+      if (!siblingRunIds.includes(task.runId)) continue
+      for (const w of task.writes ?? []) siblingWrites.add(w.toLowerCase())
+    }
+    if (siblingWrites.size === 0) return undefined
+    for (const task of incoming) {
+      for (const w of task.writes ?? []) {
+        if (siblingWrites.has(w.toLowerCase())) return w
+      }
+    }
+    return undefined
   }
 
   endorse(runId: string): void {
