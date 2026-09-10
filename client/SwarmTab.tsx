@@ -193,6 +193,17 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                   <h3>{run.title}</h3>
                   <p className="dsh-swarm-dim">{run.spec.length > 220 ? run.spec.slice(0, 220) + '…' : run.spec}</p>
                   <p className="dsh-swarm-dim">created {timeAgo(run.createdAt)}{run.completedAt !== undefined && run.createdAt !== undefined ? ` · finished ${timeAgo(run.completedAt)}` : ` · elapsed ${timeAgo(run.createdAt)}`}</p>
+                  {(() => {
+                    const cwd = run.dispatch?.cwd
+                    if (cwd === undefined) return null
+                    const norm = (p: string): string => p.replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
+                    const siblings = (board?.runs ?? []).filter((r) =>
+                      r.id !== run.id && (r.status === 'planning' || r.status === 'running' || r.status === 'paused')
+                      && r.dispatch?.cwd !== undefined && norm(r.dispatch.cwd) === norm(cwd))
+                    return siblings.length > 0
+                      ? <p className="dsh-swarm-run-banner">⚠ {siblings.length} other active run{siblings.length === 1 ? '' : 's'} in this workspace: {siblings.map((s) => s.title).join(' · ')}</p>
+                      : null
+                  })()}
                 </div>
                 <div className="dsh-swarm-run-actions">
                   {(run.status === 'planning') && (

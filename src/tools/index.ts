@@ -59,12 +59,16 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     description:
       'Submit a swarm run: a task DAG executed by parallel role agents (models come from the swarm duty table; check the Swarm dashboard tab). '
       + 'Use ONLY when the human explicitly asks for a swarm / multi-agent run — never as a default way to work a task. '
+      + 'Shape: ONE run per goal — put parallel workstreams in the same DAG as concurrent tasks, never in separate runs. '
+      + 'If you have already planned, pass your plan as the spec and tasks: an architect agent reviews and refines it into PLAN.md before any builder starts '
+      + '(automatic; skip per-run with architectReview=false). '
       + 'Returns the run id; tasks dispatch once the run is endorsed (the human endorses on the dashboard, or pass endorse=true ONLY when the human already approved spawning).',
     parameters: {
       title: { type: 'string', required: true, description: 'Run title shown on the dashboard' },
       spec: { type: 'string', required: true, description: 'The overall objective handed to every task agent as context' },
       tasks: { type: 'array', required: true, items: taskItemSchema, description: 'Ordered task list; independent tasks run in parallel' },
       endorse: { type: 'boolean', description: 'Set true ONLY when the human has explicitly approved spawning this run' },
+      architectReview: { type: 'boolean', description: 'Set false to skip the architect-review first task for this run (or true to force it when the deployment default is off)' },
     },
     output: {
       schema: { type: 'string' },
@@ -101,6 +105,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
               : {}),
           })),
           ...(args.endorse === true ? { endorse: true } : {}),
+          ...(args.architectReview !== undefined ? { architectReview: args.architectReview } : {}),
         },
         exec.agent,
       )

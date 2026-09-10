@@ -22,6 +22,7 @@
 - **失败是状态，不是谜语。** provider 超时、配额耗尽、证据缺失——每一类都会被识别、直白地报告，并各有各的处理：带续作提示的重试、整体暂停后一键恢复、反复失败后自动换模型。
 - **没有你点头，什么都不跑。** 运行先停在 *planning*，在看板上人工放行才启动。还提供 `requireManualEndorsement` 服务端开关——打开之后，连模型自己都无法从聊天里绕过这道门。
 - **只看你所在的战场。** 每个聊天的 Swarm 标签页默认只显示该工作区的运行；一个常驻开关随时切到"全部运行"。
+- **一个目标一次运行，先审后建。** 向已有活跃运行的工作区再派发会收到警告（或按配置直接拦截）；默认情况下，架构师代理会先把派发方的计划审阅精炼成 PLAN.md，建造者才开始动工。
 
 ## 看板
 
@@ -98,6 +99,8 @@ dsh plugin --profile web add ./dsh-swarm-orchestrator
     adaptiveConcurrency: true   # provider 吃紧时收缩，恢复后回升
     spawnStaggerMs: 750         # 同一波派发的启动间隔
     nudgeAfterMinutes: 20       # 长时间静默的任务在看板上打点（0 = 关闭）
+    workspaceRunPolicy: warn      # 单运行守门：warn | block | off
+    requireArchitectReview: true  # 架构师先审阅并精炼派发计划（产出 PLAN.md）
     staleTimeoutSeconds: 14400  # 看门狗：静默任务被回收
     maxRetries: 2               # 每个任务的重试次数
     reviewLoops: 3              # 每个任务的评审驳回上限
@@ -113,7 +116,7 @@ dsh plugin --profile web add ./dsh-swarm-orchestrator
 
 ## 状态
 
-v0.4.0，日常使用中。测试覆盖调度器对假 spawn provider 的端到端行为（40 个用例：派发、放行、评审循环、人工评审门、模型回退轮换、配额暂停/恢复、救援路径、证据合约、写入范围警告、事件日志合法性），并已在真实部署上完成在线验证。
+v0.5.0，日常使用中。测试覆盖调度器对假 spawn provider 的端到端行为（45 个用例：派发、放行、评审循环、人工评审门、模型回退轮换、配额暂停/恢复、救援路径、证据合约、写入范围警告、事件日志合法性），并已在真实部署上完成在线验证。
 
 ## 许可证
 

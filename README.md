@@ -22,6 +22,7 @@ This plugin takes the coordination seriously so you don't have to:
 - **Failure is a state, not a mystery.** Provider timeouts, quota exhaustion, bad evidence — each is detected, reported plainly, and handled: retries with resume hints, run pause/resume instead of burn-down, automatic model rotation after repeated failures.
 - **Nothing starts without you.** Runs sit in *planning* until you endorse them on the board. A server-side option (`requireManualEndorsement`) makes that gate impossible to bypass from chat, even by a model that decides to be helpful.
 - **Scoped to where you are.** Each chat's Swarm tab shows the runs for that chat's workspace; a persisted switch reveals everything on the machine when you want the full picture.
+- **One run per goal, reviewed before built.** Dispatching into a workspace with an active run raises a warning (or a block, your choice); and unless you opt out, an architect agent reviews the dispatcher''s plan into PLAN.md before any builder starts.
 
 ## The dashboard
 
@@ -98,6 +99,8 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
     adaptiveConcurrency: true   # shrink on provider pain, recover on success
     spawnStaggerMs: 750         # pace launches within a wave
     nudgeAfterMinutes: 20       # board marker for long-silent tasks (0 = off)
+    workspaceRunPolicy: warn      # one-run-per-goal guard: warn | block | off
+    requireArchitectReview: true  # architect reviews the dispatcher's plan into PLAN.md first
     staleTimeoutSeconds: 14400  # watchdog: silent agents get reclaimed
     maxRetries: 2               # per task
     reviewLoops: 3              # review rejections per task
@@ -113,7 +116,7 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
 
 ## Status
 
-v0.4.0, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (40 tests: dispatch, endorsement, review loops, human gates, fallback rotation, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality), plus live verification on a real deployment.
+v0.5.0, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (45 tests: dispatch, endorsement, review loops, human gates, fallback rotation, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality), plus live verification on a real deployment.
 
 ## License
 
