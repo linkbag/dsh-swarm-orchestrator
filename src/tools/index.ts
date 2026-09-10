@@ -153,6 +153,27 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
   })))
 
   disposers.push(tools.register(defineTool({
+    name: 'swarm_interrupt',
+    description:
+      'Interrupt a stalled or runaway swarm task: aborts its child agent and requeues the task in the SAME run '
+      + '(no relief sibling needed). Use when a task has been silent far past its nudge window or is producing '
+      + 'nothing. Gated to the run\'s dispatching session.',
+    parameters: {
+      runId: { type: 'string', required: true, description: 'The run id' },
+      taskId: { type: 'string', required: true, description: 'The running/dispatching task to interrupt' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    isConcurrencySafe: () => true,
+    execute: async (args, exec) => {
+      service.interruptTask(args.runId, args.taskId, exec.agent === undefined ? undefined : String(exec.agent.id))
+      return `Task ${args.taskId} interrupted and requeued — the dispatcher will relaunch it. Track with swarm_status.`
+    },
+  })))
+
+  disposers.push(tools.register(defineTool({
     name: 'swarm_complete',
     description:
       'Mark a swarm task as completed when its work was finished OUTSIDE the swarm (e.g. you rescued it '

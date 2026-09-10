@@ -888,4 +888,91 @@ describe('swarm service (integration, fake subagents)', () => {
     // The push throws inside the service, but the run still completes normally.
     await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes despite broken push')
   })
+
+  it('swarm_interrupt aborts a running task and requeues it in the same run (I-1)', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    fake.holdAll = true // child stays running until released
+
+    const result = service.dispatch({
+      title: 'interrupt demo',
+      spec: 's',
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder' },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder', blockedBy: ['a'] },
+      ],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+    await waitFor(() => service.events.all().some((e) => e.kind === 'task/agent-started'), 5000, 'child running')
+
+    // Task 'a' is held (stalled). Interrupt it: it should fail-with-retry and requeue.
+    service.interruptTask(result.runId, 'a', undefined)
+    const a = service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'a')!
+    expect(a.status).toBe('retrying')
+
+    // Disable hold so the retry completes normally; release the held original.
+    fake.holdAll = false
+    fake.release()
+    // Wait for the retry + downstream to complete.
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 8000, 'run completes after interrupt + retry')
+    const snap = service.snapshot()
+    expect(snap.tasks.find((t) => t.id === 'a')?.status).toBe('completed')
+    expect(snap.tasks.find((t) => t.id === 'b')?.status).toBe('completed')
+  })
+
+  it('swarm_interrupt is gated to the dispatching session', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    fake.holdAll = true
+
+    const result = service.dispatch({
+      title: 'interrupt gate demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+    await waitFor(() => service.events.all().some((e) => e.kind === 'task/agent-started'), 5000, 'child running')
+
+    expect(() => service.interruptTask(result.runId, 'a', 'wrong-session')).toThrow(/gated to the dispatching session/)
+    service.interruptTask(result.runId, 'a', 'parent-1') // correct session: works
+    fake.release()
+  })
+
+  it('watchdog escalates after 3 nudges and reclaims the task (I-2)', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ nudgeAfterMinutes: 1, maxRetries: 1 })
+    contexts.push(ctx)
+    dirs.push(dir)
+    fake.holdAll = true
+
+    const result = service.dispatch({
+      title: 'escalation demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+    await waitFor(() => service.events.all().some((e) => e.kind === 'task/agent-started'), 5000, 'child running')
+
+    // Simulate escalating silence: 1st nudge, 2nd nudge, 3rd → reclaim.
+    service.watchdog(Date.now() + 21 * 60 * 1000)  // nudge 1
+    expect(service.events.all().filter((e) => e.kind === 'task/nudged').length).toBe(1)
+    expect(service.events.all().filter((e) => e.kind === 'task/failed').length).toBe(0)
+
+    service.watchdog(Date.now() + 42 * 60 * 1000)  // nudge 2 (now - lastNudge > nudgeMs)
+    expect(service.events.all().filter((e) => e.kind === 'task/nudged').length).toBe(2)
+    expect(service.events.all().filter((e) => e.kind === 'task/failed').length).toBe(0)
+
+    service.watchdog(Date.now() + 63 * 60 * 1000)  // nudge 3 → escalation (reclaim)
+    expect(service.events.all().filter((e) => e.kind === 'task/nudged').length).toBe(2) // no new nudge — reclaimed instead
+    const failed = service.events.all().filter((e) => e.kind === 'task/failed')
+    expect(failed.length).toBeGreaterThanOrEqual(1)
+    expect((failed[failed.length - 1]?.data as { reason?: string })?.reason).toMatch(/watchdog escalation/)
+
+    // The task requeues and the fake spawn now succeeds (holdAll still on, but the
+    // watchdog-aborted child's controller is done — the requeued spawn will hold too,
+    // so release and complete).
+    fake.release()
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 8000, 'run completes after escalation')
+  })
 })

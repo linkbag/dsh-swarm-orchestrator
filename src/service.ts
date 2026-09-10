@@ -172,6 +172,8 @@ export class SwarmService extends Service {
   private readonly adaptiveLimits = new Map<string, number>()
   /** Last silence-nudge timestamp per in-flight task (dedupes re-nudges). */
   private readonly nudgedAt = new Map<string, number>()
+  /** Consecutive nudge count per in-flight task (3+ triggers auto-reclaim). */
+  private readonly nudgeCount = new Map<string, number>()
   private readonly sessionTasks = new Map<string, { taskKey: string; effort?: string }>()
   private tickScheduled = false
 
@@ -256,16 +258,40 @@ export class SwarmService extends Service {
         continue
       }
       // Early-warning tier: surface long silences long before the reclaim.
+      // I-2 escalation: after 3 consecutive nudges (3× nudgeAfterMinutes of
+      // silence with no heartbeat reset), auto-reclaim the task — stalled
+      // children shouldn't sit for the full stale timeout.
       if (nudgeMs > 0 && task.status === 'running') {
         const last = task.lastNoteAt ?? task.updatedAt
         const silentMs = now - last
         const lastNudge = this.nudgedAt.get(key) ?? 0
         if (silentMs > nudgeMs && now - lastNudge > nudgeMs) {
           this.nudgedAt.set(key, now)
+          const count = (this.nudgeCount.get(key) ?? 0) + 1
+          this.nudgeCount.set(key, count)
+          if (count >= 3) {
+            // Escalation: reclaim the stalled child and requeue the task.
+            this.nudgeCount.delete(key)
+            this.inFlight.delete(key)
+            flight.controller.abort()
+            this.events.append('task/failed', {
+              runId: task.runId, taskId: task.id,
+              data: {
+                retry: task.attempts <= this.swarmConfig.maxRetries,
+                reason: `watchdog escalation: ${count} nudges over ${Math.round(silentMs / 60000)} min of silence — child reclaimed`,
+              },
+            })
+            this.ctx.logger('swarm').warn('watchdog escalated task %s after %d nudges', key, count)
+            continue
+          }
           this.events.append('task/nudged', {
             runId: task.runId, taskId: task.id,
             data: { silentMinutes: Math.round(silentMs / 60000) },
           })
+        }
+        // Reset the nudge counter when the task heartbeats (is making progress).
+        if (silentMs <= nudgeMs) {
+          this.nudgeCount.delete(key)
         }
       }
     }
@@ -336,7 +362,8 @@ export class SwarmService extends Service {
         const overlap = this.crossRunWriteOverlap(tasks, siblings.map((s) => s.id))
         const message = `run ${siblings[0]!.id} ("${siblings[0]!.title}") is already active in this workspace`
           + (overlap !== undefined ? ` and both declare writes over "${overlap}"` : '')
-          + ' — parallel workstreams belong in ONE run: consolidate into it, or endorse this run only after it finishes'
+          + ' — parallel workstreams belong in ONE run. If the sibling is stalled, use swarm_interrupt on its stuck task '
+          + '(or abort the sibling run) before endorsing this one; otherwise consolidate into it.'
         if (policy === 'block') {
           throw new Error(`workspace already has an active run: ${message}`)
         }
@@ -878,6 +905,41 @@ export class SwarmService extends Service {
     this.events.append('task/completed', {
       runId, taskId,
       data: { summary: (summary.length > 0 ? summary : `task ${taskId} completed outside the swarm (dispatcher rescue)`) },
+    })
+    this.scheduleTick()
+  }
+
+  /**
+   * I-1: interrupt a running task's child agent and requeue it in the same run.
+   * This is the dispatcher's rescue for stalled children: instead of dispatching
+   * a relief-sibling run, the dead task is aborted and retried in place.
+   */
+  interruptTask(runId: string, taskId: string, actorSessionId: string | undefined): void {
+    const run = this.view().runs.get(runId)
+    if (run === undefined) throw new Error(`unknown run ${runId}`)
+    // Gated to the dispatching session (same rule as swarm_complete).
+    const owner = run.dispatch?.sessionId
+    if (actorSessionId !== undefined && owner !== undefined && actorSessionId !== owner) {
+      throw new Error('swarm_interrupt is gated to the dispatching session; use the Swarm dashboard instead')
+    }
+    const task = this.view().tasks.get(`${runId}/${taskId}`)
+    if (task === undefined) throw new Error(`unknown task ${runId}/${taskId}`)
+    if (task.status !== 'running' && task.status !== 'dispatching') {
+      throw new Error(`task ${taskId} is ${task.status}; only running or dispatching tasks can be interrupted`)
+    }
+    // Abort the in-flight child agent.
+    const key = `${runId}/${taskId}`
+    const flight = this.inFlight.get(key)
+    if (flight !== undefined) {
+      flight.controller.abort()
+      this.inFlight.delete(key)
+    }
+    // Forget the tracked child session so the effort pin doesn't leak.
+    if (flight?.childSessionId !== undefined) this.forgetChildSession(flight.childSessionId)
+    // Mark the task as failed-with-retry: the dispatcher requeues it in the same run.
+    this.events.append('task/failed', {
+      runId, taskId,
+      data: { retry: true, reason: 'interrupted by the dispatching session (stalled child)' },
     })
     this.scheduleTick()
   }
