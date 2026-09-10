@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { zstdDecompressSync } from 'node:zlib'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
@@ -68,8 +69,11 @@ interface AgentsLike {
     agentOptions?: { provider?: string; model?: string }
     setup?: (anchorCtx: unknown) => void | Promise<void>
   }): Promise<{ agent: Agent; dispose(): Promise<void> }>
-  /** Live-agent lookup by session id (workspace resolution). */
-  get?(id: string): { session?: { header?: { cwd?: string } } } | undefined
+  /** Live-agent lookup by session id (workspace resolution + completion push). */
+  get?(id: string): {
+    session?: { header?: { cwd?: string } }
+    followup?(message: unknown): void
+  } | undefined
 }
 
 /** Structural view of the agentPresets service for anchor composition. */
@@ -482,6 +486,31 @@ export class SwarmService extends Service {
     return undefined
   }
 
+  /**
+   * P-A: push the run's terminal result into the dispatching chat's inbox, so
+   * the dispatcher learns the outcome exactly once, at the moment it's true —
+   * no polling, no optimistic summaries. Only live sessions are woken: a chat
+   * that was closed is never disturbed. Failures are contained — a notification
+   * problem must never affect the run.
+   */
+  private notifyDispatchSession(runId: string, outcome: 'completed' | 'failed' | 'paused', detail: string): void {
+    if (this.swarmConfig.notifyDispatchSession !== true) return
+    try {
+      const run = this.view().runs.get(runId)
+      const sessionId = run?.dispatch?.sessionId
+      if (sessionId === undefined) return
+      const agents = this.ctx.get('agents') as AgentsLike | undefined
+      const live = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
+      if (live === undefined || typeof live.followup !== 'function') return
+      const icon = outcome === 'completed' ? '✅' : outcome === 'paused' ? '⏸' : '❌'
+      const text = `[swarm auto-notification] Swarm run "${run?.title ?? runId}" (${runId}) ${outcome}: ${detail}. `
+        + 'Briefly relay this to the user. Do not start new work unless the user asks — the live board is on the Swarm tab.'
+      live.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
+    } catch (err) {
+      this.ctx.logger('swarm').warn('completion push for run %s failed (contained): %s', runId, String(err))
+    }
+  }
+
   snapshot(filter?: { session?: string; cwd?: string }): BoardSnapshot {
     const state = this.view()
     let effective = state
@@ -688,6 +717,7 @@ export class SwarmService extends Service {
       }
     }
     this.events.append('run/paused', { runId, data: { reason: `provider quota exhausted — resume from the Swarm dashboard after topping up (${cause})` } })
+    this.notifyDispatchSession(runId, 'paused', cause)
   }
 
   /** A3/K2: resume a paused (or requeue a terminally failed) run, keeping completed tasks. */
@@ -820,6 +850,31 @@ export class SwarmService extends Service {
       }
       this.checkRunCompletion(run.id)
     }
+  }
+
+  /** P-C: mark a task completed from outside the swarm (dispatcher rescue path). */
+  completeTaskExternally(runId: string, taskId: string, actorSessionId: string | undefined, summary: string): void {
+    const run = this.view().runs.get(runId)
+    if (run === undefined) throw new Error(`unknown run ${runId}`)
+    // Gated to the dispatching session; the dashboard bypasses via its own action.
+    const owner = run.dispatch?.sessionId
+    if (actorSessionId !== undefined && owner !== undefined && actorSessionId !== owner) {
+      throw new Error('swarm_complete is gated to the dispatching session; use the Swarm dashboard instead')
+    }
+    const task = this.view().tasks.get(`${runId}/${taskId}`)
+    if (task === undefined) throw new Error(`unknown task ${runId}/${taskId}`)
+    if (task.status === 'completed') throw new Error(`task ${taskId} is already completed`)
+    for (const [key, flight] of this.inFlight) {
+      if (flight.taskKey === `${runId}/${taskId}`) {
+        flight.controller.abort()
+        this.inFlight.delete(key)
+      }
+    }
+    this.events.append('task/completed', {
+      runId, taskId,
+      data: { summary: (summary.length > 0 ? summary : `task ${taskId} completed outside the swarm (dispatcher rescue)`) },
+    })
+    this.scheduleTick()
   }
 
   private launchTask(runId: string, task: Task, delayMs = 0): void {
@@ -1097,6 +1152,12 @@ export class SwarmService extends Service {
       },
     })
     this.releaseAnchor(runId)
+    // P-A: push the terminal result to the dispatching chat (once, on transition).
+    this.notifyDispatchSession(
+      runId,
+      succeeded ? 'completed' : 'failed',
+      tasks.map((t) => `${t.id}=${t.status}`).join(', '),
+    )
   }
 
   /** Requeue a failed/blocked task for another attempt (dashboard action or swarm_retry tool). */

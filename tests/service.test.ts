@@ -110,6 +110,16 @@ class FakeAgents {
       dispose: async () => { this.disposeCount += 1 },
     }))
   }
+
+  /** Live-session lookup: resolves the dispatching session for completion pushes. */
+  get(id: string): { followup: (message: unknown) => void } | undefined {
+    if (id === 'parent-live' || id === 'parent-1') {
+      return { followup: (message: unknown): void => { this.followupCalls.push(String(message)) } }
+    }
+    return undefined
+  }
+
+  readonly followupCalls: string[] = []
 }
 
 /** Fake dispatching agent: carries a route, session cwd, and a composed preset. */
@@ -802,5 +812,80 @@ describe('swarm service (integration, fake subagents)', () => {
     const run = service.snapshot().runs.find((r) => r.id === result.runId)!
     expect(run.dispatch?.sessionId).toBe('agent-has-id')
     expect(run.dispatch?.cwd).toBe('D:\\work')
+  })
+
+  it('pushes a completion notification into the live dispatching session (P-A)', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    // A dispatching session that is LIVE: agents.get resolves it and it can
+    // accept followup messages (that's how the completion push is delivered).
+    const followupCalls: string[] = []
+    const liveParent = {
+      id: 'parent-live',
+      options: { provider: 'zai', model: 'glm-5.3' },
+      session: { header: { id: 'parent-live', cwd: 'D:\\work' } },
+      ctx: { get: (): undefined => undefined },
+      followup: (message: unknown): void => { followupCalls.push(JSON.stringify(message)) },
+    } as never
+
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+    // FakeAgents.get returns the anchor for anchor ids; the completion push
+    // looks up the DISPATCH session id — route it through a spy.
+    const originalGet = agents.get.bind(agents)
+    ;(agents as unknown as { get: (id: string) => unknown }).get = (id: string): unknown => {
+      if (id === 'parent-live') {
+        return { followup: (message: unknown): void => { followupCalls.push(JSON.stringify(message)) } }
+      }
+      return originalGet(id)
+    }
+
+    const result = service.dispatch({
+      title: 'push demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, liveParent)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes')
+    // The dispatching session received exactly one followup notification
+    // naming the run, tagged as a swarm auto-notification.
+    expect(followupCalls.length).toBe(1)
+    expect(followupCalls[0]).toContain(result.runId)
+    expect(followupCalls[0]).toContain('swarm auto-notification')
+  })
+
+  it('notification failures are contained and never affect the run', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    // FakeAgents whose anchors ACCEPT followup but the followup throws —
+    // proving the push failure is contained without affecting the run.
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+    const originalGet = agents.get.bind(agents)
+    ;(agents as unknown as { get: (id: string) => unknown }).get = (id: string): unknown => {
+      const result = (originalGet as (id: string) => unknown)(id)
+      if (result !== undefined && result !== null) {
+        return {
+          ...result,
+          followup: (): void => { throw new Error('inbox exploded') },
+        }
+      }
+      return result
+    }
+
+    const result = service.dispatch({
+      title: 'contained push demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    // The push throws inside the service, but the run still completes normally.
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes despite broken push')
   })
 })

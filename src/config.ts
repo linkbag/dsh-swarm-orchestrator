@@ -22,6 +22,7 @@ export interface SwarmConfig {
   /** 'warn' (default) | 'block' | 'off' — normalized at use; any other value behaves as 'warn'. */
   workspaceRunPolicy: string
   requireArchitectReview: boolean
+  notifyDispatchSession: boolean
 }
 
 export const Config = Schema.object({
@@ -67,5 +68,10 @@ export const Config = Schema.object({
     + 'architect task: it deep-reviews the dispatching agent\'s plan against the repo, consolidates '
     + 'workstreams into one DAG, and must produce PLAN.md before any builder starts. '
     + 'Per-dispatch opt-out: architectReview: false.',
+  ),
+  notifyDispatchSession: Schema.boolean().default(true).description(
+    'Push a completion notification into the dispatching chat when a run finishes (completed, '
+    + 'failed, or paused) — the chat agent wakes once to relay the result, so it never has to '
+    + 'poll or guess. Only live sessions are woken; closed chats are never disturbed.',
   ),
 })

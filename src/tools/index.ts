@@ -62,6 +62,8 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
       + 'Shape: ONE run per goal — put parallel workstreams in the same DAG as concurrent tasks, never in separate runs. '
       + 'If you have already planned, pass your plan as the spec and tasks: an architect agent reviews and refines it into PLAN.md before any builder starts '
       + '(automatic; skip per-run with architectReview=false). '
+      + 'IMPORTANT: this returns when the run is CREATED, not finished — a run is finished only when swarm_status/swarm_wait shows it completed; '
+      + 'never report a run as done without that. '
       + 'Returns the run id; tasks dispatch once the run is endorsed (the human endorses on the dashboard, or pass endorse=true ONLY when the human already approved spawning).',
     parameters: {
       title: { type: 'string', required: true, description: 'Run title shown on the dashboard' },
@@ -151,6 +153,28 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
   })))
 
   disposers.push(tools.register(defineTool({
+    name: 'swarm_complete',
+    description:
+      'Mark a swarm task as completed when its work was finished OUTSIDE the swarm (e.g. you rescued it '
+      + 'with your own subagents or direct edits). Gated to the run\'s dispatching session; other sessions '
+      + 'must use the Swarm dashboard. This updates the run record so downstream tasks can proceed.',
+    parameters: {
+      runId: { type: 'string', required: true, description: 'The run id' },
+      taskId: { type: 'string', required: true, description: 'The task that was completed outside the swarm' },
+      summary: { type: 'string', description: 'One-line summary of how/where the work was completed' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
+    isConcurrencySafe: () => true,
+    execute: async (args, exec) => {
+      service.completeTaskExternally(args.runId, args.taskId, exec.agent === undefined ? undefined : String(exec.agent.id), args.summary ?? '')
+      return `Task ${args.taskId} marked completed — downstream tasks unblock automatically. Track with swarm_status.`
+    },
+  })))
+
+  disposers.push(tools.register(defineTool({
     name: 'swarm_retry',
     description:
       'Requeue a failed or blocked swarm task for another attempt (recovery after a fix). '
@@ -174,7 +198,8 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     name: 'swarm_wait',
     description:
       'Block until the swarm board changes (task completed/failed, run state change) or the timeout expires — '
-      + 'use this instead of sleep-polling when supervising a swarm run. Returns the board text at the moment of the change.',
+      + 'the preferred way to await a swarm run before reporting anything to the user. '
+      + 'Returns the board text at the moment of the change.',
     parameters: {
       runId: { type: 'string', description: 'Only wait for changes in this run (omit for any swarm activity)' },
       timeoutSeconds: { type: 'number', description: 'Max seconds to wait (default 240, max 600)' },
