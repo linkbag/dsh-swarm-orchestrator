@@ -90,6 +90,7 @@ export interface Board {
 
 export interface BoardActionBody {
   action: string
+  runtime?: unknown
   runId?: string
   taskId?: string
   table?: unknown
