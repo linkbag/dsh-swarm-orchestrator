@@ -1394,6 +1394,9 @@ export class SwarmService extends Service {
           : undefined
         const outcome = await spawnTaskAgent(deps, {
           parent, run, task, role, candidates, signal: spawnSignal.signal,
+          // J14: bound delegation depth so task agents cannot spawn hidden
+          // descendants the dispatcher cannot see or account for.
+          ...(this.swarmConfig.maxSubagentDepth > 0 ? { maxDepth: this.swarmConfig.maxSubagentDepth } : {}),
           ...(role.toolFilter !== undefined ? { toolFilter: role.toolFilter } : {}),
           ...(priorNotes !== undefined && priorNotes.length > 0 ? { priorNotes } : {}),
           ...(task.evidence !== undefined ? { evidence: task.evidence } : {}),

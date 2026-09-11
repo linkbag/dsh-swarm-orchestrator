@@ -36,6 +36,8 @@ class FakeSubagents {
   quotaCount = 0
   /** Throw a provider-class error on the first call only (A6 rotation). */
   failOnce = false
+  /** Throw the real depth-guard error, as the provider does when maxDepth is exceeded (J14). */
+  throwDepthError = false
   private readonly held: Array<() => void> = []
   private n = 0
   private failedOnce = false
@@ -55,6 +57,10 @@ class FakeSubagents {
     if (this.failOnce && !this.failedOnce) {
       this.failedOnce = true
       throw new Error('boom: stream idle timeout')
+    }
+    if (this.throwDepthError) {
+      // Mirror @deepseek-ai/dsh-subagent's SubagentDepthError wording.
+      throw new Error('subagent depth 2 exceeds maxDepth 1')
     }
     this.n += 1
     const id = `sess-${this.n}`
@@ -1562,5 +1568,60 @@ describe('swarm service (integration, fake subagents)', () => {
     table.roles.reviewer = { ...table.roles.reviewer, toolFilter: { deny: ['modlens'] } }
     service.setDutyTable(table, 'test')
     expect(service.duty.role('reviewer')?.toolFilter?.deny).toEqual(['modlens'])
+  }, 15000)
+
+  // ── J14: task agents must not spawn invisible descendants ────────────────
+  // Production evidence: the `vhp-cryo-embed` task spawned 12 DSH subagents in
+  // 42 minutes while the orchestrator saw exactly one task; a separate chain
+  // reached delegation depth 3. None of those were counted by the global agent
+  // cap, tracked by the watchdog, or shown on the board.
+  it('J14: maxDepth is passed to the spawn provider by default', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    const result = service.dispatch({
+      title: 'depth bound',
+      spec: 's',
+      tasks: [{ id: 'd1', subject: 'D', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 5000, 'spawn')
+    const sent = (fake.calls[0] as unknown as { maxDepth?: number }).maxDepth
+    expect(sent).toBe(1) // depth 1 = the task agent itself; grandchildren rejected
+    service.abort(result.runId)
+  }, 15000)
+
+  it('J14: maxSubagentDepth 0 disables the bound (opt-out)', async () => {
+    const { service, fake, dir } = await bootRunnable({ maxSubagentDepth: 0 })
+    const result = service.dispatch({
+      title: 'no depth bound',
+      spec: 's',
+      tasks: [{ id: 'd2', subject: 'D', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 5000, 'spawn')
+    const sent = (fake.calls[0] as unknown as { maxDepth?: number }).maxDepth
+    expect(sent).toBeUndefined()
+    service.abort(result.runId)
+  }, 15000)
+
+  it('J14: a delegation attempt beyond the cap surfaces as a task failure, not silently', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    // Simulate the provider rejecting a grandchild the way the real depth guard does.
+    fake.throwDepthError = true
+    const result = service.dispatch({
+      title: 'depth rejection',
+      spec: 's',
+      tasks: [{ id: 'd3', subject: 'D', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => ['failed', 'retrying'].includes(service.snapshot().tasks.find((t) => t.id === 'd3')?.status ?? ''),
+      8000,
+      'depth rejection recorded',
+    )
+    const note = service.snapshot().tasks.find((t) => t.id === 'd3')?.lastNote ?? ''
+    expect(note).toMatch(/depth/i)
   }, 15000)
 })

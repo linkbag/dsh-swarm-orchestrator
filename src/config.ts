@@ -29,6 +29,7 @@ export interface SwarmConfig {
   circuitBreakerCooldownMs: number
   spawnTimeoutSeconds: number
   bootGraceSeconds: number
+  maxSubagentDepth: number
 }
 
 export const Config = Schema.object({
@@ -109,5 +110,14 @@ export const Config = Schema.object({
     + 'running when the host died; a requeue that fires before the provider exists fails with '
     + '"subagents service unavailable" and burns a retry for no reason. Raise this on a host '
     + 'with a slow plugin tree.',
+  ),
+  maxSubagentDepth: Schema.number().default(1).min(0).max(8).description(
+    'Absolute delegation-depth cap for every swarm task agent (default 1). A task agent '
+    + 'runs at depth 1, so 1 permits the agent itself and rejects any subagents IT tries '
+    + 'to spawn. Without this bound a task agent can delegate freely, and those '
+    + 'descendants are invisible to the dispatcher: not counted by the global agent cap, '
+    + 'not tracked by the watchdog, not shown on the board, and each one resident on the '
+    + 'same Node heap. One production task spawned 12 hidden subagents while the '
+    + 'orchestrator saw a single task. 0 disables the bound.',
   ),
 })

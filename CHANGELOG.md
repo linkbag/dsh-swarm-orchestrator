@@ -7,6 +7,26 @@ Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 Reliability release. Every fix below came out of diagnosing 47 recorded swarm runs
 and 184 task failures, and each one has a regression test.
 
+### Added
+
+- **`maxSubagentDepth` (default 1) — task agents can no longer spawn invisible
+  descendants.** The swarm never passed `maxDepth` to the subagent provider, and the
+  provider's recursion cap is opt-in, so a task agent could delegate freely. Those
+  descendants were invisible to the dispatcher: not counted by the global agent cap,
+  not tracked by the watchdog, not shown on the board, and each one resident on the
+  same Node heap. This was not hypothetical — auditing 512 session transcripts found
+  **16 sessions spawned by swarm task agents**, including one task
+  (`vhp-cryo-embed`) that spawned **12 distinct subagents in 42 minutes** while the
+  orchestrator saw exactly one task, and a chain that reached delegation depth 3
+  (`swarm:v6b-integration → Verify 8 landed task claims → Verify content+identity+photofit data`).
+  A task agent runs at depth 1, so `maxDepth: 1` permits the agent itself and rejects
+  any further delegation with `SubagentDepthError`. Set `0` to disable the bound.
+
+  Note on blast radius: growth is multiplicative, not runaway — 93 top-level chats →
+  394 first-level children → 23 grandchildren → 2 great-grandchildren. Reaching those
+  deeper levels needs an agent that explicitly delegates. The bound removes the
+  possibility rather than relying on model restraint.
+
 ### Fixed
 
 - **Evidence commands ran under `cmd.exe`, not a POSIX shell.** `checkEvidence`
@@ -91,7 +111,8 @@ and 184 task failures, and each one has a regression test.
   live-task, and genuine-restart-orphan cases), the spawn ceiling (positive and
   `0`-disables), the evidence shell, the missing-workspace guard, durable adoption
   (adopt and refuse-to-adopt cases), the `swarm_report` binding, write-scope nesting,
-  and the role `toolFilter` pass-through.
+  the role `toolFilter` pass-through, and the delegation-depth bound (default, opt-out,
+  and rejection-surfaces-as-failure). **77 tests total.**
 - **End-to-end smoke on a real host, twice.** The plugin was installed from source
   into an isolated DSH profile and driven by a live headless agent. The final run is
   fully green:

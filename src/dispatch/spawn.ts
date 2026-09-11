@@ -171,6 +171,7 @@ export interface SpawnDeps {
     agentOptions?: { provider?: string; model?: string; maxTokens?: number }
     persona?: string
     toolFilter?: { deny?: string[]; allow?: string[] }
+    maxDepth?: number
   }): Promise<{
     id: string
     result: Promise<{
@@ -203,6 +204,8 @@ export async function spawnTaskAgent(
     priorNotes?: string[]
     /** Evidence contract restated in the prompt (J2). */
     evidence?: TaskEvidence
+    /** J14: absolute delegation-depth cap for the task agent (1 = no grandchildren). */
+    maxDepth?: number
     onFallback?: (failed: { provider: string; model: string }, next: { provider: string; model: string } | undefined) => void
     onStarted?: (childSessionId: string) => void
   },
@@ -226,6 +229,16 @@ export async function spawnTaskAgent(
         prompt: [{ type: 'text', text: prompt }],
         parent: opts.parent,
         signal: opts.signal,
+        // J14: bound the delegation depth of every task agent. The swarm never
+        // passed maxDepth, so a task agent could spawn its own DSH subagents, and
+        // those were invisible to the dispatcher: not counted by the global agent
+        // cap, not tracked by the watchdog, not shown on the board, and each one
+        // resident on the same Node heap. Observed in production: the
+        // `vhp-cryo-embed` task spawned 12 hidden subagents in 42 minutes while the
+        // orchestrator saw exactly one task, and one chain reached depth 3.
+        // maxDepth 1 permits the task agent itself (depth 1) and rejects any
+        // further delegation with SubagentDepthError. 0 disables the bound.
+        ...(opts.maxDepth !== undefined ? { maxDepth: opts.maxDepth } : {}),
         ...(agentOptions !== undefined ? { agentOptions } : {}),
         ...(opts.role.persona !== undefined ? { persona: opts.role.persona } : {}),
         ...(opts.toolFilter !== undefined ? { toolFilter: opts.toolFilter } : {}),
