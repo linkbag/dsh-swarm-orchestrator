@@ -632,6 +632,7 @@ describe('swarm service (integration, fake subagents)', () => {
     }, makeDispatcher() as never)
     expect(overlapping.warnings?.length).toBe(1)
     expect(overlapping.warnings?.[0]).toContain('both declare write scope over "core.js"')
+    service.abort(overlapping.runId) // free the session for the next dispatch
 
     // A dependency makes the same scopes legal — no warning.
     const chained = service.dispatch({
@@ -767,11 +768,18 @@ describe('swarm service (integration, fake subagents)', () => {
     }, makeDispatcher() as never)
     expect(first.warnings).toBeUndefined() // first dispatch in the workspace: clean
 
+    // Different session, same workspace — hits the workspace warning (not the session hard limit).
+    const chat2 = {
+      id: 'parent-2',
+      options: { provider: 'zai', model: 'glm-5.3' },
+      session: { header: { id: 'parent-2', cwd: 'D:\\work' } },
+      ctx: { get: (): undefined => undefined },
+    } as never
     const second = service.dispatch({
       title: 'second run',
       spec: 's',
       tasks: [{ id: 'x', subject: 'X', description: 'd', role: 'builder', writes: ['core.js'] }],
-    }, makeDispatcher() as never)
+    }, chat2)
     expect(second.warnings?.some((w) => w.includes('already active in this workspace') && w.includes('"core.js"'))).toBe(true)
 
     // A run in a DIFFERENT workspace is not a sibling.
@@ -792,7 +800,14 @@ describe('swarm service (integration, fake subagents)', () => {
     void fake
 
     service.dispatch({ title: 'first', spec: 's', tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }] }, makeDispatcher() as never)
-    expect(() => service.dispatch({ title: 'second', spec: 's', tasks: [{ id: 'b', subject: 'B', description: 'd', role: 'builder' }] }, makeDispatcher() as never))
+    // Different session, same workspace — hits the workspace block policy.
+    const chat2 = {
+      id: 'parent-2',
+      options: { provider: 'zai', model: 'glm-5.3' },
+      session: { header: { id: 'parent-2', cwd: 'D:\\work' } },
+      ctx: { get: (): undefined => undefined },
+    } as never
+    expect(() => service.dispatch({ title: 'second', spec: 's', tasks: [{ id: 'b', subject: 'B', description: 'd', role: 'builder' }] }, chat2))
       .toThrow(/workspace already has an active run/)
   })
 
@@ -974,5 +989,65 @@ describe('swarm service (integration, fake subagents)', () => {
     // so release and complete).
     fake.release()
     await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 8000, 'run completes after escalation')
+  })
+
+  it('hard limit: one active run per chat session — sequential dispatches are rejected until the first completes', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ workspaceRunPolicy: 'off' })
+    contexts.push(ctx)
+    dirs.push(dir)
+    fake.holdAll = true
+
+    const dispatcher = makeDispatcher() as never
+    const first = service.dispatch({
+      title: 'first sequential run',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, dispatcher)
+    service.endorse(first.runId)
+
+    // Same chat tries to dispatch a second run while the first is active → REJECTED.
+    expect(() => service.dispatch({
+      title: 'second sequential run',
+      spec: 's',
+      tasks: [{ id: 'b', subject: 'B', description: 'd', role: 'builder' }],
+    }, dispatcher)).toThrow(/already has an active swarm run.*swarm_wait/)
+
+    // A DIFFERENT chat session can still dispatch (different sessionId).
+    const otherChat = {
+      id: 'other-session',
+      options: { provider: 'zai', model: 'glm-5.3' },
+      session: { header: { id: 'other-session', cwd: 'D:\\elsewhere' } },
+      ctx: { get: (): undefined => undefined },
+    } as never
+    const other = service.dispatch({ title: 'other chat run', spec: 's', tasks: [{ id: 'c', subject: 'C', description: 'd', role: 'builder' }] }, otherChat)
+    expect(other.runId).toBeDefined()
+
+    // Complete the first run: the same chat can now dispatch again.
+    fake.holdAll = false
+    fake.release()
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === first.runId)?.status === 'completed', 5000, 'first run completes')
+    const second = service.dispatch({
+      title: 'second sequential run',
+      spec: 's',
+      tasks: [{ id: 'b', subject: 'B', description: 'd', role: 'builder' }],
+    }, dispatcher)
+    expect(second.runId).toBeDefined()
+    service.abort(second.runId)
+    service.abort(other.runId)
+  })
+
+  it('hard limit: a parentless dispatch (no sessionId) skips the session check', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    void fake
+
+    // No parent → no sessionId → the session guard can't check → dispatch succeeds.
+    const first = service.dispatch({ title: 'parentless 1', spec: 's', tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }] }, undefined)
+    expect(first.runId).toBeDefined()
+    const second = service.dispatch({ title: 'parentless 2', spec: 's', tasks: [{ id: 'b', subject: 'B', description: 'd', role: 'builder' }] }, undefined)
+    expect(second.runId).toBeDefined()
+    service.abort(first.runId)
+    service.abort(second.runId)
   })
 })

@@ -64,6 +64,8 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
       + '(automatic; skip per-run with architectReview=false). '
       + 'IMPORTANT: this returns when the run is CREATED, not finished — a run is finished only when swarm_status/swarm_wait shows it completed; '
       + 'never report a run as done without that. '
+      + 'HARD LIMIT: one active run per chat — if this chat already has a running swarm, the dispatch is REJECTED. '
+      + 'Sequential runs must wait: call swarm_wait on the active run until it completes (you will get a notification), then dispatch the next. '
       + 'Returns the run id; tasks dispatch once the run is endorsed (the human endorses on the dashboard, or pass endorse=true ONLY when the human already approved spawning).',
     parameters: {
       title: { type: 'string', required: true, description: 'Run title shown on the dashboard' },

@@ -384,6 +384,24 @@ export class SwarmService extends Service {
       }
     }
 
+    // Hard limit: ONE active run per chat session. Sequential runs in the same
+    // conversation must wait for the current run to finish — the dispatcher
+    // calls swarm_wait on the active run, gets the completion notification,
+    // then dispatches the next one. This prevents accidental parallel dispatches
+    // that duplicate work or conflict on files.
+    if (captured.sessionId !== undefined) {
+      const activeFromSession = [...this.view().runs.values()].find((r) =>
+        (r.status === 'planning' || r.status === 'running' || r.status === 'paused')
+        && r.dispatch?.sessionId === captured.sessionId)
+      if (activeFromSession !== undefined) {
+        throw new Error(
+          `this chat already has an active swarm run: ${activeFromSession.id} ("${activeFromSession.title}") [${activeFromSession.status}] — `
+          + `call swarm_wait({ runId: "${activeFromSession.id}" }) until it completes, then dispatch your next run. `
+          + 'If the run is stalled, use swarm_interrupt on its stuck task or abort it from the dashboard first.',
+        )
+      }
+    }
+
     // P2: mandatory architect review. When enabled and the DAG has no architect
     // task, an architect-review root is injected and every dispatched task is
     // gated behind it. Injection can never throw: a duty table without the
