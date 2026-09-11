@@ -159,6 +159,9 @@ async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx
     // v0.5.0 guards default ON in production; tests opt out unless exercising them.
     requireArchitectReview: false,
     workspaceRunPolicy: 'off',
+    // H-1/H-2 hardening defaults ON in production; tests disable for speed.
+    retryBackoffBaseMs: 0,
+    circuitBreakerThreshold: 0,
     ...overrides,
   })
   // ctx.get returns a traceable proxy; unwrap to the raw service via symbols.original
@@ -1050,4 +1053,69 @@ describe('swarm service (integration, fake subagents)', () => {
     service.abort(first.runId)
     service.abort(second.runId)
   })
+
+  it('H-1 retry backoff: a failed task waits before retrying, not immediately', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({ retryBackoffBaseMs: 3000 })
+    contexts.push(ctx)
+    dirs.push(dir)
+    fake.failOnce = true // first attempt fails, second succeeds
+
+    const result = service.dispatch({
+      title: 'backoff demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    // First attempt fails (failOnce).
+    await waitFor(() => service.snapshot().tasks.find((t) => t.id === 'a')?.status === 'retrying', 5000, 'first failure')
+
+    // The retry should NOT fire immediately — the backoff window is 3s.
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    expect(fake.calls.length).toBe(1) // only the first (failed) spawn
+
+    // After the backoff, the retry fires and completes.
+    await waitFor(() => fake.calls.length >= 2, 10000, 'retry after backoff')
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 8000, 'run completes after backoff')
+  }, 20000)
+
+  it('H-2 circuit breaker with non-quota errors: 3 failures pause retries, cooldown resumes', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm({
+      circuitBreakerThreshold: 3,
+      circuitBreakerCooldownMs: 1500,
+      retryBackoffBaseMs: 200, // small backoff: gives the breaker time to trip
+      maxRetries: 3,
+    })
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    fake.unavailableCount = 100 // all spawns throw (provider class)
+
+    const result = service.dispatch({
+      title: 'breaker non-quota demo',
+      spec: 's',
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder' },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder' },
+        { id: 'c', subject: 'C', description: 'd', role: 'builder' },
+      ],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    // Wait for the breaker to trip (3 failures recorded).
+    await waitFor(() => {
+      const failures = service.events.all().filter((e) => e.kind === 'task/failed' && e.runId === result.runId)
+      return failures.length >= 3
+    }, 5000, 'breaker threshold reached')
+
+    // While the breaker is open, no new spawns for 300ms.
+    const callCountAfterBreaker = fake.calls.length
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(fake.calls.length).toBe(callCountAfterBreaker)
+
+    // After the 1.5s cooldown, the breaker closes and retries resume.
+    fake.unavailableCount = 0 // subsequent spawns succeed
+    await waitFor(() => fake.calls.length > callCountAfterBreaker, 8000, 'retries resume after cooldown')
+    service.abort(result.runId)
+  }, 15000)
 })

@@ -23,6 +23,9 @@ export interface SwarmConfig {
   workspaceRunPolicy: string
   requireArchitectReview: boolean
   notifyDispatchSession: boolean
+  retryBackoffBaseMs: number
+  circuitBreakerThreshold: number
+  circuitBreakerCooldownMs: number
 }
 
 export const Config = Schema.object({
@@ -73,5 +76,16 @@ export const Config = Schema.object({
     'Push a completion notification into the dispatching chat when a run finishes (completed, '
     + 'failed, or paused) — the chat agent wakes once to relay the result, so it never has to '
     + 'poll or guess. Only live sessions are woken; closed chats are never disturbed.',
+  ),
+  retryBackoffBaseMs: Schema.number().default(5000).min(0).max(120000).description(
+    'Retry backoff: a failed task waits base × 2^(attempt-1) before retrying (5s → 10s → 20s). '
+    + 'Prevents synchronized retry cascades when a provider outage kills all tasks at once.',
+  ),
+  circuitBreakerThreshold: Schema.number().default(3).min(0).max(10).description(
+    'Circuit breaker: when this many tasks fail within a 30-second window, the run pauses '
+    + 'retries for the cooldown period (provider outage detected). 0 disables.',
+  ),
+  circuitBreakerCooldownMs: Schema.number().default(60000).min(1000).max(600000).description(
+    'How long the circuit breaker pauses retries before resuming (default 60 seconds).',
   ),
 })

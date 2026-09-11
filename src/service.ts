@@ -174,6 +174,10 @@ export class SwarmService extends Service {
   private readonly nudgedAt = new Map<string, number>()
   /** Consecutive nudge count per in-flight task (3+ triggers auto-reclaim). */
   private readonly nudgeCount = new Map<string, number>()
+  /** H-2 circuit breaker: recent failure timestamps per runId (rolling 30s window). */
+  private readonly recentFailures = new Map<string, number[]>()
+  /** H-2 circuit breaker: runId → resume-after timestamp (retries paused while active). */
+  private readonly circuitBreakerUntil = new Map<string, number>()
   private readonly sessionTasks = new Map<string, { taskKey: string; effort?: string }>()
   private tickScheduled = false
 
@@ -852,6 +856,44 @@ export class SwarmService extends Service {
     })
   }
 
+  /**
+   * H-2 circuit breaker: record a task failure and trip the breaker when
+   * threshold failures land within the rolling 30-second window. While the
+   * breaker is open, no tasks for this run launch — the tick skips them,
+   * letting the provider recover instead of burning retries into a dead endpoint.
+   */
+  private recordFailure(runId: string): void {
+    const threshold = this.swarmConfig.circuitBreakerThreshold
+    if (threshold <= 0) return
+    const now = Date.now()
+    const stamps = (this.recentFailures.get(runId) ?? []).filter((t) => now - t < 30_000)
+    stamps.push(now)
+    this.recentFailures.set(runId, stamps)
+    if (stamps.length >= threshold) {
+      this.recentFailures.delete(runId)
+      const cooldown = this.swarmConfig.circuitBreakerCooldownMs
+      this.circuitBreakerUntil.set(runId, now + cooldown)
+      this.ctx.logger('swarm').warn(
+        'circuit breaker OPEN for run %s: %d failures in 30s — retries paused for %dms',
+        runId, stamps.length, cooldown,
+      )
+      // Schedule a tick after the cooldown so the run resumes automatically.
+      setTimeout(() => this.scheduleTick(), cooldown + 100)
+    }
+  }
+
+  /** H-2: whether the circuit breaker is currently pausing retries for this run. */
+  private isCircuitOpen(runId: string): boolean {
+    const until = this.circuitBreakerUntil.get(runId)
+    if (until === undefined) return false
+    if (Date.now() >= until) {
+      this.circuitBreakerUntil.delete(runId)
+      this.ctx.logger('swarm').info('circuit breaker CLOSED for run %s — resuming', runId)
+      return false
+    }
+    return true
+  }
+
   /** Launch ready tasks up to the concurrency caps. Sync planning; spawns are staggered + fire-and-track. */
   private tick(): void {
     const state = this.view()
@@ -889,6 +931,13 @@ export class SwarmService extends Service {
       const runTasks = run.taskIds
         .map((id) => fresh.tasks.get(`${run.id}/${id}`))
         .filter((t): t is Task => t !== undefined)
+      // H-2 circuit breaker: when ≥3 tasks failed within 30s (provider outage),
+      // pause retries for the cooldown period instead of launching into a dead
+      // provider. The breaker auto-clears when the cooldown expires.
+      if (this.isCircuitOpen(run.id)) {
+        this.checkRunCompletion(run.id)
+        continue
+      }
       const roleRunning = new Map<string, number>()
       for (const task of runTasks) {
         if (task.status === 'running' || task.status === 'dispatching' || task.status === 'reviewing') {
@@ -901,6 +950,17 @@ export class SwarmService extends Service {
         if (capacity <= 0) break
         if (!isReady(fresh, task)) continue
         if (this.inFlight.has(taskKeyOf(task))) continue
+        // H-1 retry backoff: a retrying task waits base × 2^(attempt-1) from
+        // its failure timestamp (updatedAt) before relaunching — prevents
+        // synchronized retry cascades when a provider outage kills all tasks
+        // at once. First-attempt tasks launch immediately.
+        if (task.status === 'retrying' && this.swarmConfig.retryBackoffBaseMs > 0) {
+          const backoffMs = Math.min(
+            this.swarmConfig.retryBackoffBaseMs * Math.pow(2, Math.max(0, task.attempts - 1)),
+            60000,
+          )
+          if (Date.now() - task.updatedAt < backoffMs) continue // too soon — next tick will retry
+        }
         const role = this.duty.role(task.role)
         const roleCap = role?.maxConcurrent
         if (roleCap !== undefined && (roleRunning.get(task.role) ?? 0) >= roleCap) continue
@@ -1102,6 +1162,18 @@ export class SwarmService extends Service {
             runId, taskId: task.id,
             data: { retry, reason },
           })
+          // H-2: record for the circuit breaker (trips when threshold reached).
+          this.recordFailure(runId)
+          // H-1: schedule a tick after the retry backoff window so the task
+          // relaunches when the delay expires (the event append alone doesn't
+          // schedule a future tick — only an immediate microtask).
+          if (retry && this.swarmConfig.retryBackoffBaseMs > 0) {
+            const backoffMs = Math.min(
+              this.swarmConfig.retryBackoffBaseMs * Math.pow(2, Math.max(0, fresh.attempts - 1)),
+              60000,
+            )
+            setTimeout(() => this.scheduleTick(), backoffMs + 100)
+          }
         }
       }).catch((err: unknown) => {
         this.inFlight.delete(key)
