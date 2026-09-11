@@ -66,7 +66,7 @@ importers:
         specifier: ^18.3.1
         version: 18.3.1(react@18.3.1)
       typescript:
-        specifier: ^5.8.0
+        specifier: 5.9.3
         version: 5.9.3
       vitest:
         specifier: ^3.0.0

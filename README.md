@@ -191,6 +191,25 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
     reviewLoops: 3              # review rejections per task
 ```
 
+## Runtime control
+
+All concurrency, hardening, and watchdog parameters are **tunable from the dashboard** — no YAML editing or restart needed. Open **Settings → AI Swarm → Runtime tuning** (or the **Roster tab → Runtime tuning**) and adjust:
+
+| Parameter | Default | What it controls |
+|---|---|---|
+| Max concurrent agents | 5 | Simultaneously running task agents **per run** |
+| Global agent cap | 5 | Max agents across **all** runs — concurrent runs share this budget (3+2, not 5+5). Prevents heap-exhaustion crashes when running multiple swarms in parallel |
+| Spawn stagger (ms) | 750 | Delay between launches in one wave — softens simultaneous provider load |
+| Retry backoff base (ms) | 5000 | Failed tasks wait base × 2^attempt before retrying (5s → 10s → 20s) — prevents synchronized retry cascades when a provider outage kills all tasks at once |
+| Circuit breaker threshold | 3 | Failures within 30 seconds before pausing all retries (0 = off) — detects provider-wide outages |
+| Circuit breaker cooldown (ms) | 60000 | How long retries pause after the breaker trips |
+| Nudge after silence (min) | 20 | Board marker for silent tasks — 0 = off |
+| Stale timeout (sec) | 14400 | Last-resort reclaim for agents that go completely silent (4 hours) |
+
+Changes are **applied immediately** (no restart) and **persisted to `runtime.json`** in the swarm storage directory, overriding the profile's `cordis.patch.yml` values. They survive host restarts.
+
+> 💡 If you run multiple swarms from different workspaces in parallel, keep the global agent cap at 5 (default) and max 2 concurrent runs. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower the global cap to 3.
+
 ## Under the hood
 
 - **Host half** (Node): a `SwarmService` — duty-table store, append-only JSONL event store, projection fold, the dispatcher (parallel one-shot subagents behind a service-owned anchor agent), review loop, watchdog, pause/resume, and `/swarm/*` HTTP + SSE routes.

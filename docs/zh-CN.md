@@ -196,6 +196,25 @@ dsh plugin --profile web add dsh-swarm-orchestrator
     reviewLoops: 3              # 每个任务的评审驳回上限
 ```
 
+## 运行时调优
+
+所有并发、熔断和看门狗参数都**可以在仪表盘上直接调整**——无需改 YAML、无需重启。打开 **Settings → AI Swarm → Runtime tuning**（或 **Roster 标签页 → Runtime tuning**）：
+
+| 参数 | 默认值 | 控制什么 |
+|---|---|---|
+| Max concurrent agents | 5 | **单个运行**内同时运行的任务代理数 |
+| Global agent cap | 5 | **所有运行**加起来的总代理上限——并发运行共享此预算（3+2 而非 5+5）。防止并行运行多个 swarm 时堆内存耗尽导致宿主崩溃 |
+| Spawn stagger (ms) | 750 | 同一波内启动间隔——减轻 provider 瞬时压力 |
+| Retry backoff base (ms) | 5000 | 失败任务按 base × 2^n 递增等待后重试（5s → 10s → 20s）——防止 provider 全局故障时所有任务同时重试的级联风暴 |
+| Circuit breaker threshold | 3 | 30 秒内多少次失败后暂停所有重试（0 = 关闭）——识别 provider 级故障 |
+| Circuit breaker cooldown (ms) | 60000 | 熔断后暂停多久再自动恢复 |
+| Nudge after silence (min) | 20 | 静默任务在看板上打标记的阈值——0 = 关闭 |
+| Stale timeout (sec) | 14400 | 完全静默代理的最后回收手段（4 小时） |
+
+修改**立即生效**（无需重启）并**持久化到 `runtime.json`**（在 swarm 存储目录中），覆盖 profile `cordis.patch.yml` 中的同名值，重启后仍然有效。
+
+> 💡 如果从不同工作区并行运行多个 swarm，建议全局代理上限保持默认 5、最多 2 个并发运行。如果遇到 `ERR_CONNECTION_REFUSED`（宿主崩溃），请将全局上限降到 3。
+
 ## 实现方式
 
 - **宿主半区**（Node）：`SwarmService` —— 分工表存储、JSONL 追加事件日志、投影折叠、调度器（锚定代理背后的并行一次性子代理）、评审循环、看门狗、暂停/恢复、`/swarm/*` HTTP + SSE 路由。
