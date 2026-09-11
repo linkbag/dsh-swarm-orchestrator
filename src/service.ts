@@ -351,6 +351,13 @@ export class SwarmService extends Service {
       if (task.status !== 'running' && task.status !== 'dispatching' && task.status !== 'reviewing') continue
       const run = state.runs.get(task.runId)
       if (run?.status !== 'running') { skipped++; continue }
+      // J13: never touch a task this process is actively running. Recovery runs
+      // asynchronously after boot, and in a one-shot/headless host the dispatching
+      // agent can already have launched a task by then — that task is not an
+      // orphan, and failing it kills live work (observed live: a smoke run showed
+      // task/started -> agent-started -> failed("host restarted mid-flight")
+      // -> heartbeat). An in-memory flight is the authoritative ownership signal.
+      if (this.inFlight.has(taskKeyOf(task))) continue
       this.events.append('task/failed', {
         runId: task.runId, taskId: task.id,
         data: { retry: task.attempts <= this.swarmConfig.maxRetries, reason: 'host restarted mid-flight' },

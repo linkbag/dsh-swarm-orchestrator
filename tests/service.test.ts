@@ -1207,29 +1207,58 @@ describe('swarm service (integration, fake subagents)', () => {
     fake.release()
   }, 15000)
 
-  it('J6 (control): recoverOrphans still requeues an orphan of a RUNNING run', async () => {
-    const { service, fake } = await bootRunnable()
+  it('J6 (control): recoverOrphans still requeues a genuine restart orphan', async () => {
+    // A genuine orphan is a task the fold reports as running while NOTHING in this
+    // process owns it — i.e. exactly what a fresh host sees after a crash. Append
+    // those events directly so no live flight exists (J13 ignores live tasks).
+    const { service } = await bootRunnable()
 
+    const runId = 'run-orphan-control'
+    service.events.append('run/created', {
+      runId,
+      data: {
+        title: 'orphan control',
+        spec: 's',
+        tasks: [{ id: 'z2', subject: 'Z', description: 'd', role: 'builder' }],
+      },
+    })
+    service.events.append('run/endorsed', { runId })
+    service.events.append('task/started', { runId, taskId: 'z2', data: { label: 'swarm:z2' } })
+    service.events.append('task/agent-started', { runId, taskId: 'z2', data: { sessionId: 'sess-orphan' } })
+
+    const before = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z2').length
+    const recover = (service as unknown as { recoverOrphans(): void }).recoverOrphans.bind(service)
+    recover()
+    const after = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z2')
+
+    // The guard must not disable legitimate orphan recovery.
+    expect(after.length).toBe(before + 1)
+    expect(String(after[after.length - 1]?.data?.reason)).toMatch(/host restarted mid-flight/)
+  }, 15000)
+
+  it('J13: recoverOrphans never touches a task this process is actively running', async () => {
+    // Regression for a bug caught by a live one-shot-host smoke run: recovery fires
+    // asynchronously after boot, and a dispatch that happened in the meantime was
+    // killed with "host restarted mid-flight" (task/started -> agent-started ->
+    // failed -> heartbeat). A live in-memory flight means the task is not an orphan.
+    const { service, fake } = await bootRunnable()
     fake.holdAll = true
 
     const result = service.dispatch({
-      title: 'orphan still recovered',
+      title: 'live task is not an orphan',
       spec: 's',
-      tasks: [{ id: 'z2', subject: 'Z', description: 'd', role: 'builder' }],
+      tasks: [{ id: 'live', subject: 'L', description: 'd', role: 'builder' }],
     }, makeDispatcher() as never)
     service.endorse(result.runId)
 
-    await waitFor(() => service.snapshot().tasks.some((t) => t.id === 'z2' && t.status === 'running'), 5000, 'task running')
+    await waitFor(() => service.snapshot().tasks.some((t) => t.id === 'live' && t.status === 'running'), 5000, 'task running')
 
-    const failsBefore = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z2').length
+    const failsBefore = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'live').length
     const recover = (service as unknown as { recoverOrphans(): void }).recoverOrphans.bind(service)
     recover()
-    const failsAfter = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z2').length
 
-    // The guard must not disable legitimate orphan recovery.
-    expect(failsAfter).toBe(failsBefore + 1)
-    const last = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z2').slice(-1)[0]
-    expect(String(last?.data?.reason)).toMatch(/host restarted mid-flight/)
+    expect(service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'live').length).toBe(failsBefore)
+    expect(service.snapshot().tasks.find((t) => t.id === 'live')?.status).toBe('running')
 
     service.abort(result.runId)
     fake.release()

@@ -70,6 +70,14 @@ and 184 task failures, and each one has a regression test.
   now named in the dispatch warnings.
 - **`spawnTimeoutSeconds` is editable in the Runtime settings** section of the swarm
   settings, alongside the other hardening knobs.
+- **Orphan recovery no longer kills a task this process is actively running.** This
+  one was caught by the end-to-end smoke below, not by unit tests: recovery runs on a
+  timer after boot, and in a one-shot/headless host the dispatching agent can have
+  already launched a task by then. The live run showed
+  `task/started → task/agent-started → task/failed "host restarted mid-flight" →
+  task/heartbeat`, i.e. recovery failing a task it did not own. An in-memory flight is
+  now treated as the authoritative ownership signal. The old fixed 3000 ms grace had
+  the same race window for anyone who dispatched within it.
 
 ### Packaging
 
@@ -79,18 +87,29 @@ and 184 task failures, and each one has a regression test.
 
 ### Verification
 
-- **73 tests pass** (was 58): new coverage for the orphan-recovery gate (positive and
-  control), the spawn ceiling (positive and `0`-disables), the evidence shell, the
-  missing-workspace guard, durable adoption (adopt and refuse-to-adopt cases), the
-  `swarm_report` binding, write-scope nesting, and the role `toolFilter` pass-through.
-- **End-to-end smoke on a real host.** The plugin was installed into an isolated DSH
-  profile from source and driven by a live headless agent. Confirmed in that run: the
-  resolved evidence interpreter is Windows PowerShell 5.1 and is invoked as
-  `powershell.exe -NoProfile -NonInteractive -Command <cmd>`; and every task agent
-  wrote its `.dsh-swarm/task-<id>.json` report, including a two-node run where the
-  report was consumed by the downstream node. A separate probe against the packaged
-  executor confirmed the quoted form `if (Test-Path "artifact.txt") { exit 0 } else { exit 1 }`
-  exits 0 when the file exists and 1 when it does not.
+- **74 tests pass** (was 58): new coverage for the orphan-recovery gate (terminal-run,
+  live-task, and genuine-restart-orphan cases), the spawn ceiling (positive and
+  `0`-disables), the evidence shell, the missing-workspace guard, durable adoption
+  (adopt and refuse-to-adopt cases), the `swarm_report` binding, write-scope nesting,
+  and the role `toolFilter` pass-through.
+- **End-to-end smoke on a real host, twice.** The plugin was installed from source
+  into an isolated DSH profile and driven by a live headless agent. The final run is
+  fully green:
+
+  ```
+  run/created → run/endorsed → task/started → task/agent-started
+  → task/heartbeat → task/heartbeat → task/completed → run/completed
+  artifact.txt = "OK"     .dsh-swarm/task-t1.json written
+  ```
+
+  Also confirmed in those runs: the evidence interpreter resolves to Windows
+  PowerShell 5.1 and is invoked as
+  `powershell.exe -NoProfile -NonInteractive -Command <cmd>` (an agent independently
+  reported "`pwsh` is not installed on this host"), task agents write their
+  `.dsh-swarm/task-<id>.json` report including in multi-node runs, and a probe against
+  the packaged executor confirmed the quoted form
+  `if (Test-Path "artifact.txt") { exit 0 } else { exit 1 }` exits 0 when the file
+  exists and 1 when it does not.
 
 ### Known limitation
 
