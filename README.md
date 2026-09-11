@@ -12,7 +12,7 @@ It has already shipped real work: the first production run reverse-engineered a 
 
 ## At a glance
 
-**dsh-swarm-orchestrator** turns one goal into a supervised agent team inside DeepSeek Harness: an architect reviews your plan into `PLAN.md`, parallel builders execute it as a task DAG, reviewers gate quality, an integrator ships. Every run is endorsed by you before anything spawns, every role runs a model you pin from your live catalog, every deliverable can be machine-verified, and the whole pipeline is visible on a live kanban + flow chart.
+**dsh-swarm-orchestrator** turns one goal into a supervised agent team inside DeepSeek Harness: an architect reviews your plan into `PLAN.md`, parallel builders execute it as a task DAG, reviewers gate quality, an integrator ships. Every role runs a model you pin from your live catalog, every deliverable can be machine-verified, and the whole pipeline is visible on a live kanban + flow chart.
 
 ```text
         you ── "spawn a swarm: ⟨goal⟩"
@@ -21,8 +21,6 @@ It has already shipped real work: the first production run reverse-engineered a 
    your chat agent            (free to plan/research on its own —
          │  swarm_dispatch     its plan becomes the proposal)
          ▼
-  ▣ ENDORSEMENT GATE          run sits in *planning*, nothing spawns,
-         │                     until you click Endorse on the Swarm tab
          ▼
   ┌─────────────────┐
   │ architect-review │  deep-reviews the proposal against the repo,
@@ -51,7 +49,6 @@ This plugin takes the coordination seriously so you don't have to:
 - **Every role gets its own model.** Pin DeepSeek, GLM, Kimi, Claude — any model configured in DSH — to any role, with an ordered fallback chain and a per-role reasoning-effort ladder. The picker reads your live model catalog, so new providers show up automatically.
 - **Review before "done" means done.** Tasks tagged `reviewBy` are judged by a reviewer agent against the task brief; a rejection loops back to the builder with the feedback attached. Want the last word yourself? Set `reviewGate: "human"` and approve from the dashboard.
 - **Failure is a state, not a mystery.** Provider timeouts, quota exhaustion, bad evidence — each is detected, reported plainly, and handled: retries with resume hints, run pause/resume instead of burn-down, automatic model rotation after repeated failures.
-- **Nothing starts without you.** Runs sit in *planning* until you endorse them on the board. A server-side option (`requireManualEndorsement`) makes that gate impossible to bypass from chat, even by a model that decides to be helpful.
 - **Scoped to where you are.** Each chat's Swarm tab shows the runs for that chat's workspace; a persisted switch reveals everything on the machine when you want the full picture.
 - **One run per goal, reviewed before built.** Dispatching into a workspace with an active run raises a warning (or a block, your choice); and unless you opt out, an architect agent reviews the dispatcher''s plan into PLAN.md before any builder starts.
 
@@ -68,15 +65,8 @@ A **Swarm** tab lives next to Chat in the web GUI, in three views:
 ## How a run works
 
 1. **Dispatch** — tell your agent what you want; it calls `swarm_dispatch` with a task graph. Runs start gated: *planning*, zero agents spawned.
-2. **Endorse** — you review the plan on the board and hit **Endorse**. (Approved it in chat already? The agent can pass `endorse: true`.)
-3. **Execute** — the dispatcher spawns task agents through a service-owned anchor, so the run keeps going even if the chat that started it is long gone.
-4. **Review** — tasks with a reviewer get judged; rejections requeue with feedback. Tasks with an evidence contract must produce the files and passing commands they promised.
-5. **Report** — the run closes with a report: who did what, on which models, with fallback/retry/review stats. The whole history is an append-only JSONL event log you can replay.
-
-## Getting started (~5 minutes)
-
-### 1 · Install
-
+2. **Execute** — the architect reviews the proposal and produces `PLAN.md`; then parallel builders start.
+3. **Watch** — **Board** shows the kanban; **Flow** shows the workflow chart; click any task for its drawer.
 From this GitHub repo (pnpm will run the package's `prepare` script to build from source):
 
 ```sh
@@ -137,9 +127,8 @@ or the one-shot form:
 
 Your agent will call `swarm_dispatch` with a task DAG. (It may plan first itself — that's fine: an architect agent reviews and refines whatever plan it sends.)
 
-### 4 · Endorse and watch
+### 4 · Watch the run
 
-- The new run sits in **planning** — open the **Swarm** tab and click **Endorse**. Nothing spawns before you do.
 - **Board** shows the kanban; **Flow** shows the same run as a workflow chart (scheduler → parallel waves → report); click any task for its drawer — brief, model, interim notes, reviewer feedback, retry.
 - Tasks with `reviewGate: "human"` park on the board for your Approve/Reject.
 - The dispatching chat gets a live progress card; the 🐝 header button and the bottom-right badge track active runs from anywhere.
@@ -186,7 +175,6 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
     staleTimeoutSeconds: 14400  # watchdog: silent agents get reclaimed
     maxRetries: 2               # per task
     reviewLoops: 3              # review rejections per task
-    requireManualEndorsement: false  # true = the endorse gate cannot be bypassed from chat
 ```
 
 ## Under the hood
@@ -198,7 +186,7 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
 
 ## Status
 
-v0.5.0, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (45 tests: dispatch, endorsement, review loops, human gates, fallback rotation, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality), plus live verification on a real deployment.
+v0.5.0, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (45 tests: dispatch, review loops, human gates, fallback rotation, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality), plus live verification on a real deployment.
 
 ## License
 
