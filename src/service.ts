@@ -642,6 +642,7 @@ export class SwarmService extends Service {
     }
     const effectiveRuntime = {
       maxConcurrent: this.rt('maxConcurrent'),
+      maxTotalConcurrentAgents: this.swarmConfig.maxTotalConcurrentAgents,
       spawnStaggerMs: this.rt('spawnStaggerMs'),
       retryBackoffBaseMs: this.rt('retryBackoffBaseMs'),
       circuitBreakerThreshold: this.rt('circuitBreakerThreshold'),
@@ -769,6 +770,15 @@ export class SwarmService extends Service {
       ? Math.min(this.rt('maxConcurrent'), adaptive ?? this.rt('maxConcurrent'))
       : this.rt('maxConcurrent')
     return Math.max(1, base)
+  }
+
+  /** Count all running/dispatching/reviewing tasks across ALL runs (the global agent footprint). */
+  private countGlobalRunning(): number {
+    let count = 0
+    for (const task of this.view().tasks.values()) {
+      if (task.status === 'running' || task.status === 'dispatching' || task.status === 'reviewing') count += 1
+    }
+    return count
   }
 
   private shrinkConcurrency(runId: string): void {
@@ -988,6 +998,15 @@ export class SwarmService extends Service {
         }
       }
       let capacity = this.effectiveConcurrency(run.id) - runningCount(fresh, run.id)
+      // Global agent cap: swarm agents are in-process on the DSH host, sharing
+      // its Node.js heap. Without a global cap, two concurrent runs × 5 agents
+      // each = 10 heap-resident sessions → potential OOM crash. The cap is
+      // shared across all runs: concurrent runs split the budget (3+2, not 5+5).
+      const globalCap = this.swarmConfig.maxTotalConcurrentAgents
+      const globalRunning = this.countGlobalRunning()
+      if (globalRunning + capacity > globalCap) {
+        capacity = Math.max(0, globalCap - globalRunning)
+      }
       let wave = 0
       for (const task of runTasks) {
         if (capacity <= 0) break

@@ -4,6 +4,7 @@ import { dirname } from 'node:path'
 /** User-tunable runtime parameters, persisted alongside the duty table. */
 export interface RuntimeOverrides {
   maxConcurrent?: number
+  maxTotalConcurrentAgents?: number
   spawnStaggerMs?: number
   retryBackoffBaseMs?: number
   circuitBreakerThreshold?: number
@@ -13,7 +14,7 @@ export interface RuntimeOverrides {
 }
 
 const NUMERIC_KEYS = [
-  'maxConcurrent', 'spawnStaggerMs', 'retryBackoffBaseMs',
+  'maxConcurrent', 'maxTotalConcurrentAgents', 'spawnStaggerMs', 'retryBackoffBaseMs',
   'circuitBreakerThreshold', 'circuitBreakerCooldownMs',
   'nudgeAfterMinutes', 'staleTimeoutSeconds',
 ] as const

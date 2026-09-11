@@ -2,7 +2,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-export const PLUGIN_VERSION = '0.5.6'
+export const PLUGIN_VERSION = '0.5.7'
 
 function defaultStorageDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -12,6 +12,7 @@ function defaultStorageDir(): string {
 export interface SwarmConfig {
   storageDir: string
   maxConcurrent: number
+  maxTotalConcurrentAgents: number
   staleTimeoutSeconds: number
   maxRetries: number
   reviewLoops: number
@@ -34,6 +35,12 @@ export const Config = Schema.object({
   ),
   maxConcurrent: Schema.number().default(5).min(1).max(32).description(
     'Maximum simultaneously running task agents.',
+  ),
+  maxTotalConcurrentAgents: Schema.number().default(5).min(1).max(16).description(
+    'Global cap on concurrently running swarm agents across ALL runs (default 5). '
+    + 'Swarm agents run IN-PROCESS on the DSH host, sharing its Node.js heap — '
+    + 'too many concurrent agents can exhaust memory and crash the host. '
+    + 'Two parallel runs SHARE this budget (e.g. cap=5 means 3+2 or 4+1, not 5+5).',
   ),
   staleTimeoutSeconds: Schema.number().default(14400).min(60).description(
     'Heartbeat timeout in seconds before a running task with no progress is reclaimed.',

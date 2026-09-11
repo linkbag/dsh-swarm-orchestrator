@@ -68,6 +68,7 @@ export interface BoardRole {
 
 export interface BoardRuntime {
   maxConcurrent?: number
+  maxTotalConcurrentAgents?: number
   spawnStaggerMs?: number
   retryBackoffBaseMs?: number
   circuitBreakerThreshold?: number

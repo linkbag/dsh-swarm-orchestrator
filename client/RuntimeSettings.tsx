@@ -6,6 +6,7 @@ import { boardStore, type Board, type BoardRuntime } from './board-store'
 
 const FIELDS: Array<{ key: keyof BoardRuntime; label: string; hint: string; min: number; max: number; step: number }> = [
   { key: 'maxConcurrent', label: 'Max concurrent agents', hint: 'Simultaneously running task agents per run (default 5)', min: 1, max: 32, step: 1 },
+  { key: 'maxTotalConcurrentAgents', label: 'Global agent cap', hint: 'Max agents across ALL runs (default 5). Agents share the DSH host heap — too many can crash it. Concurrent runs split this budget.', min: 1, max: 16, step: 1 },
   { key: 'spawnStaggerMs', label: 'Spawn stagger (ms)', hint: 'Delay between launches in one wave — softens provider load (default 750)', min: 0, max: 60000, step: 250 },
   { key: 'retryBackoffBaseMs', label: 'Retry backoff base (ms)', hint: 'Failed tasks wait base × 2^n before retrying (default 5000 = 5s)', min: 0, max: 120000, step: 1000 },
   { key: 'circuitBreakerThreshold', label: 'Circuit breaker threshold', hint: 'Failures within 30s before pausing retries — 0 = off (default 3)', min: 0, max: 10, step: 1 },
