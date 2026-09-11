@@ -1499,6 +1499,11 @@ export class SwarmService extends Service {
           // J14: bound delegation depth so task agents cannot spawn hidden
           // descendants the dispatcher cannot see or account for.
           ...(this.swarmConfig.maxSubagentDepth > 0 ? { maxDepth: this.swarmConfig.maxSubagentDepth } : {}),
+          // J16: state the workspace root in the prompt so the agent writes where the
+          // dispatcher will look. Observed live: agents split the same run's artifacts
+          // between the run root and a subdirectory named in the spec, because nothing
+          // in the brief said which directory "the workspace" meant.
+          ...(run.dispatch?.cwd !== undefined ? { workspace: run.dispatch.cwd } : {}),
           ...(roleFilter !== undefined ? { toolFilter: roleFilter } : {}),
           ...(priorNotes !== undefined && priorNotes.length > 0 ? { priorNotes } : {}),
           ...(task.evidence !== undefined ? { evidence: task.evidence } : {}),

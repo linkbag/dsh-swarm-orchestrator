@@ -8,6 +8,8 @@ export interface PromptContext {
   priorNotes?: string[]
   /** Machine-checked evidence requirements, restated in the prompt. */
   evidence?: TaskEvidence
+  /** J16: the run's workspace root, stated so path-relative contracts are unambiguous. */
+  workspace?: string
 }
 
 /** The prompt every task agent receives: role framing + task + report contract. */
@@ -21,6 +23,21 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context:
     '## Run objective (context only — other agents own the rest)',
     run.spec,
     '',
+    // J16: state the workspace root explicitly. The rest of this prompt refers to
+    // "the workspace" repeatedly, and without an absolute path each agent guesses —
+    // observed live: one task wrote to the run root while its siblings wrote into a
+    // subdirectory named in the spec, so their evidence contracts failed and the
+    // integrator could not reconcile the two. Every bare path below (evidence.files,
+    // the write scope, the task report) is resolved against THIS directory.
+    ...(context.workspace !== undefined
+      ? [
+          '## Workspace root (all relative paths resolve here)',
+          `\`${context.workspace}\``,
+          '',
+          `Every relative path in this brief — your evidence contract, your write scope, \`${taskReportRelPath(task.id)}\` — is resolved against that directory by the dispatcher. If the brief names any other directory, write there too only if you ALSO satisfy the contract at the workspace root.`,
+          '',
+        ]
+      : []),
     '## Your task (implement exactly this, nothing more)',
     `id: ${task.id}`,
     `subject: ${task.subject}`,
@@ -206,11 +223,13 @@ export async function spawnTaskAgent(
     evidence?: TaskEvidence
     /** J14: absolute delegation-depth cap for the task agent (1 = no grandchildren). */
     maxDepth?: number
+    /** J16: the run's workspace root, stated in the prompt so relative paths are unambiguous. */
+    workspace?: string
     onFallback?: (failed: { provider: string; model: string }, next: { provider: string; model: string } | undefined) => void
     onStarted?: (childSessionId: string) => void
   },
 ): Promise<SpawnOutcome> {
-  const prompt = opts.prompt ?? buildTaskPrompt(opts.run, opts.task, opts.role, { priorNotes: opts.priorNotes, evidence: opts.evidence })
+  const prompt = opts.prompt ?? buildTaskPrompt(opts.run, opts.task, opts.role, { priorNotes: opts.priorNotes, evidence: opts.evidence, workspace: opts.workspace })
   const chain = opts.candidates.length > 0 ? opts.candidates : [{ provider: '', model: '' }]
   let lastReason = 'no model candidates'
   let lastProvider: string | undefined

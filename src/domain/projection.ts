@@ -59,7 +59,7 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       createdAt: event.at,
       updatedAt: event.at,
       taskIds: [],
-      stats: { fallbacks: 0, retries: 0, reviewsPassed: 0, reviewsRejected: 0 },
+      stats: { fallbacks: 0, retries: 0, reviewsPassed: 0, reviewsRejected: 0, reviewsUnavailable: 0 },
     }
     const dispatch = d.dispatch as Record<string, unknown> | undefined
     if (dispatch !== null && typeof dispatch === 'object') {
@@ -232,9 +232,16 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
           }
           if (runStats !== undefined) runStats.reviewsRejected += 1
         } else {
-          // reviewer unavailable — fail-open: the builder's output stands
+          // Reviewer unavailable / no explicit verdict — fail-open: the builder's
+          // output stands, but the skip is now COUNTED and marked on the task.
+          // J17: this path completes the task while leaving `reviewed` false and
+          // `reviewsPassed` unchanged, so a silently skipped review used to be
+          // indistinguishable from a clean pass in the run report.
           task.status = 'completed'
+          task.reviewed = false
+          task.reviewUnavailable = true
           task.reviewFeedback = `review unavailable: ${feedback ?? 'unknown reason'}`
+          if (runStats !== undefined) runStats.reviewsUnavailable += 1
         }
         break
       }

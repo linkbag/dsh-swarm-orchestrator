@@ -88,6 +88,11 @@ export interface Task extends TaskSpec {
   reviewFeedback?: string
   reviewed?: boolean
   reviewExhausted?: boolean
+  /**
+   * J17: the review ran but produced no usable verdict, so the task completed
+   * fail-open. Distinguishes a skipped review from a clean pass.
+   */
+  reviewUnavailable?: boolean
   /** Human-gated review pending (J7). */
   humanReview?: boolean
   /** Timestamp of the last heartbeat — the board greys stale notes (B2). */
@@ -103,7 +108,7 @@ export interface RunReport {
   durationMs: number
   taskCount: number
   byStatus: Record<string, number>
-  stats: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number }
+  stats: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number; reviewsUnavailable: number }
   tasks: Array<{ id: string; role: RoleId; model?: string; status: TaskStatus; reviewed?: boolean; summary?: string }>
 }
 
@@ -135,7 +140,7 @@ export interface Run {
   /** Set while status = paused (A3): why the run stopped waiting for human action. */
   pauseReason?: string
   /** Live counters folded from task events. */
-  stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number }
+  stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number; reviewsUnavailable: number }
 }
 
 /** One append-only event record (JSONL line). */

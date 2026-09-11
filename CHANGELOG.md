@@ -63,6 +63,21 @@ and 184 task failures, and each one has a regression test.
 
 ### Added
 
+- **The task prompt now states the workspace root explicitly (`J16`).** The prompt
+  referred to "the workspace" eight times without ever saying where it was, so each
+  agent guessed. Caught by a live 4-task audit: one task wrote to the run root while
+  its siblings wrote into a subdirectory named in the spec, their evidence contracts
+  failed against the dispatcher's own resolution, and the integrator then refused to
+  certify the result because the artifacts were split across two directories. Agents
+  now receive the absolute workspace root, plus the rule that every relative path in
+  the brief — evidence, write scope, task report — resolves against it.
+- **Skipped reviews are now visible (`J17`).** When a reviewer produced no usable
+  `VERDICT:` line the task completed fail-open (deliberate), but `reviewed` stayed
+  unset and `reviewsPassed` was never incremented — so a run report could not
+  distinguish a silently skipped review from a clean pass. The audit run reported
+  `reviewsPassed: 0` for a task that had "passed review". Runs now carry
+  `reviewsUnavailable` and the task is marked `reviewUnavailable`.
+
 - **`spawnTimeoutSeconds` (default 3600).** A hard ceiling on one task-agent run. The
   heartbeat watchdog only reclaims tasks in `running`; a task whose child never
   publishes `agent-started` sits in `dispatching` holding its concurrency slot
@@ -116,7 +131,7 @@ and 184 task failures, and each one has a regression test.
 
 ### Verification
 
-- **82 tests pass** (was 58): new coverage for the orphan-recovery gate (terminal-run,
+- **85 tests pass** (was 58): new coverage for the orphan-recovery gate (terminal-run,
   live-task, and genuine-restart-orphan cases), the spawn ceiling (positive and
   `0`-disables), the evidence shell, the missing-workspace guard, durable adoption
   (adopt and refuse-to-adopt cases), the `swarm_report` binding, write-scope nesting,
