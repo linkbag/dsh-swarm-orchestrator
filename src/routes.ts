@@ -147,6 +147,13 @@ export function registerSwarmRoutes(ctx: Context, service: SwarmService): (() =>
               sendJson(res, 200, { ok: true, action, table: saved })
               return
             }
+            case 'set-runtime': {
+              const runtime = body.runtime
+              if (runtime === null || typeof runtime !== 'object') throw new Error('runtime required')
+              const saved = service.setRuntimeOverrides(runtime as never)
+              sendJson(res, 200, { ok: true, action, runtime: saved })
+              return
+            }
             default:
               sendJson(res, 400, { error: `unknown action ${JSON.stringify(action)}` })
               return

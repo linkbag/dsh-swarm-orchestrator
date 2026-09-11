@@ -1,5 +1,6 @@
 import type { DutyTable, Run, Task } from './domain/types.js'
 import type { SwarmState } from './domain/projection.js'
+import type { RuntimeOverrides } from './domain/runtime-store.js'
 
 /** Owned, plain-JSON board projection served over HTTP/SSE. Never holds live harness objects. */
 export interface BoardSnapshot {
@@ -13,6 +14,8 @@ export interface BoardSnapshot {
   at: number
   /** Workspace scope of this snapshot (present when the request asked for one). */
   scope?: { cwd?: string; unresolvable?: boolean }
+  /** Effective runtime parameters (YAML merged with dashboard overrides). */
+  runtime?: RuntimeOverrides & Record<string, number>
 }
 
 const MAX_RUNS = 50
@@ -23,6 +26,7 @@ export function buildBoardSnapshot(
   seq: number,
   version: string,
   scope?: { cwd?: string; unresolvable?: boolean },
+  runtime?: RuntimeOverrides & Record<string, number>,
 ): BoardSnapshot {
   const runs = [...state.runs.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_RUNS)
   const runIds = new Set(runs.map((run) => run.id))
@@ -36,6 +40,7 @@ export function buildBoardSnapshot(
     roles: duty.roles,
     ...(duty.override !== undefined ? { override: duty.override } : {}),
     ...(scope !== undefined && (scope.cwd !== undefined || scope.unresolvable === true) ? { scope } : {}),
+    ...(runtime !== undefined ? { runtime } : {}),
     at: Date.now(),
   }
 }

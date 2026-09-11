@@ -66,6 +66,16 @@ export interface BoardRole {
   persona?: string
 }
 
+export interface BoardRuntime {
+  maxConcurrent?: number
+  spawnStaggerMs?: number
+  retryBackoffBaseMs?: number
+  circuitBreakerThreshold?: number
+  circuitBreakerCooldownMs?: number
+  nudgeAfterMinutes?: number
+  staleTimeoutSeconds?: number
+}
+
 export interface Board {
   service: string
   version: string
@@ -74,6 +84,7 @@ export interface Board {
   tasks: BoardTask[]
   roles: Record<string, BoardRole>
   override?: { enabled: boolean; note?: string; setBy?: string; at: number }
+  runtime?: BoardRuntime
   at: number
 }
 

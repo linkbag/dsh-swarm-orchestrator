@@ -4,6 +4,7 @@
 import { useEffect, useState } from 'react'
 import { boardStore, type Board } from './board-store'
 import { DutyTableEditor } from './DutyTableEditor'
+import { RuntimeSettings } from './RuntimeSettings'
 
 export function SwarmSettingsSection(): JSX.Element {
   const [board, setBoard] = useState<Board | null>(null)
@@ -44,6 +45,7 @@ export function SwarmSettingsSection(): JSX.Element {
         </p>
       )}
       <DutyTableEditor board={board} onSaved={() => {}} />
+      <RuntimeSettings board={board} />
     </div>
   )
 }

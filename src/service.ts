@@ -14,6 +14,7 @@ import { PLUGIN_VERSION, type SwarmConfig } from './config.js'
 import { validateDag } from './domain/dag.js'
 import { DutyTableStore } from './domain/duty-table.js'
 import { EventStore } from './domain/event-store.js'
+import { RuntimeStore } from './domain/runtime-store.js'
 import { fold, isReady, newState, runningCount, taskKeyOf, type SwarmState } from './domain/projection.js'
 import type { BoardSnapshot } from './board.js'
 import { buildBoardSnapshot } from './board.js'
@@ -159,6 +160,7 @@ export class SwarmService extends Service {
   private readonly swarmConfig: SwarmConfig
   readonly events: EventStore
   readonly duty: DutyTableStore
+  readonly runtime: RuntimeStore
   readonly startedAt: number
 
   private state: SwarmState = newState()
@@ -188,7 +190,22 @@ export class SwarmService extends Service {
     mkdirSync(config.storageDir, { recursive: true })
     this.events = new EventStore(join(config.storageDir, 'events.jsonl'))
     this.duty = new DutyTableStore(join(config.storageDir, 'duty-table.json'))
-    this.recoverOrphans()
+    this.runtime = new RuntimeStore(join(config.storageDir, 'runtime.json'))
+    // H-4 boot grace: delay orphan recovery so the subagents service (and
+    // any other late-mounting providers) finish loading before retried
+    // tasks hit them. Without this, post-restart retries can terminally
+    // fail with "subagents service unavailable" on their first attempt.
+    ctx.effect(() => {
+      const grace = 3000
+      const timer = setTimeout(() => {
+        try {
+          this.recoverOrphans()
+        } catch (err) {
+          ctx.logger('swarm').warn('orphan recovery after grace failed: %s', String(err))
+        }
+      }, grace)
+      return () => clearTimeout(timer)
+    })
     this.events.subscribe(() => {
       this.stateDirty = true
       this.scheduleTick()
@@ -242,8 +259,8 @@ export class SwarmService extends Service {
    */
   watchdog(now = Date.now()): void {
     const state = this.view()
-    const staleMs = this.swarmConfig.staleTimeoutSeconds * 1000
-    const nudgeMs = this.swarmConfig.nudgeAfterMinutes * 60000
+    const staleMs = this.rt('staleTimeoutSeconds') * 1000
+    const nudgeMs = this.rt('nudgeAfterMinutes') * 60000
     for (const [key, flight] of [...this.inFlight]) {
       const task = state.tasks.get(key)
       if (task === undefined) {
@@ -315,6 +332,23 @@ export class SwarmService extends Service {
   }
 
   // ── actions ──────────────────────────────────────────────────────────────
+
+  /** Effective runtime parameter: dashboard override wins over YAML config. */
+  private rt<K extends keyof import('./domain/runtime-store.js').RuntimeOverrides>(key: K): number {
+    const override = this.runtime.get()[key]
+    if (override !== undefined) return override
+    return this.swarmConfig[key] as number
+  }
+
+  /** Update runtime overrides from the dashboard (persisted to runtime.json). */
+  setRuntimeOverrides(next: import('./domain/runtime-store.js').RuntimeOverrides): import('./domain/runtime-store.js').RuntimeOverrides {
+    const saved = this.runtime.save(next)
+    // Reset in-memory state that depends on tunable parameters.
+    this.circuitBreakerUntil.clear()
+    this.recentFailures.clear()
+    this.scheduleTick()
+    return saved
+  }
 
   /**
    * Detect concurrent tasks claiming the same exclusive write scope: two tasks
@@ -606,7 +640,16 @@ export class SwarmService extends Service {
         }
       }
     }
-    return buildBoardSnapshot(effective, this.duty.get(), this.events.seq, PLUGIN_VERSION, { cwd: scopeCwd, unresolvable: scopeUnresolvable })
+    const effectiveRuntime = {
+      maxConcurrent: this.rt('maxConcurrent'),
+      spawnStaggerMs: this.rt('spawnStaggerMs'),
+      retryBackoffBaseMs: this.rt('retryBackoffBaseMs'),
+      circuitBreakerThreshold: this.rt('circuitBreakerThreshold'),
+      circuitBreakerCooldownMs: this.rt('circuitBreakerCooldownMs'),
+      nudgeAfterMinutes: this.rt('nudgeAfterMinutes'),
+      staleTimeoutSeconds: this.rt('staleTimeoutSeconds'),
+    }
+    return buildBoardSnapshot(effective, this.duty.get(), this.events.seq, PLUGIN_VERSION, { cwd: scopeCwd, unresolvable: scopeUnresolvable }, effectiveRuntime)
   }
 
   statusText(runId?: string): string {
@@ -723,8 +766,8 @@ export class SwarmService extends Service {
   private effectiveConcurrency(runId: string): number {
     const adaptive = this.adaptiveLimits.get(runId)
     const base = this.swarmConfig.adaptiveConcurrency
-      ? Math.min(this.swarmConfig.maxConcurrent, adaptive ?? this.swarmConfig.maxConcurrent)
-      : this.swarmConfig.maxConcurrent
+      ? Math.min(this.rt('maxConcurrent'), adaptive ?? this.rt('maxConcurrent'))
+      : this.rt('maxConcurrent')
     return Math.max(1, base)
   }
 
@@ -736,7 +779,7 @@ export class SwarmService extends Service {
 
   private growConcurrency(runId: string): void {
     if (!this.swarmConfig.adaptiveConcurrency) return
-    if (this.effectiveConcurrency(runId) < this.swarmConfig.maxConcurrent) {
+    if (this.effectiveConcurrency(runId) < this.rt('maxConcurrent')) {
       this.adaptiveLimits.set(runId, this.effectiveConcurrency(runId) + 1)
     } else {
       this.adaptiveLimits.delete(runId)
@@ -863,7 +906,7 @@ export class SwarmService extends Service {
    * letting the provider recover instead of burning retries into a dead endpoint.
    */
   private recordFailure(runId: string): void {
-    const threshold = this.swarmConfig.circuitBreakerThreshold
+    const threshold = this.rt('circuitBreakerThreshold')
     if (threshold <= 0) return
     const now = Date.now()
     const stamps = (this.recentFailures.get(runId) ?? []).filter((t) => now - t < 30_000)
@@ -871,7 +914,7 @@ export class SwarmService extends Service {
     this.recentFailures.set(runId, stamps)
     if (stamps.length >= threshold) {
       this.recentFailures.delete(runId)
-      const cooldown = this.swarmConfig.circuitBreakerCooldownMs
+      const cooldown = this.rt('circuitBreakerCooldownMs')
       this.circuitBreakerUntil.set(runId, now + cooldown)
       this.ctx.logger('swarm').warn(
         'circuit breaker OPEN for run %s: %d failures in 30s — retries paused for %dms',
@@ -954,9 +997,9 @@ export class SwarmService extends Service {
         // its failure timestamp (updatedAt) before relaunching — prevents
         // synchronized retry cascades when a provider outage kills all tasks
         // at once. First-attempt tasks launch immediately.
-        if (task.status === 'retrying' && this.swarmConfig.retryBackoffBaseMs > 0) {
+        if (task.status === 'retrying' && this.rt('retryBackoffBaseMs') > 0) {
           const backoffMs = Math.min(
-            this.swarmConfig.retryBackoffBaseMs * Math.pow(2, Math.max(0, task.attempts - 1)),
+            this.rt('retryBackoffBaseMs') * Math.pow(2, Math.max(0, task.attempts - 1)),
             60000,
           )
           if (Date.now() - task.updatedAt < backoffMs) continue // too soon — next tick will retry
@@ -964,7 +1007,7 @@ export class SwarmService extends Service {
         const role = this.duty.role(task.role)
         const roleCap = role?.maxConcurrent
         if (roleCap !== undefined && (roleRunning.get(task.role) ?? 0) >= roleCap) continue
-        const delayMs = wave === 0 ? 0 : this.swarmConfig.spawnStaggerMs * wave
+        const delayMs = wave === 0 ? 0 : this.rt('spawnStaggerMs') * wave
         this.launchTask(run.id, task, delayMs)
         capacity -= 1
         wave += 1
@@ -1167,9 +1210,9 @@ export class SwarmService extends Service {
           // H-1: schedule a tick after the retry backoff window so the task
           // relaunches when the delay expires (the event append alone doesn't
           // schedule a future tick — only an immediate microtask).
-          if (retry && this.swarmConfig.retryBackoffBaseMs > 0) {
+          if (retry && this.rt('retryBackoffBaseMs') > 0) {
             const backoffMs = Math.min(
-              this.swarmConfig.retryBackoffBaseMs * Math.pow(2, Math.max(0, fresh.attempts - 1)),
+              this.rt('retryBackoffBaseMs') * Math.pow(2, Math.max(0, fresh.attempts - 1)),
               60000,
             )
             setTimeout(() => this.scheduleTick(), backoffMs + 100)

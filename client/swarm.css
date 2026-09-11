@@ -353,6 +353,12 @@
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
 }
 .dsh-swarm-hpop-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+
+/* ── runtime settings ──────────────────────────────────── */
+.dsh-swarm-runtime { padding: 12px 0 4px; border-top: 1px solid rgba(125, 125, 125, 0.2); margin-top: 16px; }
+.dsh-swarm-runtime h4 { margin: 0 0 4px; }
+.dsh-swarm-runtime .dsh-swarm-btn { margin-top: 8px; }
+
 .dsh-swarm-task-note.stale { opacity: 0.35; }
 .dsh-swarm-run-banner {
   margin: 8px 16px 0;

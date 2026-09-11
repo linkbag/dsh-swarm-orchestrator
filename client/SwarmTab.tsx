@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { boardStore, type Board, type BoardTask } from './board-store'
 import { DutyTableEditor } from './DutyTableEditor'
 import { FlowChart } from './FlowChart'
+import { RuntimeSettings } from './RuntimeSettings'
 
 const STATUS_COLUMNS: Array<{ key: string; label: string; statuses: string[] }> = [
   { key: 'queued', label: 'Queued', statuses: ['pending', 'retrying'] },
@@ -154,6 +155,7 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
             </p>
           )}
           <DutyTableEditor board={board} onSaved={() => {}} />
+          <RuntimeSettings board={board} />
         </>
       ) : view === 'flow' ? (
         run !== null ? (
