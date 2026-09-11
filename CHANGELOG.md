@@ -63,6 +63,22 @@ and 184 task failures, and each one has a regression test.
 
 ### Added
 
+- **A model that rejects the role's reasoning-effort pin no longer fails the run
+  (`J18`).** The per-role effort is pinned through the host's `agent/request`
+  waterfall, so it is applied to whichever model actually serves the request —
+  including a FALLBACK whose model does not support that level. Observed live on the
+  "Stock Selector Audit and Update" chat: a role pinned `reasoningEffort: "max"` with a
+  `zai/glm-5.3` fallback (the deployment declares effort mappings only for
+  `glm-5.3-flash`), so every task died about a second in with
+  `UNSUPPORTED_REASONING_EFFORT` — **all 6 tasks failed within one second**, twice.
+
+  Two things made this fatal rather than a hiccup: the error arrives as the child's
+  *stopReason*, not as a `start()` throw, so the candidate fallback chain was never
+  consulted; and the effort was re-pinned on every retry, so retrying could not help.
+
+  The dispatcher now detects that specific error and retries the same candidate chain
+  once with the effort pin removed — degrading beats failing, and preserving the chain
+  means a real outage is still reported as one.
 - **The task prompt now states the workspace root explicitly (`J16`).** The prompt
   referred to "the workspace" eight times without ever saying where it was, so each
   agent guessed. Caught by a live 4-task audit: one task wrote to the run root while
@@ -131,7 +147,7 @@ and 184 task failures, and each one has a regression test.
 
 ### Verification
 
-- **85 tests pass** (was 58): new coverage for the orphan-recovery gate (terminal-run,
+- **88 tests pass** (was 58): new coverage for the orphan-recovery gate (terminal-run,
   live-task, and genuine-restart-orphan cases), the spawn ceiling (positive and
   `0`-disables), the evidence shell, the missing-workspace guard, durable adoption
   (adopt and refuse-to-adopt cases), the `swarm_report` binding, write-scope nesting,

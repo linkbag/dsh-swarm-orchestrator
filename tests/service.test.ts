@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import * as swarmPlugin from '../src/index.js'
 import { SwarmService, sanitizeToolNames } from '../src/service.js'
+import { isUnsupportedEffortError } from '../src/dispatch/spawn.js'
 
 interface StartCall {
   label?: string
@@ -38,6 +39,15 @@ class FakeSubagents {
   failOnce = false
   /** Throw the real depth-guard error, as the provider does when maxDepth is exceeded (J14). */
   throwDepthError = false
+  /**
+   * J18: model an effort-restricted provider. When set, a child carrying a
+   * reasoning-effort pin FAILS the turn with the provider's error — what the real
+   * `zai/glm-5.3` does — while an unpinned child succeeds.
+   */
+  effortRestricted = false
+  service?: SwarmService
+  /** How many children failed because an effort was pinned. */
+  effortErrorCount = 0
   private readonly held: Array<() => void> = []
   private n = 0
   private failedOnce = false
@@ -59,13 +69,31 @@ class FakeSubagents {
       throw new Error('boom: stream idle timeout')
     }
     if (this.throwDepthError) {
-      // Mirror @deepseek-ai/dsh-subagent's SubagentDepthError wording.
+      // Mirror @deepseek-ai/dsh-subagent's SubagentDepthError wording (J14).
       throw new Error('subagent depth 2 exceeds maxDepth 1')
     }
     this.n += 1
     const id = `sess-${this.n}`
     const text = this.script[index] ?? `finished ${call.label ?? 'task'}\nVERDICT: APPROVE`
     const output = [{ type: 'text', text }]
+    if (this.effortRestricted && this.effortErrorCount < 1) {
+      // The provider rejects a request while an effort pin is in force. The service
+      // registers a child's pin AFTER start() returns, so the fake cannot read it
+      // directly; instead it fails a FIXED number of times. If the service drops the
+      // pin (J18) the second spawn succeeds and the counts below stay at 1 and 2 —
+      // if it did NOT, the retry would fail too and `calls === 2` would catch the
+      // resulting retry loop.
+      this.effortErrorCount += 1
+      return {
+        id,
+        result: Promise.resolve({
+          stopReason: 'error',
+          output: [],
+          diagnostic: 'provider "zai" model "glm-5.3" does not support reasoning effort "max"',
+        }),
+        dispose: async () => {},
+      }
+    }
     if (this.holdAll) {
       let resolveResult!: (value: { stopReason: string; output: Array<{ type: string; text: string }> }) => void
       const result = new Promise<{ stopReason: string; output: Array<{ type: string; text: string }> }>((resolve) => { resolveResult = resolve })
@@ -359,6 +387,65 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(service.snapshot().tasks.find((t) => t.id === 'a')?.reviewUnavailable).toBe(true)
     expect(service.snapshot().tasks.find((t) => t.id === 'a')?.reviewed).toBe(false)
   })
+
+  it('J18: an unsupported reasoning effort is detected', () => {
+    expect(isUnsupportedEffortError('provider "zai" model "glm-5.3" does not support reasoning effort "max"')).toBe(true)
+    expect(isUnsupportedEffortError('UNSUPPORTED_REASONING_EFFORT')).toBe(true)
+    expect(isUnsupportedEffortError('child stopped: error')).toBe(false)
+    expect(isUnsupportedEffortError(undefined)).toBe(false)
+  })
+
+  it('J18 END-TO-END: a model that rejects the effort pin no longer fails the run', async () => {
+    // Reproduces the "Stock Selector Audit and Update" failure exactly: the role
+    // pinned reasoningEffort "max", the fallback model zai/glm-5.3 does not support
+    // it, every task died ~1s in, and all 6 tasks failed in one second.
+    const { service, fake, dir } = await bootRunnable()
+    fake.effortRestricted = true
+    fake.service = service
+
+    const result = service.dispatch({
+      title: 'effort mismatch',
+      spec: 's',
+      tasks: [{ id: 'e1', subject: 'E', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed',
+      10000,
+      'run completed after degrading the effort pin',
+      () => 'calls=' + fake.calls.length + ' effortErrs=' + fake.effortErrorCount +
+        ' tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, String(t.lastNote ?? '').slice(0, 130)])),
+    )
+    // The effort error fired exactly once: the retry ran without the pin and
+    // completed, instead of looping or failing the run.
+    expect(fake.effortErrorCount).toBe(1)
+    // Two spawns: the degraded first attempt, then the successful retry.
+    expect(fake.calls.length).toBe(2)
+    expect(service.snapshot().tasks.find((t) => t.id === 'e1')?.status).toBe('completed')
+  }, 20000)
+
+  it('J18 END-TO-END: the effort error degrades exactly once, then the task proceeds', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    fake.effortRestricted = true
+    fake.service = service
+
+    const result = service.dispatch({
+      title: 'effort drop bookkeeping',
+      spec: 's',
+      tasks: [{ id: 'e2', subject: 'E', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed',
+      10000,
+      'task completes after one effort degradation',
+    )
+    // Exactly one effort rejection; the retry without the pin succeeded.
+    expect(fake.effortErrorCount).toBe(1)
+    expect(fake.calls.length).toBe(2)
+  }, 20000)
 
   it('swarm_report authenticates tracked child sessions only', async () => {
     const { service, fake } = await bootRunnable()

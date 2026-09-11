@@ -1521,6 +1521,16 @@ export class SwarmService extends Service {
             this.trackChildSession(childSessionId, key, effort)
             this.events.append('task/agent-started', { runId, taskId: task.id, data: { sessionId: childSessionId } })
           },
+          // J18: the child rejected the pinned reasoning effort (the fallback model
+          // does not support it). Clear the pin so the retry makes an unconstrained
+          // request instead of dying on the same mismatch.
+          onDropEffort: (childSessionId) => {
+            this.trackChildSession(childSessionId, key, undefined)
+            this.ctx.logger('swarm').warn(
+              'task %s: model rejected reasoning effort %s — retrying without an effort pin',
+              task.id, String(effort),
+            )
+          },
         })
         this.inFlight.delete(key)
         clearSpawnTimeout()

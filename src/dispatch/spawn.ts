@@ -169,6 +169,18 @@ export function isModelUnavailableError(err: unknown): boolean {
   return message.includes('model') && (message.includes('unavailable') || message.includes('not found') || message.includes('no adapter'))
 }
 
+/**
+ * J18: whether a failure is the model rejecting the pinned reasoning effort.
+ *
+ * This is a *configuration* mismatch between the role's effort pin and the model
+ * that actually served the request, not a provider outage — so the right response
+ * is to drop the effort and retry, never to fail the task.
+ */
+export function isUnsupportedEffortError(reason: string | undefined): boolean {
+  if (reason === undefined) return false
+  return /UNSUPPORTED_REASONING_EFFORT|does not support reasoning effort/i.test(reason)
+}
+
 export interface SpawnOutcome {
   ok: boolean
   stopReason?: string
@@ -227,6 +239,8 @@ export async function spawnTaskAgent(
     workspace?: string
     onFallback?: (failed: { provider: string; model: string }, next: { provider: string; model: string } | undefined) => void
     onStarted?: (childSessionId: string) => void
+    /** J18: clear the per-request effort pin for a child before an effort-less retry. */
+    onDropEffort?: (childSessionId: string) => void
   },
 ): Promise<SpawnOutcome> {
   const prompt = opts.prompt ?? buildTaskPrompt(opts.run, opts.task, opts.role, { priorNotes: opts.priorNotes, evidence: opts.evidence, workspace: opts.workspace })
@@ -235,58 +249,72 @@ export async function spawnTaskAgent(
   let lastProvider: string | undefined
   let lastModel: string | undefined
 
-  for (const candidate of chain) {
-    const agentOptions = candidate.provider.length > 0 && candidate.model.length > 0
-      ? { provider: candidate.provider, model: candidate.model, ...(opts.role.maxTokens !== undefined ? { maxTokens: opts.role.maxTokens } : {}) }
-      : opts.role.maxTokens !== undefined
-        ? { maxTokens: opts.role.maxTokens }
-        : undefined
-    let run
-    try {
-      run = await deps.start({
-        label: `swarm:${opts.task.id}`,
-        prompt: [{ type: 'text', text: prompt }],
-        parent: opts.parent,
-        signal: opts.signal,
-        // J14: bound the delegation depth of every task agent. The swarm never
-        // passed maxDepth, so a task agent could spawn its own DSH subagents, and
-        // those were invisible to the dispatcher: not counted by the global agent
-        // cap, not tracked by the watchdog, not shown on the board, and each one
-        // resident on the same Node heap. Observed in production: the
-        // `vhp-cryo-embed` task spawned 12 hidden subagents in 42 minutes while the
-        // orchestrator saw exactly one task, and one chain reached depth 3.
-        // maxDepth 1 permits the task agent itself (depth 1) and rejects any
-        // further delegation with SubagentDepthError. 0 disables the bound.
-        ...(opts.maxDepth !== undefined ? { maxDepth: opts.maxDepth } : {}),
-        ...(agentOptions !== undefined ? { agentOptions } : {}),
-        ...(opts.role.persona !== undefined ? { persona: opts.role.persona } : {}),
-        ...(opts.toolFilter !== undefined ? { toolFilter: opts.toolFilter } : {}),
-      })
-    } catch (err) {
-      lastReason = String(err instanceof Error ? err.message : err)
-      if (isModelUnavailableError(err)) {
-        const next = chain[chain.indexOf(candidate) + 1]
-        opts.onFallback?.(candidate, next)
-        if (next !== undefined) continue
-        return { ok: false, reason: `all model candidates unavailable (last: ${lastReason})` }
+  /**
+   * J18: run the candidate chain. `withEffort` controls whether the service's
+   * per-request reasoning-effort pin applies to the child.
+   *
+   * The effort is pinned through the `agent/request` waterfall, so it is applied
+   * to whichever model actually serves the request — including a FALLBACK whose
+   * model does not support that level. Observed live: a role pinned
+   * `reasoningEffort: "max"` with a `zai/glm-5.3` fallback, and every spawned task
+   * died ~1s in with `UNSUPPORTED_REASONING_EFFORT`. That error arrives as the
+   * child's stopReason, not as a `start()` throw, so the candidate loop below
+   * never advanced and the whole run failed.
+   */
+  const runChain = async (withEffort: boolean): Promise<SpawnOutcome> => {
+    for (const candidate of chain) {
+      const agentOptions = candidate.provider.length > 0 && candidate.model.length > 0
+        ? { provider: candidate.provider, model: candidate.model, ...(opts.role.maxTokens !== undefined ? { maxTokens: opts.role.maxTokens } : {}) }
+        : opts.role.maxTokens !== undefined
+          ? { maxTokens: opts.role.maxTokens }
+          : undefined
+      let run
+      try {
+        run = await deps.start({
+          label: `swarm:${opts.task.id}`,
+          prompt: [{ type: 'text', text: prompt }],
+          parent: opts.parent,
+          signal: opts.signal,
+          // J14: bound the delegation depth of every task agent. The swarm never
+          // passed maxDepth, so a task agent could spawn its own DSH subagents, and
+          // those were invisible to the dispatcher: not counted by the global agent
+          // cap, not tracked by the watchdog, not shown on the board, and each one
+          // resident on the same Node heap. Observed in production: the
+          // `vhp-cryo-embed` task spawned 12 hidden subagents in 42 minutes while the
+          // orchestrator saw exactly one task, and one chain reached depth 3.
+          // maxDepth 1 permits the task agent itself (depth 1) and rejects any
+          // further delegation with SubagentDepthError. 0 disables the bound.
+          ...(opts.maxDepth !== undefined ? { maxDepth: opts.maxDepth } : {}),
+          ...(agentOptions !== undefined ? { agentOptions } : {}),
+          ...(opts.role.persona !== undefined ? { persona: opts.role.persona } : {}),
+          ...(opts.toolFilter !== undefined ? { toolFilter: opts.toolFilter } : {}),
+        })
+      } catch (err) {
+        lastReason = String(err instanceof Error ? err.message : err)
+        if (isModelUnavailableError(err)) {
+          const next = chain[chain.indexOf(candidate) + 1]
+          opts.onFallback?.(candidate, next)
+          if (next !== undefined) continue
+          return { ok: false, reason: `all model candidates unavailable (last: ${lastReason})` }
+        }
+        return { ok: false, reason: lastReason }
       }
-      return { ok: false, reason: lastReason }
-    }
 
-    lastProvider = candidate.provider.length > 0 ? candidate.provider : undefined
-    lastModel = candidate.model.length > 0 ? candidate.model : undefined
-    opts.onStarted?.(run.id)
-    const result = await run.result
-    if (result.stopReason === 'completed') {
-      return {
-        ok: true,
-        stopReason: result.stopReason,
-        summary: summarizeOutput(result.output),
-        provider: lastProvider,
-        model: lastModel,
-        childSessionId: run.id,
+      lastProvider = candidate.provider.length > 0 ? candidate.provider : undefined
+      lastModel = candidate.model.length > 0 ? candidate.model : undefined
+      opts.onStarted?.(run.id)
+      if (!withEffort) opts.onDropEffort?.(run.id)
+      const result = await run.result
+      if (result.stopReason === 'completed') {
+        return {
+          ok: true,
+          stopReason: result.stopReason,
+          summary: summarizeOutput(result.output),
+          provider: lastProvider,
+          model: lastModel,
+          childSessionId: run.id,
+        }
       }
-    }
     return {
       ok: false,
       stopReason: result.stopReason,
@@ -295,6 +323,18 @@ export async function spawnTaskAgent(
       model: lastModel,
       childSessionId: run.id,
     }
+    }
+    return { ok: false, reason: lastReason, provider: lastProvider, model: lastModel }
   }
-  return { ok: false, reason: lastReason, provider: lastProvider, model: lastModel }
+
+  const first = await runChain(true)
+  // J18: if the model rejected the pinned reasoning effort, retry the same chain
+  // once with the effort pin removed. Degrading beats failing the task, and the
+  // candidate chain is preserved so this does not mask real outages.
+  if (!first.ok && isUnsupportedEffortError(first.reason)) {
+    lastReason = first.reason ?? lastReason
+    const retry = await runChain(false)
+    if (retry.ok || !isUnsupportedEffortError(retry.reason)) return retry
+  }
+  return first
 }
