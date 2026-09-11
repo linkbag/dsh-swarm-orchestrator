@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -23,6 +23,15 @@ class FakeSubagents {
   script: Record<number, string> = {}
   /** When true, children stay in-flight until release() (mimics a running agent). */
   holdAll = false
+  /**
+   * When true, a held child ALSO settles as soon as its caller's AbortSignal fires.
+   * Opt-in because it changes when a requeued spawn happens: the real provider does
+   * settle on abort, and the J8 spawn-ceiling test depends on that. Left off by
+   * default so the watchdog/interrupt tests keep their original timing.
+   */
+  abortAware = false
+  /** Capture the cancellation signal each held spawn was given (J8 spawn ceiling). */
+  readonly signals: Array<AbortSignal | undefined> = []
   /** Throw a quota-class error for this many upcoming calls (A3). */
   quotaCount = 0
   /** Throw a provider-class error on the first call only (A6 rotation). */
@@ -55,6 +64,20 @@ class FakeSubagents {
       let resolveResult!: (value: { stopReason: string; output: Array<{ type: string; text: string }> }) => void
       const result = new Promise<{ stopReason: string; output: Array<{ type: string; text: string }> }>((resolve) => { resolveResult = resolve })
       this.held.push(() => { resolveResult({ stopReason: 'completed', output }) })
+      const signal = (request as unknown as { signal?: AbortSignal }).signal
+      this.signals.push(signal)
+      if (this.abortAware) {
+        // The real provider settles a cancelled child; if the caller's signal is
+        // already aborted it must not resolve as a successful completion.
+        let settled = false
+        const settleAborted = (): void => {
+          if (settled) return
+          settled = true
+          resolveResult({ stopReason: 'aborted', output })
+        }
+        if (signal?.aborted === true) settleAborted()
+        else signal?.addEventListener('abort', settleAborted, { once: true })
+      }
       return { id, result, dispose: async () => {} }
     }
     return {
@@ -123,11 +146,11 @@ class FakeAgents {
 }
 
 /** Fake dispatching agent: carries a route, session cwd, and a composed preset. */
-function makeDispatcher(): unknown {
+function makeDispatcher(cwd = 'D:\\work'): unknown {
   return {
     id: 'parent-1',
     options: { provider: 'zai', model: 'glm-5.3' },
-    session: { header: { id: 'parent-1', cwd: 'D:\\work' } },
+    session: { header: { id: 'parent-1', cwd } },
     ctx: {
       get: (name: string): unknown =>
         name === 'agentPresets' ? { composedPreset: () => 'standard' } : undefined,
@@ -162,6 +185,8 @@ async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx
     // H-1/H-2 hardening defaults ON in production; tests disable for speed.
     retryBackoffBaseMs: 0,
     circuitBreakerThreshold: 0,
+    // Match production's boot grace so the readiness poll behaves as deployed.
+    bootGraceSeconds: 3,
     ...overrides,
   })
   // ctx.get returns a traceable proxy; unwrap to the raw service via symbols.original
@@ -296,9 +321,7 @@ describe('swarm service (integration, fake subagents)', () => {
   })
 
   it('swarm_report authenticates tracked child sessions only', async () => {
-    const { ctx, service, fake, dir } = await bootSwarm()
-    contexts.push(ctx)
-    dirs.push(dir)
+    const { service, fake } = await bootRunnable()
 
     fake.holdAll = true // keep the child in-flight so its session stays tracked
     const result = service.dispatch({
@@ -1117,5 +1140,398 @@ describe('swarm service (integration, fake subagents)', () => {
     fake.unavailableCount = 0 // subsequent spawns succeed
     await waitFor(() => fake.calls.length > callCountAfterBreaker, 8000, 'retries resume after cooldown')
     service.abort(result.runId)
+  }, 15000)
+
+  /**
+   * Boot a swarm with the builder role pinned so dispatches can actually spawn.
+   * Mirrors the setup used by the core dispatch test; without a pinned role (or
+   * a captured run route) `resolveCandidates` returns undefined and nothing runs.
+   */
+  async function bootRunnable(overrides: Record<string, unknown> = {}): Promise<{ service: SwarmService; fake: FakeSubagents; dir: string }> {
+    const { ctx, service, fake, dir } = await bootSwarm(overrides)
+    contexts.push(ctx)
+    dirs.push(dir)
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3' }
+    service.setDutyTable(table, 'test')
+    return { service, fake, dir }
+  }
+
+  // ── J6: orphan recovery must not re-fail tasks of a terminal run ──────────
+  // Production evidence: run-mtvrocbe-tns8 was aborted, yet its task
+  // vhp-cryo-embed was re-failed 13 times over 21.5h ("host restarted
+  // mid-flight"). `fold` ignores task transitions on terminal runs, so each
+  // event was a no-op that left the task `running` for the next boot to fail
+  // again — inflating failure counts and never reaching a terminal state.
+  it('J6: recoverOrphans skips tasks whose run is not running (no ghost re-fails)', async () => {
+    const { service, fake } = await bootRunnable()
+
+    fake.holdAll = true
+
+    const result = service.dispatch({
+      title: 'zombie guard',
+      spec: 's',
+      tasks: [{ id: 'z1', subject: 'Z', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    // Wait until the task is genuinely mid-flight (running), still held.
+    const seen: string[] = []
+    await waitFor(
+      () => {
+        const t = service.snapshot().tasks.find((x) => x.id === 'z1')
+        const tag = `${t?.status ?? 'none'}|ev=${service.events.all().filter((e) => e.taskId === 'z1').map((e) => e.kind.replace('task/', '')).join(',')}`
+        if (seen[seen.length - 1] !== tag) seen.push(tag)
+        return t?.status === 'running'
+      },
+      5000,
+      'task running',
+      () => 'transitions=' + JSON.stringify(seen) + ' calls=' + fake.calls.length,
+    )
+
+    // Abort the run: the projection now freezes this run's task transitions.
+    service.abort(result.runId)
+    expect(service.snapshot().runs.find((r) => r.id === result.runId)?.status).toBe('aborted')
+
+    const failsBefore = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z1').length
+
+    // Three "host restarts" in a row, as production experienced.
+    const recover = (service as unknown as { recoverOrphans(): void }).recoverOrphans.bind(service)
+    recover()
+    recover()
+    recover()
+
+    const failsAfter = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z1').length
+    expect(failsAfter).toBe(failsBefore) // the ghost loop is gone
+
+    fake.release()
+  }, 15000)
+
+  it('J6 (control): recoverOrphans still requeues an orphan of a RUNNING run', async () => {
+    const { service, fake } = await bootRunnable()
+
+    fake.holdAll = true
+
+    const result = service.dispatch({
+      title: 'orphan still recovered',
+      spec: 's',
+      tasks: [{ id: 'z2', subject: 'Z', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().tasks.some((t) => t.id === 'z2' && t.status === 'running'), 5000, 'task running')
+
+    const failsBefore = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z2').length
+    const recover = (service as unknown as { recoverOrphans(): void }).recoverOrphans.bind(service)
+    recover()
+    const failsAfter = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z2').length
+
+    // The guard must not disable legitimate orphan recovery.
+    expect(failsAfter).toBe(failsBefore + 1)
+    const last = service.events.all().filter((e) => e.kind === 'task/failed' && e.taskId === 'z2').slice(-1)[0]
+    expect(String(last?.data?.reason)).toMatch(/host restarted mid-flight/)
+
+    service.abort(result.runId)
+    fake.release()
+  }, 15000)
+
+  // ── J8: the spawn ceiling covers the `dispatching` state ──────────────────
+  it('J8: spawnTimeoutSeconds aborts a child that never reports started', async () => {
+    const { service, fake } = await bootRunnable({
+      spawnTimeoutSeconds: 1, // 1s ceiling
+      maxRetries: 0,
+      circuitBreakerThreshold: 0,
+    })
+    fake.abortAware = true
+
+    fake.holdAll = true
+
+    const result = service.dispatch({
+      title: 'spawn ceiling',
+      spec: 's',
+      tasks: [{ id: 'slow', subject: 'S', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().tasks.some((t) => t.id === 'slow' && t.status === 'running'), 5000, 'task running')
+
+    // The held child never resolves; without the ceiling the slot is held forever.
+    await waitFor(() => {
+      const t = service.snapshot().tasks.find((x) => x.id === 'slow')
+      return t !== undefined && t.status !== 'running' && t.status !== 'dispatching'
+    }, 12000, 'spawn ceiling released the task')
+
+    fake.release()
+  }, 20000)
+
+  it('J8: spawnTimeoutSeconds = 0 disables the ceiling', async () => {
+    const { service, fake } = await bootRunnable({ spawnTimeoutSeconds: 0, maxRetries: 0 })
+    fake.abortAware = true
+
+    fake.holdAll = true
+
+    const result = service.dispatch({
+      title: 'no ceiling',
+      spec: 's',
+      tasks: [{ id: 'held', subject: 'H', description: 'd', role: 'builder' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().tasks.some((t) => t.id === 'held' && t.status === 'running'), 5000, 'task running')
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    // Still running: no ceiling was applied.
+    expect(service.snapshot().tasks.find((t) => t.id === 'held')?.status).toBe('running')
+
+    service.abort(result.runId)
+    fake.release()
+  }, 15000)
+
+  // ── J3: evidence commands must run under a shell that accepts PS syntax ────
+  it('J3: evidence commands run under PowerShell on Windows, not cmd.exe', async () => {
+    const { service, fake, dir } = await bootRunnable()
+
+    // The gate runs in the run's workspace, so point the dispatcher at a real
+    // directory and give it a file to find (the default fake cwd D:\work does not
+    // exist, which is itself reported as a distinct, non-gate failure).
+    writeFileSync(join(dir, 'package.json'), '{"name":"evidence-fixture"}')
+
+    // This is exactly the syntax that produced 59 cmd.exe failures in production.
+    const result = service.dispatch({
+      title: 'evidence shell',
+      spec: 's',
+      tasks: [{
+        id: 'gate',
+        subject: 'G',
+        description: 'd',
+        role: 'builder',
+        evidence: { commands: ['if (Test-Path package.json) { exit 0 } else { exit 1 }'] },
+      }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed',
+      8000,
+      'PowerShell evidence passed',
+      () => 'run=' + service.snapshot().runs.find((r) => r.id === result.runId)?.status +
+        ' tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, t.lastNote])) +
+        ' calls=' + fake.calls.length,
+    )
+    expect(fake.calls.length).toBeGreaterThan(0)
+  }, 15000)
+
+  it('J3: a nonexistent run workspace is reported as such, not as a failed gate', async () => {
+    const { service } = await bootRunnable()
+
+    const result = service.dispatch({
+      title: 'evidence cwd guard',
+      spec: 's',
+      tasks: [{
+        id: 'gate2',
+        subject: 'G',
+        description: 'd',
+        role: 'builder',
+        evidence: { commands: ['exit 0'] },
+      }],
+    }, makeDispatcher('D:\\definitely-missing-workspace-xyz') as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => {
+      const t = service.snapshot().tasks.find((x) => x.id === 'gate2')
+      return t !== undefined && (t.status === 'failed' || t.status === 'retrying')
+    }, 8000, 'gate2 closed')
+
+    const note = service.snapshot().tasks.find((x) => x.id === 'gate2')?.lastNote ?? ''
+    expect(note).toMatch(/does not exist/)
+  }, 15000)
+
+  // ── J9: boot readiness waits for the spawn provider ──────────────────────
+  it('J9: orphan recovery runs after the subagents provider is available', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'swarm-readiness-'))
+    dirs.push(dir)
+    const ctx = new Context()
+    contexts.push(ctx)
+    const fake = new FakeSubagents()
+    // Provide `subagents` only AFTER the plugin loads — the real post-restart race.
+    await ctx.plugin(swarmPlugin, {
+      storageDir: dir,
+      maxConcurrent: 5,
+      staleTimeoutSeconds: 14400,
+      maxRetries: 2,
+      reviewLoops: 3,
+      requireArchitectReview: false,
+      workspaceRunPolicy: 'off',
+      retryBackoffBaseMs: 0,
+      circuitBreakerThreshold: 0,
+    })
+    const traced = ctx.get('swarm') as Record<symbol, unknown>
+    const service = traced[Symbol.for('cordis.original')] as SwarmService
+    expect(service).toBeDefined()
+
+    // Plugin loaded with no provider; the readiness poll must not have thrown,
+    // and loading must not have crashed the context.
+    expect(ctx.get('swarm')).toBeDefined()
+    ctx.reflect.provide('subagents', fake as never)
+    await new Promise((resolve) => setTimeout(resolve, 1200))
+    expect(ctx.get('swarm')).toBeDefined()
+  }, 15000)
+
+  // ── J10: durable task handoff ─────────────────────────────────────────────
+  it('J10: a completed on-disk task report is adopted instead of re-running the task', async () => {
+    const { service, fake, dir } = await bootRunnable({ maxRetries: 0 })
+    fake.failOnce = true // the child dies after writing its work
+
+    const result = service.dispatch({
+      title: 'durable handoff',
+      spec: 's',
+      tasks: [{ id: 'hand', subject: 'H', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    // The agent finished the work and wrote its report, then died before the
+    // dispatcher could record it — exactly the production "landed on disk" case.
+    mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
+    writeFileSync(
+      join(dir, '.dsh-swarm', 'task-hand.json'),
+      JSON.stringify({ taskId: 'hand', status: 'completed', summary: 'work landed before the crash' }),
+    )
+
+    await waitFor(
+      () => service.snapshot().tasks.find((t) => t.id === 'hand')?.status === 'completed',
+      8000,
+      'task adopted from its on-disk report',
+      () => 'tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, t.lastNote])),
+    )
+    expect(service.snapshot().tasks.find((t) => t.id === 'hand')?.summary).toMatch(/landed before the crash/)
+  }, 15000)
+
+  it('J10: a report that does not claim completion is NOT adopted', async () => {
+    const { service, fake, dir } = await bootRunnable({ maxRetries: 0 })
+    fake.failOnce = true
+
+    const result = service.dispatch({
+      title: 'no false adoption',
+      spec: 's',
+      tasks: [{ id: 'half', subject: 'H', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
+    writeFileSync(
+      join(dir, '.dsh-swarm', 'task-half.json'),
+      JSON.stringify({ taskId: 'half', status: 'in-progress', summary: 'still going' }),
+    )
+
+    await waitFor(
+      () => ['failed', 'retrying'].includes(service.snapshot().tasks.find((t) => t.id === 'half')?.status ?? ''),
+      8000,
+      'incomplete report left the task failed',
+    )
+    expect(service.snapshot().tasks.find((t) => t.id === 'half')?.status).not.toBe('completed')
+  }, 15000)
+
+  it('J10: the task prompt instructs the agent to write its report last', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    const result = service.dispatch({
+      title: 'prompt contract',
+      spec: 's',
+      tasks: [{ id: 'p1', subject: 'P', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 5000, 'spawn')
+    const prompt = fake.calls[0]?.prompt?.[0]?.text ?? ''
+    expect(prompt).toContain('.dsh-swarm/task-p1.json')
+    expect(prompt).toMatch(/LAST thing you do/)
+    service.abort(result.runId)
+  }, 15000)
+
+  // ── J11: swarm_report no longer requires the model to pass taskId ─────────
+  it('J11: report() resolves the task from the authenticated agent when taskId is omitted', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    fake.holdAll = true
+
+    const result = service.dispatch({
+      title: 'report binding',
+      spec: 's',
+      tasks: [{ id: 'r1', subject: 'R', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 5000, 'spawn')
+    const childId = 'sess-1' // first minted child session id
+
+    // Omitted taskId: resolved from the tracked child session.
+    expect(service.report(childId, undefined, 'progress: half way')).toBe('ok')
+    const notes = service.events.all().filter((e) => e.kind === 'task/heartbeat')
+    expect(notes.length).toBe(1)
+    expect(notes[0]?.taskId).toBe('r1')
+
+    // A wrong explicit id is still rejected — authentication is not weakened.
+    expect(() => service.report(childId, 'someone-else', 'nope')).toThrow(/not assigned to this agent/)
+    // An untracked agent cannot report at all.
+    expect(() => service.report('not-a-swarm-child', undefined, 'hi')).toThrow(/not a tracked swarm task agent/)
+
+    service.abort(result.runId)
+    fake.release()
+  }, 15000)
+
+  // ── write-scope discipline ───────────────────────────────────────────────
+  it('warns when a task claims a broad scope that contains a sibling\'s files', async () => {
+    const { service, dir } = await bootRunnable()
+    const result = service.dispatch({
+      title: 'nested scope',
+      spec: 's',
+      tasks: [
+        { id: 'build', subject: 'B', description: 'd', role: 'builder', writes: ['scripts/build.mjs'] },
+        { id: 'qa', subject: 'Q', description: 'd', role: 'builder', writes: ['scripts'] },
+      ],
+    }, makeDispatcher(dir) as never)
+    const joined = (result.warnings ?? []).join(' | ')
+    expect(joined).toMatch(/broad scope "scripts"/)
+    expect(joined).toContain('build')
+    service.abort(result.runId)
+  }, 15000)
+
+  it('does not warn when the broad scope is serialised behind blockedBy', async () => {
+    const { service, dir } = await bootRunnable()
+    const result = service.dispatch({
+      title: 'serialised scope',
+      spec: 's',
+      tasks: [
+        { id: 'build', subject: 'B', description: 'd', role: 'builder', writes: ['scripts/build.mjs'] },
+        { id: 'qa', subject: 'Q', description: 'd', role: 'builder', writes: ['scripts'], blockedBy: ['build'] },
+      ],
+    }, makeDispatcher(dir) as never)
+    expect((result.warnings ?? []).join(' | ')).not.toMatch(/broad scope/)
+    service.abort(result.runId)
+  }, 15000)
+
+  // ── J12: role toolFilter reaches the spawn provider ──────────────────────
+  it('J12: a role toolFilter is passed through to the spawn provider', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = { ...table.roles.builder, toolFilter: { deny: ['modlens'] } }
+    service.setDutyTable(table, 'test')
+
+    const result = service.dispatch({
+      title: 'tool filter',
+      spec: 's',
+      tasks: [{ id: 'f1', subject: 'F', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 5000, 'spawn')
+    const sent = (fake.calls[0] as unknown as { toolFilter?: { deny?: string[] } }).toolFilter
+    expect(sent?.deny).toEqual(['modlens'])
+    service.abort(result.runId)
+  }, 15000)
+
+  it('J12: the duty table keeps its toolFilter across a save round-trip', async () => {
+    const { service } = await bootRunnable()
+    const table = structuredClone(service.duty.get())
+    table.roles.reviewer = { ...table.roles.reviewer, toolFilter: { deny: ['modlens'] } }
+    service.setDutyTable(table, 'test')
+    expect(service.duty.role('reviewer')?.toolFilter?.deny).toEqual(['modlens'])
   }, 15000)
 })

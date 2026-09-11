@@ -68,7 +68,23 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context:
     '- Verify your own work before finishing (run the checks that exist for what you changed).',
     '- Post a `swarm_report` progress note at least every ~10 minutes or at each milestone, prefixed `progress:`, `blocker:`, or `done:`.',
     '- Finish with a concise final summary: what changed, where, and how it was verified.',
+    '',
+    '## Mandatory final action — write your task report (J10)',
+    `As the LAST thing you do, write \`${taskReportRelPath(task.id)}\` (relative to the workspace) containing JSON:`,
+    '```json',
+    '{ "taskId": "' + task.id + '", "status": "completed", "summary": "<what changed and how you verified it>" }',
+    '```',
+    'Write it only when the work is genuinely done and verified — it is machine-checked and the',
+    'dispatcher treats it as proof of completion. If you cannot finish, do not write it.',
+    'This exists because a host restart can kill you between finishing the work and being recorded:',
+    'the report is what preserves the finished work instead of discarding it.',
   ].join('\n')
+}
+
+/** Workspace-relative path of a task's durable completion report (J10). */
+export function taskReportRelPath(taskId: string): string {
+  const safe = taskId.replace(/[^A-Za-z0-9._-]/g, '_')
+  return `.dsh-swarm/task-${safe}.json`
 }
 
 /** Prompt for the review agent judging a completed task's output. */

@@ -1,7 +1,7 @@
 // Runtime tuning section: edit the swarm's hardening and concurrency
 // parameters from the AI Swarm settings (persisted to runtime.json, applied
 // live — no restart needed).
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { boardStore, type Board, type BoardRuntime } from './board-store'
 
 const FIELDS: Array<{ key: keyof BoardRuntime; label: string; hint: string; min: number; max: number; step: number }> = [
@@ -13,16 +13,22 @@ const FIELDS: Array<{ key: keyof BoardRuntime; label: string; hint: string; min:
   { key: 'circuitBreakerCooldownMs', label: 'Circuit breaker cooldown (ms)', hint: 'How long retries pause after the breaker trips (default 60000 = 60s)', min: 1000, max: 600000, step: 5000 },
   { key: 'nudgeAfterMinutes', label: 'Nudge after silence (min)', hint: 'Board marker for silent tasks — 0 = off (default 20)', min: 0, max: 240, step: 5 },
   { key: 'staleTimeoutSeconds', label: 'Stale timeout (sec)', hint: 'Last-resort reclaim for silent agents (default 14400 = 4h)', min: 60, max: 86400, step: 600 },
+  { key: 'spawnTimeoutSeconds', label: 'Spawn timeout (sec)', hint: 'Hard ceiling on one task run — guards the "dispatching" state the watchdog cannot see (default 3600 = 1h; 0 = off)', min: 0, max: 86400, step: 300 },
 ]
-
 export function RuntimeSettings({ board }: { board: Board | null }): JSX.Element {
   const [draft, setDraft] = useState<Record<string, string>>({})
   const [busy, setBusy] = useState(false)
   const [savedAt, setSavedAt] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const initialized = useRef(false)
 
+  // Initialize the draft from the board ONCE (on mount). Subsequent board
+  // updates (SSE-driven, arriving every few seconds during active runs) must
+  // NOT clobber the user's in-progress edits. After a successful save, the
+  // board's next fetch carries the new values and we re-sync once.
   useEffect(() => {
-    if (board?.runtime !== undefined) {
+    if (!initialized.current && board?.runtime !== undefined) {
+      initialized.current = true
       const next: Record<string, string> = {}
       for (const f of FIELDS) {
         const v = board.runtime?.[f.key]
@@ -44,8 +50,18 @@ export function RuntimeSettings({ board }: { board: Board | null }): JSX.Element
           if (Number.isFinite(n) && n >= 0) runtime[f.key] = n
         }
       }
-      await boardStore().action({ action: 'set-runtime', runtime })
+      const result = await boardStore().action({ action: 'set-runtime', runtime })
       setSavedAt(new Date().toLocaleTimeString())
+      // Re-sync the draft from the saved result (the authoritative values).
+      const saved = (result as { runtime?: Record<string, number> }).runtime
+      if (saved !== undefined) {
+        const next: Record<string, string> = {}
+        for (const f of FIELDS) {
+          const v = saved[f.key]
+          next[f.key] = v !== undefined ? String(v) : ''
+        }
+        setDraft(next)
+      }
     } catch (err) {
       setError(String(err instanceof Error ? err.message : err))
     } finally {

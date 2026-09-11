@@ -11,12 +11,13 @@ export interface RuntimeOverrides {
   circuitBreakerCooldownMs?: number
   nudgeAfterMinutes?: number
   staleTimeoutSeconds?: number
+  spawnTimeoutSeconds?: number
 }
 
 const NUMERIC_KEYS = [
   'maxConcurrent', 'maxTotalConcurrentAgents', 'spawnStaggerMs', 'retryBackoffBaseMs',
   'circuitBreakerThreshold', 'circuitBreakerCooldownMs',
-  'nudgeAfterMinutes', 'staleTimeoutSeconds',
+  'nudgeAfterMinutes', 'staleTimeoutSeconds', 'spawnTimeoutSeconds',
 ] as const
 
 /**

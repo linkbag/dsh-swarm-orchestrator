@@ -26,10 +26,13 @@ const taskItemSchema = {
     evidence: {
       type: 'object' as const,
       additionalProperties: true,
-      description: 'Evidence contract: the task will not close until these hold. { files: [paths], commands: [shell commands] }',
+      description: 'Evidence contract: the task will not close until these hold. { files: [paths], commands: [shell commands] }. '
+        + 'IMPORTANT: commands run through PowerShell on Windows (pwsh) and bash elsewhere, from the workspace root. '
+        + 'Write POSIX/PowerShell command lines — never cmd.exe syntax. Prefer file checks (files: [...]) over '
+        + 'shell expressions: a file check cannot fail for shell reasons.',
       properties: {
-        files: { type: 'array' as const, items: { type: 'string' as const }, description: 'Files (relative to the workspace) that must exist and be non-empty' },
-        commands: { type: 'array' as const, items: { type: 'string' as const }, description: 'Shell commands that must exit 0' },
+        files: { type: 'array' as const, items: { type: 'string' as const }, description: 'Files (relative to the workspace) that must exist and be non-empty. Preferred — no shell involved.' },
+        commands: { type: 'array' as const, items: { type: 'string' as const }, description: 'Commands that must exit 0. Run by pwsh on Windows (bash elsewhere), from the workspace root. Example: "npm run check" or "if (Test-Path app/build.gradle.kts) { exit 0 } else { exit 1 }". Do NOT use cmd.exe-only syntax.' },
       },
     },
   },
@@ -140,7 +143,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
       'Post an interim progress note from a swarm task agent to the dashboard (one line: what you are doing or just finished). '
       + 'Only the agent executing the tracked task may report; finish your turn to complete the task.',
     parameters: {
-      taskId: { type: 'string', required: true, description: 'Your task id' },
+      taskId: { type: 'string', description: 'Your task id. Optional — the service resolves it from your session; pass it only to be explicit.' },
       note: { type: 'string', required: true, description: 'One-line progress note' },
     },
     output: {
@@ -150,7 +153,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     isConcurrencySafe: () => true,
     execute: async (args, exec) => {
       if (exec.agent === undefined) throw new Error('swarm_report is only available to swarm task agents')
-      return service.report(String(exec.agent.id), args.taskId, args.note)
+      return service.report(String(exec.agent.id), args.taskId === undefined ? undefined : String(args.taskId), args.note)
     },
   })))
 

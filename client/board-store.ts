@@ -75,6 +75,7 @@ export interface BoardRuntime {
   circuitBreakerCooldownMs?: number
   nudgeAfterMinutes?: number
   staleTimeoutSeconds?: number
+  spawnTimeoutSeconds?: number
 }
 
 export interface Board {

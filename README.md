@@ -52,8 +52,18 @@ This plugin takes the coordination seriously so you don't have to:
 - **Scoped to where you are.** Each chat's Swarm tab shows the runs for that chat's workspace; a persisted switch reveals everything on the machine when you want the full picture.
 - **One run per goal, reviewed before built.** Dispatching into a workspace with an active run raises a warning (or a block, your choice); and unless you opt out, an architect agent reviews the dispatcher''s plan into PLAN.md before any builder starts.
 - **Memory-safe concurrency.** Swarm agents run in-process on the DSH host, sharing its Node.js heap. A global cap (`maxTotalConcurrentAgents`, default 5) ensures concurrent runs from different workspaces share the agent budget (3+2, not 5+5) — preventing the heap exhaustion that can crash the host when too many agents run simultaneously.
+- **Work outlives its agent.** Every task agent writes a small completion report as its final action. If the host restarts and kills an agent between finishing the work and being recorded, the dispatcher adopts the on-disk report instead of throwing the finished work away and re-running the task. A task can also never sit `dispatching` forever: `spawnTimeoutSeconds` is a hard ceiling the heartbeat watchdog cannot provide.
 
 > ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** with the default cap of 5 total agents. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` to 3 in the Runtime settings.
+
+### Reliability notes (v0.5.8)
+
+Diagnosed from 47 recorded runs / 184 task failures, then fixed and regression-tested:
+
+- **Evidence commands run under PowerShell** (bash elsewhere) from the workspace root, and the `evidence.commands` schema says so. Previously they were handed to `cmd.exe`, so a perfectly normal PowerShell gate (`if (Test-Path …) { exit 0 }`) failed the task — 32% of all recorded task failures. Prefer `evidence.files` where a file check can express the gate: it involves no shell at all.
+- **`modlens` is denied to swarm roles** by default in the shipped roster guidance: it is an interactive tool that asks the user a question, and swarm children run non-interactively. Add it back per-role from the Roster if your deployment has a headless vision provider.
+- **A task report that does not claim `"status": "completed"` is never adopted** — adoption cannot mask unfinished work.
+- **Recovery is scoped to running runs.** Orphan recovery only requeues tasks whose run is still running, so a terminal run's tasks stay frozen instead of being re-failed on every host restart.
 
 ## The dashboard
 

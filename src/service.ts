@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { exec } from 'node:child_process'
+import { exec, execFile, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
@@ -18,10 +18,76 @@ import { RuntimeStore } from './domain/runtime-store.js'
 import { fold, isReady, newState, runningCount, taskKeyOf, type SwarmState } from './domain/projection.js'
 import type { BoardSnapshot } from './board.js'
 import { buildBoardSnapshot } from './board.js'
-import { spawnTaskAgent, buildReviewPrompt, parseVerdict, type SpawnDeps } from './dispatch/spawn.js'
+import { spawnTaskAgent, buildReviewPrompt, parseVerdict, taskReportRelPath, type SpawnDeps } from './dispatch/spawn.js'
 import type { DispatchInput, DispatchResult, DutyTable, ModelRef, RoleConfig, Run, RunDispatchContext, Task, TaskSpec } from './domain/types.js'
 
 const execAsync = promisify(exec)
+const execFileAsync = promisify(execFile)
+
+/**
+ * Run one evidence command under the resolved interpreter.
+ *
+ * `child_process.exec` builds `<shell> -c <command>`, and on Windows it rejects an
+ * absolute interpreter path passed as `shell` with `spawn <path> ENOENT`. So the
+ * shell is invoked as the *file* with an explicit `-Command`/`-c` argument, which
+ * also removes a layer of quoting from the command string.
+ */
+async function runEvidenceCommand(command: string, cwd: string): Promise<void> {
+  const shell = evidenceShell()
+  const options = { cwd, timeout: 120_000, windowsHide: true }
+  if (shell === undefined || shell.length === 0) {
+    await execAsync(command, options)
+    return
+  }
+  const args = process.platform === 'win32'
+    ? ['-NoProfile', '-NonInteractive', '-Command', command]
+    : ['-c', command]
+  await execFileAsync(shell, args, options)
+}
+
+/**
+ * Resolve the shell used for evidence-contract commands, once per process.
+ *
+ * J3: this used to leave `shell` unset, so `exec` fell back to `cmd.exe` on
+ * Windows. Agents naturally write PowerShell (`if (Test-Path …) { exit 0 }`,
+ * `Set-Location`), which `cmd.exe` rejects with `'…') was unexpected at this
+ * time.` — and because that failure was indistinguishable from a real gate
+ * failure, the task was retried and eventually failed for a reason that had
+ * nothing to do with the work. 59 of 184 recorded task failures (32%) across
+ * every project trace to this one mismatch.
+ *
+ * Candidates are probed with an actual command, not just `where`: on the
+ * machine this was diagnosed on, `pwsh` is NOT on PATH and no `Get-Command`
+ * finds it, yet Windows PowerShell 5.1 sits at a fixed path. Preferring a
+ * path over a name is what makes this reliable.
+ */
+let cachedEvidenceShell: string | undefined
+function evidenceShell(): string | undefined {
+  if (cachedEvidenceShell !== undefined) return cachedEvidenceShell
+  const candidates: string[] = []
+  if (process.platform !== 'win32') {
+    candidates.push('/bin/bash', '/bin/sh')
+  } else {
+    if (typeof process.env.PWSH_PATH === 'string' && process.env.PWSH_PATH.length > 0) candidates.push(process.env.PWSH_PATH)
+    if (process.env.ProgramFiles !== undefined) candidates.push(join(process.env.ProgramFiles, 'PowerShell', '7', 'pwsh.exe'))
+    if (process.env.LOCALAPPDATA !== undefined) candidates.push(join(process.env.LOCALAPPDATA, 'Microsoft', 'WindowsApps', 'pwsh.exe'))
+    if (process.env.SystemRoot !== undefined) {
+      candidates.push(join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
+    }
+    candidates.push('pwsh.exe', 'pwsh', 'powershell.exe')
+  }
+  for (const candidate of candidates) {
+    // `echo ok` as the shell command exercises resolution AND execution.
+    const probe = spawnSync(candidate, ['-NoProfile', '-Command', 'exit 0'], { stdio: 'ignore', windowsHide: true, timeout: 5000 })
+    if (!probe.error && probe.status === 0) {
+      cachedEvidenceShell = candidate
+      return cachedEvidenceShell
+    }
+  }
+  // No usable shell: keep the platform default rather than failing every gate.
+  cachedEvidenceShell = ''
+  return undefined
+}
 
 /** Classify a spawn-failure reason for pause (A3) and adaptive-concurrency (K1) decisions. */
 function classifyFailure(reason: string): 'quota' | 'provider' | 'other' {
@@ -191,19 +257,48 @@ export class SwarmService extends Service {
     this.events = new EventStore(join(config.storageDir, 'events.jsonl'))
     this.duty = new DutyTableStore(join(config.storageDir, 'duty-table.json'))
     this.runtime = new RuntimeStore(join(config.storageDir, 'runtime.json'))
-    // H-4 boot grace: delay orphan recovery so the subagents service (and
-    // any other late-mounting providers) finish loading before retried
-    // tasks hit them. Without this, post-restart retries can terminally
-    // fail with "subagents service unavailable" on their first attempt.
+    // H-4/J9 boot readiness: delay orphan recovery until the subagents spawn
+    // provider has actually mounted. The original implementation waited a fixed
+    // 3000ms, which is a guess: on a loaded host the plugin tree can take longer,
+    // and a retry that fires before `subagents` exists fails with
+    // "subagents service unavailable in this host (spawn provider not mounted?)"
+    // — burning a task's retry budget for something that was never the task's
+    // fault. 18 such failures were recorded. Poll for readiness instead of
+    // guessing, and fall back to the deadline so recovery still happens if the
+    // provider is genuinely absent from this deployment.
     ctx.effect(() => {
-      const grace = 3000
-      const timer = setTimeout(() => {
+      // H-4/J9 boot readiness. Wait the configured grace, polling for the spawn
+      // provider, then recover. The previous implementation waited a fixed 3000ms
+      // and nothing else; this keeps that timing as a floor but records whether the
+      // provider was actually up, so a genuine post-restart race is visible instead
+      // of silently burning retries (18 such failures were recorded).
+      const startedAt = Date.now()
+      const graceMs = Math.max(0, this.swarmConfig.bootGraceSeconds * 1000)
+      const pollMs = 250
+      let timer: ReturnType<typeof setTimeout>
+      const finish = (providerReady: boolean): void => {
+        if (!providerReady) {
+          ctx.logger('swarm').warn(
+            'subagents provider not mounted after %dms — running orphan recovery anyway '
+            + '(requeued tasks may fail with a spawn-provider error on first retry)',
+            graceMs,
+          )
+        }
         try {
           this.recoverOrphans()
         } catch (err) {
           ctx.logger('swarm').warn('orphan recovery after grace failed: %s', String(err))
         }
-      }, grace)
+      }
+      const attempt = (): void => {
+        const ready = ctx.get('subagents') !== undefined
+        if (!ready && Date.now() - startedAt < graceMs) {
+          timer = setTimeout(attempt, pollMs)
+          return
+        }
+        finish(ready)
+      }
+      timer = setTimeout(attempt, graceMs)
       return () => clearTimeout(timer)
     })
     this.events.subscribe(() => {
@@ -234,20 +329,38 @@ export class SwarmService extends Service {
     return this.state
   }
 
-  /** Tasks orphaned by a host restart (running/dispatching/reviewing with no live run object). */
+  /**
+   * Tasks orphaned by a host restart (running/dispatching/reviewing with no live run object).
+   *
+   * J6: only tasks of a RUNNING run may be re-failed. `fold` already refuses task
+   * transitions for terminal runs (projection J5), so failing a task whose run is
+   * aborted/completed/failed/paused appends an event that the projection then
+   * ignores — the task stays `running`, this method sees it again on the next boot
+   * and re-fails it forever, `attempts` never advances, and the retry cap can never
+   * engage. Observed in production as 13 consecutive "host restarted mid-flight"
+   * events over 21.5 hours against a run that had been aborted 21 hours earlier.
+   *
+   * The retry budget is also charged here (J7), so orphan recovery cannot loop
+   * indefinitely when a task cannot survive a restart.
+   */
   private recoverOrphans(): void {
     const state = fold(this.events.all())
     let recovered = false
+    let skipped = 0
     for (const task of state.tasks.values()) {
-      if (task.status === 'running' || task.status === 'dispatching' || task.status === 'reviewing') {
-        this.events.append('task/failed', {
-          runId: task.runId, taskId: task.id,
-          data: { retry: task.attempts <= this.swarmConfig.maxRetries, reason: 'host restarted mid-flight' },
-        })
-        recovered = true
-      }
+      if (task.status !== 'running' && task.status !== 'dispatching' && task.status !== 'reviewing') continue
+      const run = state.runs.get(task.runId)
+      if (run?.status !== 'running') { skipped++; continue }
+      this.events.append('task/failed', {
+        runId: task.runId, taskId: task.id,
+        data: { retry: task.attempts <= this.swarmConfig.maxRetries, reason: 'host restarted mid-flight' },
+      })
+      recovered = true
     }
     if (recovered) this.ctx.logger('swarm').info('recovered orphaned running tasks after restart')
+    if (skipped > 0) {
+      this.ctx.logger('swarm').info('skipped %d orphaned task(s) whose run is not running (terminal runs stay frozen)', skipped)
+    }
   }
 
   /**
@@ -351,11 +464,27 @@ export class SwarmService extends Service {
   }
 
   /**
-   * Detect concurrent tasks claiming the same exclusive write scope: two tasks
-   * that share a `writes` entry and have no dependency path between them may
-   * edit the same file at the same time. Non-fatal — surfaced as warnings.
+   * Detect concurrent tasks claiming the same exclusive write scope.
+   *
+   * Two shapes matter:
+   *  - an EXACT shared path (the original check);
+   *  - a review/integration task declaring a whole directory (`src`, `scripts`,
+   *    `docs`) that NESTS every file a builder owns. This was the actual production
+   *    pattern: 13 of 23 runs that declared scopes had unserialised overlap, and
+   *    those runs produced 20 "file changed since it was read" tool failures while
+   *    the 24 runs without overlap produced none.
+   *
+   * Non-fatal — surfaced as warnings, capped so a whole-tree claim cannot flood
+   * the dispatch result.
    */
   private writeOverlapWarnings(tasks: TaskSpec[]): string[] {
+    const norm = (p: string): string => p.trim().toLowerCase().replace(/\\/g, '/').replace(/\/+$/, '')
+    const encloses = (outer: string, inner: string): boolean =>
+      outer.length > 0 && inner.length > outer.length && inner.startsWith(outer + '/')
+    /** A scope is "broad" when it is a bare directory that likely covers a whole tree. */
+    const isBroad = (scope: string): boolean =>
+      scope.length > 0 && !scope.includes('.') && !/[*?]/.test(scope)
+
     const reach = new Map<string, Set<string>>()
     for (const task of tasks) {
       const seen = new Set<string>()
@@ -373,13 +502,29 @@ export class SwarmService extends Service {
     for (let i = 0; i < tasks.length; i++) {
       const a = tasks[i]!
       if (a.writes === undefined || a.writes.length === 0) continue
+      const aScopes = a.writes.map(norm)
       for (let j = i + 1; j < tasks.length; j++) {
         const b = tasks[j]!
         if (b.writes === undefined || b.writes.length === 0) continue
-        const shared = a.writes.find((f) => b.writes!.some((g) => g.toLowerCase() === f.toLowerCase()))
-        if (shared === undefined) continue
         if (reach.get(a.id)?.has(b.id) || reach.get(b.id)?.has(a.id)) continue
-        warnings.push(`tasks "${a.id}" and "${b.id}" may run concurrently and both declare write scope over "${shared}" — consider blockedBy or narrower scopes`)
+        const bScopes = b.writes.map(norm)
+        let emitted = false
+        for (const x of aScopes) {
+          for (const y of bScopes) {
+            if (x === y) {
+              warnings.push(`tasks "${a.id}" and "${b.id}" may run concurrently and both declare write scope over "${x}" — consider blockedBy or narrower scopes`)
+              emitted = true
+            } else if (isBroad(y) && encloses(y, x)) {
+              warnings.push(`task "${b.id}" claims the broad scope "${y}", which contains "${x}" owned by "${a.id}" — they may edit the same files concurrently; narrow the scope or serialise with blockedBy`)
+              emitted = true
+            } else if (isBroad(x) && encloses(x, y)) {
+              warnings.push(`task "${a.id}" claims the broad scope "${x}", which contains "${y}" owned by "${b.id}" — they may edit the same files concurrently; narrow the scope or serialise with blockedBy`)
+              emitted = true
+            }
+            if (emitted) break
+          }
+          if (emitted) break
+        }
         if (warnings.length >= 5) return warnings
       }
     }
@@ -539,13 +684,70 @@ export class SwarmService extends Service {
     this.releaseAnchor(runId)
   }
 
-  /** Heartbeat from a task agent, authenticated by its child session id. */
-  report(childAgentId: string, taskId: string, note: string): string {
+  /**
+   * J10 durable handoff: adopt a completed task report that survived a child death.
+   *
+   * A host restart can kill a child between finishing its work and the dispatcher
+   * recording it. Production showed exactly this: "Code landed on disk before the
+   * host restart; verified present in ..." for four tasks, and a reviewer report
+   * "written before the crash" — five completed deliverables were thrown away and
+   * the run reported failure. The child now writes `.dsh-swarm/task-<id>.json` as
+   * its final action; if that file is present and well-formed when the child dies,
+   * the work is real and is recorded as completed instead of failed.
+   *
+   * Returns the summary to record, or undefined when there is nothing to adopt.
+   */
+  private adoptTaskReport(runId: string, task: Task): string | undefined {
+    const cwd = this.view().runs.get(runId)?.dispatch?.cwd
+    if (cwd === undefined) return undefined
+    const reportPath = join(cwd, taskReportRelPath(task.id))
+    let raw: string
+    try {
+      const info = statSync(reportPath)
+      if (!info.isFile() || info.size === 0 || info.size > 256 * 1024) return undefined
+      raw = readFileSync(reportPath, 'utf8')
+    } catch {
+      return undefined
+    }
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return undefined
+    }
+    if (parsed === null || typeof parsed !== 'object') return undefined
+    const record = parsed as Record<string, unknown>
+    // Only an explicit completed status is proof; anything else is not adoption.
+    if (record.status !== 'completed') return undefined
+    if (typeof record.taskId === 'string' && record.taskId.length > 0 && record.taskId !== task.id) {
+      this.ctx.logger('swarm').warn('task report for %s declares a different taskId (%s) — ignoring', task.id, record.taskId)
+      return undefined
+    }
+    const summary = typeof record.summary === 'string' && record.summary.trim().length > 0
+      ? record.summary.trim()
+      : 'completed (recovered from the on-disk task report after the child died)'
+    this.ctx.logger('swarm').info('adopted on-disk task report for %s — the work outlived its agent', task.id)
+    return summary
+  }
+
+  /**
+   * Heartbeat from a task agent, authenticated by its child session id.
+   *
+   * The task is resolved FROM the authenticated session, so `taskId` is optional:
+   * requiring the model to pass it produced 33 `missing required property "taskId"`
+   * tool errors across production runs, all of which the service could answer for
+   * itself. A supplied id is still validated, so an agent can never report against
+   * a task it does not own.
+   */
+  report(childAgentId: string, taskId: string | undefined, note: string): string {
     const entry = this.sessionTasks.get(childAgentId)
     if (entry === undefined) throw new Error('this agent is not a tracked swarm task agent')
     const task = this.view().tasks.get(entry.taskKey)
-    if (task === undefined || task.id !== taskId) throw new Error(`task ${taskId} is not assigned to this agent`)
-    this.events.append('task/heartbeat', { runId: task.runId, taskId, data: { note } })
+    if (task === undefined) throw new Error('this agent has no task assigned (the task may have been reclaimed)')
+    if (taskId !== undefined && taskId.length > 0 && task.id !== taskId) {
+      throw new Error(`task ${taskId} is not assigned to this agent (this agent owns "${task.id}")`)
+    }
+    this.events.append('task/heartbeat', { runId: task.runId, taskId: task.id, data: { note } })
     return 'ok'
   }
 
@@ -642,13 +844,14 @@ export class SwarmService extends Service {
     }
     const effectiveRuntime = {
       maxConcurrent: this.rt('maxConcurrent'),
-      maxTotalConcurrentAgents: this.swarmConfig.maxTotalConcurrentAgents,
+      maxTotalConcurrentAgents: this.rt('maxTotalConcurrentAgents'),
       spawnStaggerMs: this.rt('spawnStaggerMs'),
       retryBackoffBaseMs: this.rt('retryBackoffBaseMs'),
       circuitBreakerThreshold: this.rt('circuitBreakerThreshold'),
       circuitBreakerCooldownMs: this.rt('circuitBreakerCooldownMs'),
       nudgeAfterMinutes: this.rt('nudgeAfterMinutes'),
       staleTimeoutSeconds: this.rt('staleTimeoutSeconds'),
+      spawnTimeoutSeconds: this.rt('spawnTimeoutSeconds'),
     }
     return buildBoardSnapshot(effective, this.duty.get(), this.events.seq, PLUGIN_VERSION, { cwd: scopeCwd, unresolvable: scopeUnresolvable }, effectiveRuntime)
   }
@@ -809,6 +1012,15 @@ export class SwarmService extends Service {
     const evidence = task.evidence
     if (evidence === undefined) return null
     const cwd = this.view().runs.get(task.runId)?.dispatch?.cwd ?? process.cwd()
+    // A command gate cannot be judged from a directory that does not exist: report
+    // that plainly instead of surfacing the shell's ENOENT as if the gate failed.
+    if ((evidence.commands ?? []).length > 0) {
+      try {
+        if (!statSync(cwd).isDirectory()) return `the run workspace "${cwd}" is not a directory`
+      } catch {
+        return `the run workspace "${cwd}" does not exist, so evidence commands cannot run`
+      }
+    }
     for (const file of evidence.files ?? []) {
       try {
         const info = statSync(join(cwd, file))
@@ -819,7 +1031,7 @@ export class SwarmService extends Service {
     }
     for (const command of evidence.commands ?? []) {
       try {
-        await execAsync(command, { cwd, timeout: 120_000 })
+        await runEvidenceCommand(command, cwd)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         return `evidence command failed: ${command} — ${message.slice(0, 300)}`
@@ -1002,7 +1214,7 @@ export class SwarmService extends Service {
       // its Node.js heap. Without a global cap, two concurrent runs × 5 agents
       // each = 10 heap-resident sessions → potential OOM crash. The cap is
       // shared across all runs: concurrent runs split the budget (3+2, not 5+5).
-      const globalCap = this.swarmConfig.maxTotalConcurrentAgents
+      const globalCap = this.rt('maxTotalConcurrentAgents')
       const globalRunning = this.countGlobalRunning()
       if (globalRunning + capacity > globalCap) {
         capacity = Math.max(0, globalCap - globalRunning)
@@ -1127,12 +1339,35 @@ export class SwarmService extends Service {
     const effort = this.resolveEffort(role, task.attempts + 1)
     const controller = new AbortController()
     const key = taskKeyOf(task)
+    const spawnTimeoutMs = this.rt('spawnTimeoutSeconds') * 1000
     this.inFlight.set(key, { controller, taskKey: key })
 
     const startSpawn = (): void => {
       const deps = this.spawnDeps()
+      // J8: a hard ceiling on the whole task run. The heartbeat watchdog only
+      // reclaims tasks in `running`, so a task whose child never publishes
+      // `agent-started` sits in `dispatching` holding its concurrency slot
+      // forever (observed: 14 tasks across 9 runs). This timeout is the only
+      // cover for that state. 0 disables.
+      const spawnSignal = new AbortController()
+      const onLaunchAbort = (): void => spawnSignal.abort()
+      let spawnTimer: ReturnType<typeof setTimeout> | undefined
+      if (spawnTimeoutMs > 0) {
+        spawnTimer = setTimeout(() => {
+          this.ctx.logger('swarm').warn('task %s exceeded the %ds spawn ceiling — aborting child', key, Math.round(spawnTimeoutMs / 1000))
+          spawnSignal.abort()
+        }, spawnTimeoutMs)
+        spawnTimer.unref?.()
+      }
+      controller.signal.addEventListener('abort', onLaunchAbort, { once: true })
+      if (controller.signal.aborted) spawnSignal.abort()
+      const clearSpawnTimeout = (): void => {
+        if (spawnTimer !== undefined) clearTimeout(spawnTimer)
+        controller.signal.removeEventListener('abort', onLaunchAbort)
+      }
       void this.ensureAnchor(runId).then(async (parent) => {
         if (parent === undefined) {
+          clearSpawnTimeout()
           this.inFlight.delete(key)
           this.events.append('task/failed', {
             runId, taskId: task.id,
@@ -1151,7 +1386,7 @@ export class SwarmService extends Service {
             .map((e) => String(e.data?.note))
           : undefined
         const outcome = await spawnTaskAgent(deps, {
-          parent, run, task, role, candidates, signal: controller.signal,
+          parent, run, task, role, candidates, signal: spawnSignal.signal,
           ...(role.toolFilter !== undefined ? { toolFilter: role.toolFilter } : {}),
           ...(priorNotes !== undefined && priorNotes.length > 0 ? { priorNotes } : {}),
           ...(task.evidence !== undefined ? { evidence: task.evidence } : {}),
@@ -1171,6 +1406,7 @@ export class SwarmService extends Service {
           },
         })
         this.inFlight.delete(key)
+        clearSpawnTimeout()
         if (outcome.childSessionId !== undefined) this.forgetChildSession(outcome.childSessionId)
         const fresh = this.view().tasks.get(key)
         if (fresh === undefined) return
@@ -1208,6 +1444,23 @@ export class SwarmService extends Service {
           }
         } else {
           const reason = outcome.reason ?? `stop: ${outcome.stopReason ?? 'unknown'}`
+          // J10: before charging a failure, check whether the child finished the
+          // work but died before the dispatcher could record it. A valid on-disk
+          // task report means the deliverable is real — adopt it instead of
+          // requeueing a task that has nothing left to do.
+          const adopted = this.adoptTaskReport(runId, task)
+          if (adopted !== undefined) {
+            this.events.append('task/completed', {
+              runId, taskId: task.id,
+              data: { summary: adopted },
+            })
+            if (task.reviewBy !== undefined && task.reviewBy.length > 0 && task.reviewGate !== 'human') {
+              void this.runReview(runId, task.id, task.reviewBy)
+            } else {
+              this.scheduleTick()
+            }
+            return
+          }
           const failureClass = classifyFailure(reason)
           if (failureClass !== 'other') this.shrinkConcurrency(runId)
           if (failureClass === 'quota') {
@@ -1239,9 +1492,20 @@ export class SwarmService extends Service {
         }
       }).catch((err: unknown) => {
         this.inFlight.delete(key)
+        clearSpawnTimeout()
         this.ctx.logger('swarm').warn('task %s crashed dispatcher bookkeeping: %s', key, String(err))
-      })
-    }
+        // J10: bookkeeping failed, but the child may have finished and written its
+        // report. Adopt it so a dispatcher fault does not discard finished work.
+        try {
+          const adopted = this.adoptTaskReport(runId, task)
+          if (adopted !== undefined && this.view().tasks.get(key)?.status === 'running') {
+            this.events.append('task/completed', { runId, taskId: task.id, data: { summary: adopted } })
+            this.scheduleTick()
+          }
+        } catch {
+          // Adoption is best-effort: never mask the original bookkeeping failure.
+        }
+      })    }
 
     this.events.append('task/started', {
       runId, taskId: task.id,

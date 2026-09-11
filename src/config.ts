@@ -2,7 +2,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-export const PLUGIN_VERSION = '0.5.7'
+export const PLUGIN_VERSION = '0.5.8'
 
 function defaultStorageDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -27,6 +27,8 @@ export interface SwarmConfig {
   retryBackoffBaseMs: number
   circuitBreakerThreshold: number
   circuitBreakerCooldownMs: number
+  spawnTimeoutSeconds: number
+  bootGraceSeconds: number
 }
 
 export const Config = Schema.object({
@@ -94,5 +96,18 @@ export const Config = Schema.object({
   ),
   circuitBreakerCooldownMs: Schema.number().default(60000).min(1000).max(600000).description(
     'How long the circuit breaker pauses retries before resuming (default 60 seconds).',
+  ),
+  spawnTimeoutSeconds: Schema.number().default(3600).min(0).max(86400).description(
+    'Hard ceiling on a single task-agent run (default 3600 = 1 hour). Guards the '
+    + "'dispatching' state, which the heartbeat watchdog cannot see: a task whose child "
+    + 'never publishes an agent-started event holds its concurrency slot indefinitely. '
+    + 'On expiry the child is aborted and the task is retried like any other failure. 0 disables.',
+  ),
+  bootGraceSeconds: Schema.number().default(3).min(3).max(3600).description(
+    'After plugin load, wait this long before running orphan recovery (default 3s), and use '
+    + 'the wait to let the subagents spawn provider mount. Recovery requeues tasks that were '
+    + 'running when the host died; a requeue that fires before the provider exists fails with '
+    + '"subagents service unavailable" and burns a retry for no reason. Raise this on a host '
+    + 'with a slow plugin tree.',
   ),
 })
