@@ -90,6 +90,15 @@ and 184 task failures, and each one has a regression test.
   now named in the dispatch warnings.
 - **`spawnTimeoutSeconds` is editable in the Runtime settings** section of the swarm
   settings, alongside the other hardening knobs.
+- **A single bad tool name in a role's `toolFilter` failed the entire run.** The host's
+  `tools.restrict()` **throws** on a name it does not expose, and that throw happens
+  during child creation — so an unknown name is not a per-task failure, it is a
+  run-wide outage. Observed in production: a filter naming `modlens` (the real tool is
+  `modlens_read_image`) failed **all 10 tasks across 3 waves** in 2 minutes and killed
+  the run. Unknown names are now dropped with a per-role warning, validated before the
+  child is created. An `allow` list that loses every entry is refused outright rather
+  than applied empty — an empty allow-list would permit everything, the opposite of the
+  operator's intent.
 - **Orphan recovery no longer kills a task this process is actively running.** This
   one was caught by the end-to-end smoke below, not by unit tests: recovery runs on a
   timer after boot, and in a one-shot/headless host the dispatching agent can have
@@ -107,12 +116,12 @@ and 184 task failures, and each one has a regression test.
 
 ### Verification
 
-- **74 tests pass** (was 58): new coverage for the orphan-recovery gate (terminal-run,
+- **82 tests pass** (was 58): new coverage for the orphan-recovery gate (terminal-run,
   live-task, and genuine-restart-orphan cases), the spawn ceiling (positive and
   `0`-disables), the evidence shell, the missing-workspace guard, durable adoption
   (adopt and refuse-to-adopt cases), the `swarm_report` binding, write-scope nesting,
-  the role `toolFilter` pass-through, and the delegation-depth bound (default, opt-out,
-  and rejection-surfaces-as-failure). **77 tests total.**
+  the role `toolFilter` pass-through and its name sanitisation, and the
+  delegation-depth bound (default, opt-out, and rejection-surfaces-as-failure).
 - **End-to-end smoke on a real host, twice.** The plugin was installed from source
   into an isolated DSH profile and driven by a live headless agent. The final run is
   fully green:

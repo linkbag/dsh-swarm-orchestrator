@@ -19,3 +19,10 @@
         staleTimeoutSeconds: 14400
         maxRetries: 2
         reviewLoops: 3
+        # Delegation-depth cap for task agents. 1 = a task agent may not spawn
+        # subagents at all; 2 = it may spawn helpers, but those helpers may not
+        # delegate further. Anything above 1 re-opens a dispatcher blind spot:
+        # descendants are NOT counted by maxTotalConcurrentAgents, not tracked by
+        # the watchdog, and not shown on the board, while still consuming host
+        # heap. Raise this only with that trade-off in mind.
+        maxSubagentDepth: 2

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import * as swarmPlugin from '../src/index.js'
-import { SwarmService } from '../src/service.js'
+import { SwarmService, sanitizeToolNames } from '../src/service.js'
 
 interface StartCall {
   label?: string
@@ -1569,6 +1569,47 @@ describe('swarm service (integration, fake subagents)', () => {
     service.setDutyTable(table, 'test')
     expect(service.duty.role('reviewer')?.toolFilter?.deny).toEqual(['modlens'])
   }, 15000)
+
+  // ── J15: an unknown toolFilter name must not fail the whole run ──────────
+  // Production: a role toolFilter naming "modlens" (the real tool is
+  // `modlens_read_image`) made tools.restrict() throw during child creation, so
+  // all 10 tasks failed across 3 waves and the run failed.
+  it('J15: unknown tool names are dropped and reported, not fatal', () => {
+    const known = new Set(['read', 'write', 'modlens_read_image', 'pwsh'])
+    const r = sanitizeToolNames({ deny: ['modlens', 'write'] }, known)
+    expect(r.filter?.deny).toEqual(['write'])
+    expect(r.dropped).toEqual(['modlens'])
+    expect(r.refusal).toBeUndefined()
+  })
+
+  it('J15: an allow-list that loses every name refuses the filter rather than widening access', () => {
+    const known = new Set(['read', 'write'])
+    const r = sanitizeToolNames({ allow: ['totally-bogus'] }, known)
+    // An empty allow-list would permit EVERYTHING — refuse instead of widening.
+    expect(r.filter).toBeUndefined()
+    expect(r.refusal).toMatch(/allow-list/)
+    expect(r.dropped).toEqual(['totally-bogus'])
+  })
+
+  it('J15: a partly-valid allow-list keeps the valid names', () => {
+    const known = new Set(['read', 'write'])
+    const r = sanitizeToolNames({ allow: ['read', 'nope'] }, known)
+    expect(r.filter?.allow).toEqual(['read'])
+    expect(r.dropped).toEqual(['nope'])
+  })
+
+  it('J15: an unverifiable registry passes the filter through untouched', () => {
+    // Without a readable registry we must not silently strip a legitimate filter.
+    const r = sanitizeToolNames({ deny: ['anything'] }, undefined)
+    expect(r.filter?.deny).toEqual(['anything'])
+    expect(r.dropped).toEqual([])
+  })
+
+  it('J15: no filter means no work', () => {
+    const r = sanitizeToolNames(undefined, new Set(['read']))
+    expect(r.filter).toBeUndefined()
+    expect(r.dropped).toEqual([])
+  })
 
   // ── J14: task agents must not spawn invisible descendants ────────────────
   // Production evidence: the `vhp-cryo-embed` task spawned 12 DSH subagents in

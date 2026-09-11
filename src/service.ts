@@ -25,6 +25,48 @@ const execAsync = promisify(exec)
 const execFileAsync = promisify(execFile)
 
 /**
+ * J15: drop tool names a host does not expose from a role's toolFilter.
+ *
+ * `tools.restrict()` throws on an unknown name, and that throw happens during
+ * child creation — so one typo in a role's toolFilter fails EVERY task agent in
+ * the run rather than the single task it was meant to constrain. Production hit
+ * this with a filter naming "modlens" when the tool is really
+ * `modlens_read_image`: 10/10 tasks failed across 3 waves and the whole run died.
+ *
+ * A configuration typo must be a warning, not an outage. Pure so the policy is
+ * directly testable.
+ *
+ * An `allow` list that loses every entry is refused outright: an empty allow-list
+ * would permit everything, which is the opposite of the operator's intent.
+ */
+export function sanitizeToolNames(
+  requested: { deny?: string[]; allow?: string[] } | undefined,
+  known: ReadonlySet<string> | undefined,
+): { filter?: { deny?: string[]; allow?: string[] }; dropped: string[]; refusal?: string } {
+  if (requested === undefined) return { dropped: [] }
+  // Without a readable registry we cannot verify: pass the request through.
+  if (known === undefined) return { filter: requested, dropped: [] }
+  const dropped: string[] = []
+  const keep = (names: string[] | undefined): string[] | undefined => {
+    if (names === undefined) return undefined
+    const valid: string[] = []
+    for (const name of names) {
+      if (known.has(name)) valid.push(name)
+      else dropped.push(name)
+    }
+    return valid.length > 0 ? valid : undefined
+  }
+  const deny = keep(requested.deny)
+  const allow = keep(requested.allow)
+  if (requested.allow !== undefined && requested.allow.length > 0 && allow === undefined) {
+    return { dropped, refusal: 'allow-list has no valid tool names; the whole filter was ignored rather than widened' }
+  }
+  const filter = { ...(deny !== undefined ? { deny } : {}), ...(allow !== undefined ? { allow } : {}) }
+  if (deny === undefined && allow === undefined) return { dropped }
+  return { filter, dropped }
+}
+
+/**
  * Run one evidence command under the resolved interpreter.
  *
  * `child_process.exec` builds `<shell> -c <command>`, and on Windows it rejects an
@@ -963,6 +1005,49 @@ export class SwarmService extends Service {
     return chain
   }
 
+  /**
+   * J15: validate a role's toolFilter against the tool names this host actually
+   * exposes, dropping unknowns instead of letting `tools.restrict()` throw.
+   *
+   * The throw happens inside child creation, so an unknown name is not a
+   * per-task failure — it fails the entire run at spawn. Production hit this
+   * with a filter naming "modlens" when the tool is `modlens_read_image`:
+   * 10/10 tasks failed across 3 waves. A configuration typo must be a warning.
+   *
+   * Returns the filter to apply, or undefined when nothing valid remains.
+   */
+  private sanitizeToolFilter(role: RoleConfig): { deny?: string[]; allow?: string[] } | undefined {
+    const requested = role.toolFilter
+    if (requested === undefined) return undefined
+    const { filter, dropped, refusal } = sanitizeToolNames(requested, this.restrictableToolNames())
+    for (const name of dropped) {
+      this.ctx.logger('swarm').warn(
+        'role %s toolFilter names unknown tool "%s" — dropped (this host does not expose it)',
+        role.id, name,
+      )
+    }
+    if (refusal !== undefined) this.ctx.logger('swarm').warn('role %s toolFilter refused: %s', role.id, refusal)
+    return filter
+  }
+
+  /** Best-effort read of the host's restrictable global tool names. */
+  private restrictableToolNames(): Set<string> | undefined {
+    try {
+      const tools = this.ctx.get('tools') as unknown as
+        | { restrictableNames?: Set<string>; view?: (scope?: unknown) => { restrictableNames?: Set<string> } }
+        | undefined
+      if (tools === undefined) return undefined
+      const direct = tools.restrictableNames
+      if (direct instanceof Set) return direct as Set<string>
+      const view = tools.view?.()
+      const fromView = view?.restrictableNames
+      if (fromView instanceof Set) return fromView as Set<string>
+      return undefined
+    } catch {
+      return undefined
+    }
+  }
+
   /** Dispose a run's anchor once the run reaches a terminal status. */
   private releaseAnchor(runId: string): void {
     const handle = this.runAnchors.get(runId)
@@ -1392,12 +1477,19 @@ export class SwarmService extends Service {
             .slice(-6)
             .map((e) => String(e.data?.note))
           : undefined
+        // J15: drop tool names this host does not actually expose. `tools.restrict()`
+        // THROWS on an unknown name, and that throw happens during child creation, so
+        // one typo in a role's toolFilter fails EVERY task agent in the run. That is
+        // exactly what happened in production: a filter naming "modlens" (the tool is
+        // really `modlens_read_image`) took out all 10 tasks across 3 waves and failed
+        // the whole run. A bad name is now a warning on that role, not an outage.
+        const roleFilter = this.sanitizeToolFilter(role)
         const outcome = await spawnTaskAgent(deps, {
           parent, run, task, role, candidates, signal: spawnSignal.signal,
           // J14: bound delegation depth so task agents cannot spawn hidden
           // descendants the dispatcher cannot see or account for.
           ...(this.swarmConfig.maxSubagentDepth > 0 ? { maxDepth: this.swarmConfig.maxSubagentDepth } : {}),
-          ...(role.toolFilter !== undefined ? { toolFilter: role.toolFilter } : {}),
+          ...(roleFilter !== undefined ? { toolFilter: roleFilter } : {}),
           ...(priorNotes !== undefined && priorNotes.length > 0 ? { priorNotes } : {}),
           ...(task.evidence !== undefined ? { evidence: task.evidence } : {}),
           onFallback: (failed, next) => {
