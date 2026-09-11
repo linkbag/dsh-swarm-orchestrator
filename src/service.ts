@@ -1017,16 +1017,26 @@ export class SwarmService extends Service {
    * Returns the filter to apply, or undefined when nothing valid remains.
    */
   private sanitizeToolFilter(role: RoleConfig): { deny?: string[]; allow?: string[] } | undefined {
+    return this.toolFilterFor(role.id)
+  }
+
+  /**
+   * J15: the toolFilter actually applied for a role, resolved against the host's
+   * real tool names. Returns undefined when nothing valid remains.
+   */
+  toolFilterFor(roleId: string): { deny?: string[]; allow?: string[] } | undefined {
+    const role = this.duty.role(roleId)
+    if (role === undefined) return undefined
     const requested = role.toolFilter
     if (requested === undefined) return undefined
     const { filter, dropped, refusal } = sanitizeToolNames(requested, this.restrictableToolNames())
     for (const name of dropped) {
       this.ctx.logger('swarm').warn(
         'role %s toolFilter names unknown tool "%s" — dropped (this host does not expose it)',
-        role.id, name,
+        roleId, name,
       )
     }
-    if (refusal !== undefined) this.ctx.logger('swarm').warn('role %s toolFilter refused: %s', role.id, refusal)
+    if (refusal !== undefined) this.ctx.logger('swarm').warn('role %s toolFilter refused: %s', roleId, refusal)
     return filter
   }
 

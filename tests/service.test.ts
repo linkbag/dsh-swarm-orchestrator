@@ -1611,6 +1611,69 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(r.dropped).toEqual([])
   })
 
+  it('J15 END-TO-END: the exact production misconfiguration no longer kills the run', async () => {
+    // Reproduces run-mtxidssw-4bky, which failed 10/10 tasks in 3 waves because a
+    // role toolFilter named "modlens" while the real tool is `modlens_read_image`.
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    // The host's real tool registry, including the correctly-named tool.
+    const KNOWN = ['ask_user_question', 'edit', 'glob', 'grep', 'modlens_read_image',
+      'pwsh', 'read', 'read_image', 'skill', 'subagent', 'swarm_report', 'write']
+    ctx.reflect.provide('tools', { restrictableNames: new Set(KNOWN) } as never)
+
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3', toolFilter: { deny: ['modlens'] } }
+    service.setDutyTable(table, 'test')
+
+    // The bad name is sanitised away rather than passed through to restrict().
+    expect(service.toolFilterFor('builder')).toBeUndefined()
+
+    const result = service.dispatch({
+      title: 'production misconfig',
+      spec: 's',
+      tasks: [{ id: 'p1', subject: 'P', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    // Before the fix this threw during child creation and failed every task.
+    await waitFor(
+      () => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed',
+      8000,
+      'run survived the bad tool name',
+      () => 'tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, String(t.lastNote ?? '').slice(0, 70)])),
+    )
+    expect(fake.calls.length).toBeGreaterThan(0)
+    expect((fake.calls[0] as unknown as { toolFilter?: unknown }).toolFilter).toBeUndefined()
+  }, 15000)
+
+  it('J15 END-TO-END: a valid tool name still reaches the spawn provider', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    ctx.reflect.provide('tools', { restrictableNames: new Set(['read', 'write', 'modlens_read_image']) } as never)
+
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = {
+      ...table.roles.builder, provider: 'zai', model: 'glm-5.3',
+      toolFilter: { deny: ['modlens_read_image', 'typo'] },
+    }
+    service.setDutyTable(table, 'test')
+
+    const result = service.dispatch({
+      title: 'valid name survives',
+      spec: 's',
+      tasks: [{ id: 'p2', subject: 'P', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 5000, 'spawn')
+    const sent = (fake.calls[0] as unknown as { toolFilter?: { deny?: string[] } }).toolFilter
+    expect(sent?.deny).toEqual(['modlens_read_image'])
+    service.abort(result.runId)
+  }, 15000)
+
   // ── J14: task agents must not spawn invisible descendants ────────────────
   // Production evidence: the `vhp-cryo-embed` task spawned 12 DSH subagents in
   // 42 minutes while the orchestrator saw exactly one task; a separate chain
