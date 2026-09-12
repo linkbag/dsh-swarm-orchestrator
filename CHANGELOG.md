@@ -2,6 +2,47 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.2
+
+Packaging and theme release.
+
+### Fixed
+
+- **The client bundle is now rebuilt with the theme change.** `client/swarm.css` was
+  updated in `24e4320`, but `lib/client.js` was still the previous evening's build, so
+  the browser kept loading the **old hardcoded dark fills**
+  (`rgba(20, 22, 26, 0.82–0.97)`) and the theme fix was invisible however often the page
+  was refreshed. Every claim around it was individually true — committed, pushed,
+  served — and the UI was still wrong, because the served artifact was stale. `lib/` is
+  gitignored and built on demand, so "pushed" does not imply "rebuilt".
+  `tests/bundle-freshness.test.ts` now fails when any file under `client/` is newer than
+  `lib/client.js`, and when a hardcoded dark fill reappears in the built bundle.
+
+### Added
+
+- **Card and flow-node fills are neutral semi-transparent tints** that adapt to the DSH
+  light/dark/system theme (`var(--dsh-swarm-card, rgba(128,128,128,0.07))` with
+  `color: inherit`), replacing the opaque dark boxes that were unreadable on a light
+  theme.
+
+## 0.6.1
+
+- Version bump only (no behaviour change).
+
+## 0.6.0
+
+- **Higher concurrency defaults**: `maxConcurrent` 5 → 10, `maxTotalConcurrentAgents`
+  5 → 20. Both remain runtime-tunable from the dashboard.
+- **Schema fix**: `maxTotalConcurrentAgents`'s own maximum was 16 while the new default
+  was 20, so the config schema rejected its own default. The bound is now 64.
+- Evidence `files` entries became **advisory warnings** rather than hard gate failures,
+  and the board carries success-rate telemetry.
+
+## 0.5.9
+
+- Documented the Runtime tuning section (EN + ZH) — concurrency and hardening
+  parameters are editable from the dashboard and applied live.
+
 ## 0.5.8
 
 Reliability release. Every fix below came out of diagnosing 47 recorded swarm runs
