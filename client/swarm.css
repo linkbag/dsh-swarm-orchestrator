@@ -144,7 +144,7 @@
   padding: 9px 10px;
   border-radius: 8px;
   border: 1px solid rgba(125, 125, 125, 0.25);
-  background: var(--dsh-swarm-card, rgba(20, 22, 26, 0.35));
+  background: var(--dsh-swarm-card, rgba(128, 128, 128, 0.07));
   color: inherit;
   font: inherit;
   cursor: pointer;
@@ -199,7 +199,7 @@
   border-radius: 10px;
   padding: 12px;
   display: flex; flex-direction: column; gap: 10px;
-  background: var(--dsh-swarm-card, rgba(20, 22, 26, 0.35));
+  background: var(--dsh-swarm-card, rgba(128, 128, 128, 0.07));
 }
 .dsh-swarm-role-card header { display: flex; justify-content: space-between; align-items: center; }
 .dsh-swarm-role-card h4 { margin: 0; font-size: 13px; }
@@ -282,7 +282,7 @@
   gap: 2px;
   border: 1px solid rgba(125, 125, 125, 0.45);
   border-radius: 10px;
-  background: var(--dsh-swarm-node-bg, rgba(20, 22, 26, 0.88));
+  background: var(--dsh-swarm-node-bg, var(--dsh-surface-primary, rgba(128, 128, 128, 0.08)));
   padding: 6px 10px;
   font-size: 12px;
   overflow: hidden;
@@ -307,8 +307,8 @@
   padding: 2px 10px;
   border-radius: 999px;
   border: 1px solid rgba(125, 125, 125, 0.3);
-  background: rgba(20, 22, 26, 0.85);
-  color: rgba(232, 232, 232, 0.85);
+  background: var(--dsh-surface-primary, rgba(128, 128, 128, 0.08));
+  
 }
 .dsh-swarm-flow-edges { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 0; }
 .dsh-swarm-flow-edge { fill: none; stroke: rgba(125, 125, 125, 0.5); stroke-width: 1.5; }
@@ -326,7 +326,7 @@
   padding: 3px 9px;
   border-radius: 999px;
   border: 1px solid rgba(125, 125, 125, 0.35);
-  background: rgba(20, 22, 26, 0.82);
+  background: var(--dsh-surface-primary, rgba(128, 128, 128, 0.08));
   color: #e8e8e8;
   pointer-events: none;
   max-width: 300px;
@@ -346,7 +346,7 @@
 .dsh-swarm-hpop {
   position: absolute; right: 0; top: calc(100% + 6px);
   z-index: 9999; width: 320px;
-  background: rgba(20, 22, 26, 0.97); color: #e8e8e8;
+  background: var(--dsh-surface-primary, rgba(128, 128, 128, 0.08)); color: inherit;
   border: 1px solid rgba(125, 125, 125, 0.35); border-radius: 10px;
   padding: 10px 12px; font-size: 12.5px;
   display: flex; flex-direction: column; gap: 4px;
