@@ -38,7 +38,10 @@
        📄 run report          ▸ 各任务总结 · 所用模型 · 统计
 ```
 
-<img width="881" height="467" alt="image" src="https://github.com/user-attachments/assets/5069470f-35b5-4f70-bfe8-37235f918ee6" />
+## 看板流程实时监测示例
+
+<img width="1059" height="475" alt="image" src="https://github.com/user-attachments/assets/f52b26ae-2c24-49d0-b713-1b584f92c043" />
+
 
 ## 为什么不只问一个 Agent
 
