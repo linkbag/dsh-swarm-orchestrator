@@ -21,7 +21,6 @@ It has already shipped real work: the first production run reverse-engineered a 
    your chat agent            (free to plan/research on its own —
          │  swarm_dispatch     its plan becomes the proposal)
          ▼
-         ▼
   ┌─────────────────┐
   │ architect-review │  deep-reviews the proposal against the repo,
   │  → PLAN.md       │  consolidates parallel workstreams (evidence-checked)
@@ -50,7 +49,7 @@ This plugin takes the coordination seriously so you don't have to:
 - **Review before "done" means done.** Tasks tagged `reviewBy` are judged by a reviewer agent against the task brief; a rejection loops back to the builder with the feedback attached. Want the last word yourself? Set `reviewGate: "human"` and approve from the dashboard.
 - **Failure is a state, not a mystery.** Provider timeouts, quota exhaustion, bad evidence — each is detected, reported plainly, and handled: retries with resume hints, run pause/resume instead of burn-down, automatic model rotation after repeated failures.
 - **Scoped to where you are.** Each chat's Swarm tab shows the runs for that chat's workspace; a persisted switch reveals everything on the machine when you want the full picture.
-- **One run per goal, reviewed before built.** Dispatching into a workspace with an active run raises a warning (or a block, your choice); and unless you opt out, an architect agent reviews the dispatcher''s plan into PLAN.md before any builder starts.
+- **One run per goal, reviewed before built.** Dispatching into a workspace with an active run raises a warning (or a block, your choice); and unless you opt out, an architect agent reviews the dispatcher's plan into PLAN.md before any builder starts.
 - **Memory-safe concurrency.** Swarm agents run in-process on the DSH host, sharing its Node.js heap. A global cap (`maxTotalConcurrentAgents`, default 5) ensures concurrent runs from different workspaces share the agent budget (3+2, not 5+5) — preventing the heap exhaustion that can crash the host when too many agents run simultaneously.
 - **Work outlives its agent.** Every task agent writes a small completion report as its final action. If the host restarts and kills an agent between finishing the work and being recorded, the dispatcher adopts the on-disk report instead of throwing the finished work away and re-running the task. A task can also never sit `dispatching` forever: `spawnTimeoutSeconds` is a hard ceiling the heartbeat watchdog cannot provide.
 - **Every agent stays on the board.** A task agent cannot spawn subagents of its own (`maxSubagentDepth`, default 1). Without that bound an agent could delegate to helpers the dispatcher cannot see or account for — not counted by the global cap, not tracked by the watchdog, not shown on the board, yet all sharing the host heap. Measured on a real machine: one task spawned 12 such hidden helpers while the board showed a single task.
@@ -81,6 +80,11 @@ A **Swarm** tab lives next to Chat in the web GUI, in three views:
 1. **Dispatch** — tell your agent what you want; it calls `swarm_dispatch` with a task graph. Runs start gated: *planning*, zero agents spawned.
 2. **Execute** — the architect reviews the proposal and produces `PLAN.md`; then parallel builders start.
 3. **Watch** — **Board** shows the kanban; **Flow** shows the workflow chart; click any task for its drawer.
+
+## Getting started (~5 minutes)
+
+### 1 · Install
+
 From this GitHub repo (pnpm will run the package's `prepare` script to build from source):
 
 ```sh
@@ -167,6 +171,8 @@ or the one-shot form: `/swarm build a landing page for this project` (plans it, 
 | `swarm_status` | The board in text: runs, task states, models in use, latest notes. |
 | `swarm_wait` | Block until the board changes or a timeout hits — supervision without sleep-polling. |
 | `swarm_retry` | Requeue a failed/blocked task after you've fixed the cause (dispatching session only). |
+| `swarm_interrupt` | Abort a stalled/running task and requeue it in the same run — no relief sibling needed (dispatching session only). |
+| `swarm_complete` | Mark a task completed when its work was finished outside the swarm (dispatching session only) — keeps the run record in sync with reality. |
 | `swarm_report` | Task agents post interim notes to the board (authenticated to their own task). |
 
 Tasks also accept an **evidence contract** — `evidence: { files: [...], commands: [...] }` — that is machine-checked before a task may close; a **write scope** — `writes: [files]` — that keeps concurrent builders out of each other's files (the dispatcher warns on overlap); and a **human review gate** that parks the verdict on the dashboard.
@@ -189,6 +195,11 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
     staleTimeoutSeconds: 14400  # watchdog: silent agents get reclaimed
     maxRetries: 2               # per task
     reviewLoops: 3              # review rejections per task
+    notifyDispatchSession: true  # push completion notification to the dispatching chat
+    retryBackoffBaseMs: 5000    # retry backoff: base × 2^attempt before retrying
+    circuitBreakerThreshold: 3  # failures in 30s before pausing all retries (0 = off)
+    circuitBreakerCooldownMs: 60000  # circuit breaker pause duration
+    maxTotalConcurrentAgents: 5 # global cap on concurrent agents across ALL runs
 ```
 
 ## Runtime control
@@ -219,7 +230,7 @@ Changes are **applied immediately** (no restart) and **persisted to `runtime.jso
 
 ## Status
 
-v0.5.0, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (45 tests: dispatch, review loops, human gates, fallback rotation, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality), plus live verification on a real deployment.
+v0.5.9, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (88 tests: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment), plus live verification on a real deployment.
 
 ## License
 

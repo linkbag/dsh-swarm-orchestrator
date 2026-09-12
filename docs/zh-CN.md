@@ -171,7 +171,9 @@ dsh plugin --profile web add dsh-swarm-orchestrator
 | `swarm_dispatch` | 提交运行：标题、目标、任务图（id / subject / description / role / blockedBy / reviewBy / reviewGate / model / evidence / writes）。 |
 | `swarm_status` | 文字版看板：运行、任务状态、所用模型、最新备注。 |
 | `swarm_wait` | 阻塞等待看板变化或超时——监督运行不再需要 sleep 轮询。 |
-| `swarm_retry` | 排障之后重新入队失败/阻塞的任务（限派发会话）。 |
+| swarm_retry | 排障之后重新入队失败/阻塞的任务（限派发会话）。 |
+| swarm_interrupt | 中断一个停滞/失控的蜂群任务：中止其子代理并在同一运行内重新入队——无需另起救援运行（限派发会话）。 |
+| swarm_complete | 当工作在蜂群外部完成时（如救援子代理或直接编辑），将任务标记为已完成——保持运行记录与现实同步（限派发会话）。 |
 | `swarm_report` | 任务代理向看板发送过程备注（按任务鉴权）。 |
 
 任务还支持**证据合约**——`evidence: { files: [...], commands: [...] }`，机器校验通过任务才算关闭；**写入范围**——`writes: [files]`，并发建造者互不越界（调度器会对重叠范围给出警告）；以及**人工评审门**，裁决权交还看板。
@@ -194,6 +196,11 @@ dsh plugin --profile web add dsh-swarm-orchestrator
     staleTimeoutSeconds: 14400  # 看门狗：静默任务被回收
     maxRetries: 2               # 每个任务的重试次数
     reviewLoops: 3              # 每个任务的评审驳回上限
+    notifyDispatchSession: true  # 运行结束时向派发聊天推送完成通知
+    retryBackoffBaseMs: 5000    # 重试退避基础间隔（毫秒）
+    circuitBreakerThreshold: 3  # 熔断器阈值：30 秒内此数量的失败将暂停所有重试
+    circuitBreakerCooldownMs: 60000  # 熔断器暂停持续时间
+    maxTotalConcurrentAgents: 5 # 所有运行的总代理数上限
 ```
 
 ## 运行时调优
@@ -224,7 +231,7 @@ dsh plugin --profile web add dsh-swarm-orchestrator
 
 ## 状态
 
-v0.5.0，日常使用中。测试覆盖调度器对假 spawn provider 的端到端行为（45 个用例：派发、放行、评审循环、人工评审门、模型回退轮换、配额暂停/恢复、救援路径、证据合约、写入范围警告、事件日志合法性），并已在真实部署上完成在线验证。
+v0.5.9，日常使用中。测试覆盖调度器对假 spawn provider 的端到端行为（88 个用例：派发、放行、评审循环、人工评审门、模型回退轮换、配额暂停/恢复、救援路径、证据合约、写入范围警告、事件日志合法性），并已在真实部署上完成在线验证。
 
 ## 许可证
 
