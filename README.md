@@ -38,7 +38,7 @@ It has already shipped real work: the first production run reverse-engineered a 
        📄 run report          ▸ per-task summaries · models used · stats
 ```
 
-## Kanban view (real-time workflow)
+## Example Kanban View (real-time workflow)
 
 <img width="1045" height="507" alt="image" src="https://github.com/user-attachments/assets/ab727b4a-c75a-41fe-be3c-3f68e9499c88" />
 
