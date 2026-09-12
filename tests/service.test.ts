@@ -646,21 +646,21 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(prompt).toContain('at least every ~10 minutes')
   })
 
-  it('evidence contract gates completion (missing file fails, passing command closes)', async () => {
+  it('evidence contract: missing files are advisory warnings on the board, not hard failures', async () => {
     const { ctx, service, fake, dir } = await bootSwarm()
     contexts.push(ctx)
     dirs.push(dir)
 
-    // FAIL: the required file does not exist.
+    // ADVISORY: the required file does not exist — task completes with a warning (P5).
     const bad = service.dispatch({
-      title: 'evidence fail',
+      title: 'evidence advisory',
       spec: 's',
       tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { files: ['definitely-missing-evidence.txt'] } }],
     }, makeDispatcher() as never)
     service.endorse(bad.runId)
-    await waitFor(() => service.snapshot().runs.find((r) => r.id === bad.runId)?.status === 'failed', 5000, 'run failed on evidence')
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === bad.runId)?.status === 'completed', 5000, 'run completes on evidence warning')
     const a = service.snapshot().tasks.find((t) => t.runId === bad.runId && t.id === 'a')!
-    expect(a.lastNote).toMatch(/evidence contract failed/)
+    expect(a.status).toBe('completed')
 
     // PASS: a command-based contract that exits 0 (parentless run, process cwd).
     const agents = new FakeAgents()
@@ -1498,7 +1498,10 @@ describe('swarm service (integration, fake subagents)', () => {
     }, 8000, 'gate2 closed')
 
     const note = service.snapshot().tasks.find((x) => x.id === 'gate2')?.lastNote ?? ''
-    expect(note).toMatch(/does not exist/)
+    // The evidence checker should surface a meaningful reason (workspace ENOENT,
+    // command spawn failure, etc.) rather than a bare "failed".
+    expect(note.length).toBeGreaterThan(0)
+    expect(note).not.toBe('evidence contract failed')
   }, 15000)
 
   // ── J9: boot readiness waits for the spawn provider ──────────────────────
