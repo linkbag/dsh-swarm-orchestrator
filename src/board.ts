@@ -16,6 +16,8 @@ export interface BoardSnapshot {
   scope?: { cwd?: string; unresolvable?: boolean }
   /** Effective runtime parameters (YAML merged with dashboard overrides). */
   runtime?: RuntimeOverrides & Record<string, number>
+  /** P6: rolling success-rate telemetry. */
+  telemetry?: { completed: number; failed: number; successRate: number }
 }
 
 const MAX_RUNS = 50
@@ -31,6 +33,11 @@ export function buildBoardSnapshot(
   const runs = [...state.runs.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_RUNS)
   const runIds = new Set(runs.map((run) => run.id))
   const tasks = [...state.tasks.values()].filter((task) => runIds.has(task.runId))
+  const terminal = runs.filter((r) => r.status === 'completed' || r.status === 'failed')
+  const completed = terminal.filter((r) => r.status === 'completed').length
+  const telemetry = terminal.length > 0
+    ? { completed, failed: terminal.length - completed, successRate: Math.round(completed / terminal.length * 100) }
+    : undefined
   return {
     service: 'dsh-swarm-orchestrator',
     version,
@@ -41,6 +48,7 @@ export function buildBoardSnapshot(
     ...(duty.override !== undefined ? { override: duty.override } : {}),
     ...(scope !== undefined && (scope.cwd !== undefined || scope.unresolvable === true) ? { scope } : {}),
     ...(runtime !== undefined ? { runtime } : {}),
+    ...(telemetry !== undefined ? { telemetry } : {}),
     at: Date.now(),
   }
 }

@@ -201,6 +201,7 @@ export interface SpawnDeps {
     persona?: string
     toolFilter?: { deny?: string[]; allow?: string[] }
     maxDepth?: number
+    evidenceWarnings?: string[]
   }): Promise<{
     id: string
     result: Promise<{

@@ -1109,26 +1109,18 @@ export class SwarmService extends Service {
     return chain[Math.min(Math.max(0, attemptNumber - 1), chain.length - 1)]
   }
 
-  /** J2: machine-check the evidence contract; null = pass, otherwise the first failure. */
-  private async checkEvidence(task: Task): Promise<string | null> {
+  /** J2/P5: machine-check the evidence contract. Returns file warnings (advisory) and command failures (hard). */
+  private async checkEvidence(task: Task): Promise<{ fileWarnings: string[]; commandFailures: string[] }> {
+    const result = { fileWarnings: [] as string[], commandFailures: [] as string[] }
     const evidence = task.evidence
-    if (evidence === undefined) return null
+    if (evidence === undefined) return result
     const cwd = this.view().runs.get(task.runId)?.dispatch?.cwd ?? process.cwd()
-    // A command gate cannot be judged from a directory that does not exist: report
-    // that plainly instead of surfacing the shell's ENOENT as if the gate failed.
-    if ((evidence.commands ?? []).length > 0) {
-      try {
-        if (!statSync(cwd).isDirectory()) return `the run workspace "${cwd}" is not a directory`
-      } catch {
-        return `the run workspace "${cwd}" does not exist, so evidence commands cannot run`
-      }
-    }
     for (const file of evidence.files ?? []) {
       try {
         const info = statSync(join(cwd, file))
-        if (!info.isFile() || info.size === 0) return `required file "${file}" is missing or empty`
+        if (!info.isFile() || info.size === 0) result.fileWarnings.push(`required file "${file}" is missing or empty`)
       } catch {
-        return `required file "${file}" is missing or empty`
+        result.fileWarnings.push(`required file "${file}" is missing or empty`)
       }
     }
     for (const command of evidence.commands ?? []) {
@@ -1136,10 +1128,10 @@ export class SwarmService extends Service {
         await runEvidenceCommand(command, cwd)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        return `evidence command failed: ${command} — ${message.slice(0, 300)}`
+        result.commandFailures.push(`evidence command failed: ${command} — ${message.slice(0, 300)}`)
       }
     }
-    return null
+    return result
   }
 
   /** A3: stop launching, abort in-flight children, and park the run for a human resume. */
@@ -1542,18 +1534,25 @@ export class SwarmService extends Service {
         if (fresh.status !== 'running' && fresh.status !== 'dispatching') return
         if (outcome.ok) {
           this.growConcurrency(runId)
-          // J2: the evidence contract gates completion.
+          // J2/P5: the evidence contract gates completion. File warnings are advisory
+          // (surfaced on the board for the reviewer); command failures are hard.
           if (task.evidence !== undefined) {
-            const evidenceFailure = await this.checkEvidence(task)
-            if (evidenceFailure !== null) {
+            const evidence = await this.checkEvidence(task)
+            if (evidence.commandFailures.length > 0) {
               this.events.append('task/failed', {
                 runId, taskId: task.id,
                 data: {
                   retry: fresh.attempts <= this.swarmConfig.maxRetries,
-                  reason: `evidence contract failed — ${evidenceFailure}`,
+                  reason: `evidence contract failed — ${evidence.commandFailures[0]}`,
                 },
               })
               return
+            }
+            if (evidence.fileWarnings.length > 0) {
+              this.events.append('task/heartbeat', {
+                runId, taskId: task.id,
+                data: { note: `⚠ evidence warning: ${evidence.fileWarnings[0]}` },
+              })
             }
           }
           this.events.append('task/completed', {
