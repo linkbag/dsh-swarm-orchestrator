@@ -38,6 +38,8 @@ It has already shipped real work: the first production run reverse-engineered a 
        📄 run report          ▸ per-task summaries · models used · stats
 ```
 
+<img width="881" height="467" alt="image" src="https://github.com/user-attachments/assets/22a61d74-21e1-48bc-9aaa-f611a40e9209" />
+
 ## Why not just ask one agent?
 
 Because one agent serializes. Long research tasks queue behind quick edits, context fills up, quality drifts, and nothing checks the output but the same model that wrote it.
