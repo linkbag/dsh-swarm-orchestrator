@@ -38,6 +38,8 @@
        📄 run report          ▸ 各任务总结 · 所用模型 · 统计
 ```
 
+<img width="881" height="467" alt="image" src="https://github.com/user-attachments/assets/5069470f-35b5-4f70-bfe8-37235f918ee6" />
+
 ## 为什么不只问一个 Agent
 
 单个 Agent 是串行的：耗时的调研排在琐碎修改后面排队，上下文越填越满，质量随之下滑，而且检查输出的还是写输出的那个模型。
