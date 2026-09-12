@@ -2,7 +2,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-export const PLUGIN_VERSION = '0.5.9'
+export const PLUGIN_VERSION = '0.6.0'
 
 function defaultStorageDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -36,10 +36,10 @@ export const Config = Schema.object({
   storageDir: Schema.string().default(defaultStorageDir()).description(
     'Directory for the swarm event log and duty table ($DSH_HOME/storages/swarm by default).',
   ),
-  maxConcurrent: Schema.number().default(5).min(1).max(32).description(
+  maxConcurrent: Schema.number().default(10).min(1).max(32).description(
     'Maximum simultaneously running task agents.',
   ),
-  maxTotalConcurrentAgents: Schema.number().default(5).min(1).max(16).description(
+  maxTotalConcurrentAgents: Schema.number().default(20).min(1).max(16).description(
     'Global cap on concurrently running swarm agents across ALL runs (default 5). '
     + 'Swarm agents run IN-PROCESS on the DSH host, sharing its Node.js heap — '
     + 'too many concurrent agents can exhaust memory and crash the host. '
