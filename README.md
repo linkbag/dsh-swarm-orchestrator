@@ -38,7 +38,9 @@ It has already shipped real work: the first production run reverse-engineered a 
        📄 run report          ▸ per-task summaries · models used · stats
 ```
 
-<img width="881" height="467" alt="image" src="https://github.com/user-attachments/assets/22a61d74-21e1-48bc-9aaa-f611a40e9209" />
+## Kanban view (real-time workflow)
+
+<img width="1045" height="507" alt="image" src="https://github.com/user-attachments/assets/ab727b4a-c75a-41fe-be3c-3f68e9499c88" />
 
 ## Why not just ask one agent?
 
