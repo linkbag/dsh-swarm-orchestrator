@@ -5,7 +5,7 @@ import { Config, type SwarmConfig } from '../src/config.js'
 describe('config schema', () => {
   it('parses defaults for an empty config', () => {
     const parsed = Config({} as SwarmConfig)
-    expect(parsed.maxConcurrent).toBe(5)
+    expect(parsed.maxConcurrent).toBe(10)
     expect(parsed.staleTimeoutSeconds).toBe(14400)
     expect(parsed.maxRetries).toBe(2)
     expect(parsed.reviewLoops).toBe(3)
