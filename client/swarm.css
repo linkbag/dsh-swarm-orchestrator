@@ -144,7 +144,10 @@
   padding: 9px 10px;
   border-radius: 8px;
   border: 1px solid rgba(125, 125, 125, 0.25);
-  background: var(--dsh-swarm-card, rgba(128, 128, 128, 0.07));
+  /* Opaque but theme-derived (see .dsh-swarm-flow-node): a translucent fill lets
+     whatever sits behind the card show through. */
+      background: rgba(128, 128, 128, 0.07);
+      background: color-mix(in srgb, canvas 94%, rgb(128 128 128));
   color: inherit;
   font: inherit;
   cursor: pointer;
@@ -199,7 +202,10 @@
   border-radius: 10px;
   padding: 12px;
   display: flex; flex-direction: column; gap: 10px;
-  background: var(--dsh-swarm-card, rgba(128, 128, 128, 0.07));
+  /* Opaque but theme-derived (see .dsh-swarm-flow-node): a translucent fill lets
+     whatever sits behind the card show through. */
+      background: rgba(128, 128, 128, 0.07);
+      background: color-mix(in srgb, canvas 94%, rgb(128 128 128));
 }
 .dsh-swarm-role-card header { display: flex; justify-content: space-between; align-items: center; }
 .dsh-swarm-role-card h4 { margin: 0; font-size: 13px; }
@@ -212,13 +218,16 @@
   background: transparent; color: inherit; width: 100%; box-sizing: border-box;
 }
 .dsh-swarm-input:focus { outline: 1px solid rgba(56, 139, 253, 0.6); }
-/* Native dropdown popups render white-on-white in light shells (the popup
-   uses its own UA background while options inherit the theme's light text).
-   Force a dark, readable list for the model pickers. */
+/* Native dropdown popups use their own UA background while options inherit the
+   page's text colour, which rendered white-on-white in light shells. Give the
+   list BOTH its own background and its own text colour, both derived from the
+   page background so the list stays readable in either theme. */
 .dsh-swarm-input option,
 .dsh-swarm-input optgroup {
-  background: #14161a;
-  color: #e8e8e8;
+  background: #fff;
+  background: color-mix(in srgb, canvas 92%, rgb(128 128 128));
+  color: #000;
+  color: canvastext;
 }
 .dsh-swarm-fallbacks { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
 .dsh-swarm-fallbacks li { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
@@ -275,6 +284,10 @@
 .dsh-swarm-flow-canvas { position: relative; margin: 0 auto; }
 .dsh-swarm-flow-node {
   position: absolute;
+  /* Edges live in an absolutely-positioned sibling layer at z-index 0, so a node
+     with auto z-index lost to it and the arrows painted OVER the boxes. Nodes sit
+     at 1; wave pills at 3 so a pill is never hidden by an overlapping card. */
+  z-index: 1;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
@@ -282,7 +295,14 @@
   gap: 2px;
   border: 1px solid rgba(125, 125, 125, 0.45);
   border-radius: 10px;
-  background: var(--dsh-swarm-node-bg, var(--dsh-surface-primary, rgba(128, 128, 128, 0.08)));
+  /* OPAQUE, but still derived from the page background — a translucent fill cannot
+     hide an arrow travelling behind it. color-mix blends a neutral 6% grey into the
+     page background, so the result is fully opaque AND adapts to light/dark/system
+     automatically: light theme -> near-white, dark theme -> near-black. The rgba
+     fallback keeps older engines rendering something reasonable (translucent, so
+     those browsers still see through it — acceptable degradation). */
+  background: rgba(128, 128, 128, 0.06);
+  background: color-mix(in srgb, canvas 94%, rgb(128 128 128));
   padding: 6px 10px;
   font-size: 12px;
   overflow: hidden;
@@ -301,14 +321,16 @@
 .dsh-swarm-flow-node-writes { font-size: 10px; opacity: 0.55; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dsh-swarm-flow-wave {
   position: absolute;
-  z-index: 1;
+  /* Above the nodes (1) so a pill is never hidden by a card that overlaps it. */
+  z-index: 3;
   font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
-  opacity: 0.9; white-space: nowrap;
+  opacity: 1; white-space: nowrap;
   padding: 2px 10px;
   border-radius: 999px;
   border: 1px solid rgba(125, 125, 125, 0.3);
-  background: var(--dsh-surface-primary, rgba(128, 128, 128, 0.08));
-  
+  /* Opaque, theme-derived — same reasoning as the node fill. */
+  background: rgba(128, 128, 128, 0.06);
+  background: color-mix(in srgb, canvas 94%, rgb(128 128 128));
 }
 .dsh-swarm-flow-edges { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 0; }
 .dsh-swarm-flow-edge { fill: none; stroke: rgba(125, 125, 125, 0.5); stroke-width: 1.5; }
@@ -326,8 +348,11 @@
   padding: 3px 9px;
   border-radius: 999px;
   border: 1px solid rgba(125, 125, 125, 0.35);
-  background: var(--dsh-surface-primary, rgba(128, 128, 128, 0.08));
-  color: #e8e8e8;
+  /* Floating surface: opaque and theme-derived, and the text inherits the page
+     theme rather than being pinned to a near-white that vanishes on light. */
+  background: rgba(128, 128, 128, 0.08);
+  background: color-mix(in srgb, canvas 94%, rgb(128 128 128));
+  color: inherit;
   pointer-events: none;
   max-width: 300px;
   overflow: hidden;
@@ -346,7 +371,10 @@
 .dsh-swarm-hpop {
   position: absolute; right: 0; top: calc(100% + 6px);
   z-index: 9999; width: 320px;
-  background: var(--dsh-surface-primary, rgba(128, 128, 128, 0.08)); color: inherit;
+  /* A floating popover must be opaque or the content behind it shows through. */
+  background: rgba(128, 128, 128, 0.08);
+  background: color-mix(in srgb, canvas 94%, rgb(128 128 128));
+  color: inherit;
   border: 1px solid rgba(125, 125, 125, 0.35); border-radius: 10px;
   padding: 10px 12px; font-size: 12.5px;
   display: flex; flex-direction: column; gap: 4px;

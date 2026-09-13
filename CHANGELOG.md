@@ -2,6 +2,34 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.3
+
+Flow-chart and surface legibility.
+
+### Fixed
+
+- **Arrows no longer show through the flow-chart boxes.** Two causes, both fixed:
+  `.dsh-swarm-flow-node` is absolutely positioned with no `z-index`, while the edge
+  layer is at `z-index: 0` — so the SVG arrows painted *over* the boxes — and the node
+  fill was only 6–8% opaque, so anything behind it was visible regardless of stacking.
+  Nodes now sit at `z-index: 1` and their fill is genuinely **opaque**.
+- **Opaque without losing theme adaptation.** A translucent tint cannot hide what is
+  behind it, so the fills are now
+  `color-mix(in srgb, canvas 94%, rgb(128 128 128))` — a neutral 6% grey blended into
+  the page background. The result is fully opaque *and* still derived from the
+  background, so light / dark / system all work with no per-theme rules. Cards, flow
+  nodes, wave pills, the header popover and the floating badge all use it; a plain
+  `rgba(...)` declaration precedes each `color-mix` as a fallback for engines without
+  `color-mix` (those degrade to translucent, as before).
+- **Near-white text that vanished on light themes.** The floating badge pinned
+  `color: #e8e8e8`, so on a light background it was close to invisible. It now inherits
+  the page colour.
+- **The model-picker dropdown no longer forces a dark popup.** It had a hardcoded
+  `background: #14161a; color: #e8e8e8` to avoid white-on-white native popups — which
+  is why the roster's dropdown looked wrong in light mode. The list now derives both
+  its background and its text colour from the page theme
+  (`color-mix(…canvas…)` + `canvastext`).
+
 ## 0.6.2
 
 Packaging and theme release.
