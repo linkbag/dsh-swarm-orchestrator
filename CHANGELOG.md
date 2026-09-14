@@ -2,6 +2,36 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.5
+
+Client-only correction. No scheduler behaviour changed.
+
+### Fixed
+
+- **The global 🐝 status pill could report a false failure.** The badge announced the
+  newest run whose status was `failed` or `paused`, not the newest run — and because
+  `/swarm/board` is sorted newest-first, that `find` returned the newest *bad* run. A
+  single failure anywhere in the last 50 runs therefore pinned the pill to
+  "last swarm run: failed" indefinitely, even while the newest run had completed. The
+  report that prompted this ("it says failed but the run actually succeeded") named a
+  failure two runs old while the board's newest run was `completed`.
+- **The label now describes live state, never accumulated history.** In-flight runs
+  (`planning` / `running`) are counted as active; otherwise a `paused` run is reported as
+  paused rather than active; a run waiting on a human reads "awaiting endorsement"
+  instead of the swarm reading as idle; and only then does the pill report the newest
+  run's real status, chosen by `createdAt` rather than array position. Alert styling now
+  means the reported run is `failed` or `aborted` — it is no longer a latch that any past
+  failure can set.
+- **A malformed board payload no longer freezes stale text.** `board.runs` is read
+  defensively; an error body previously threw inside the promise chain, and the resulting
+  rejection left the previous label on screen.
+
+### Verification
+
+- `tests/badge.test.ts` — 11 unit tests over the extracted label function, starting from
+  the exact board that produced the report (newest `completed`, two older `failed`), plus
+  order-independence, paused, awaiting-endorsement and malformed-payload cases.
+
 ## 0.6.4
 
 Verification and candour release. No scheduler behaviour changed.

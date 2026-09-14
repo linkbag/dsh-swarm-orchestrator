@@ -9,6 +9,7 @@ import { SwarmTab } from './SwarmTab'
 import { SwarmSettingsSection } from './SwarmSettingsSection'
 import { SwarmHeaderButton } from './SwarmHeaderButton'
 import { SwarmDispatchCard } from './ToolDispatchCard'
+import { badgeView } from './badge'
 import { setApiGetter } from './catalog'
 import css from './swarm.css'
 
@@ -76,17 +77,12 @@ export function apply(ctx: ClientContext): (() => void) | void {
     document.body.appendChild(badge)
     const update = (): void => {
       void fetch('/swarm/board')
-        .then((r) => r.json() as Promise<{ runs: Array<{ status: string }> }>)
+        .then((r) => r.json() as Promise<{ runs?: Array<{ status: string; createdAt?: number }> }>)
         .then((board) => {
-          const active = board.runs.filter((r) => r.status === 'running' || r.status === 'planning' || r.status === 'paused')
-          const lastBad = board.runs.find((r) => r.status === 'failed' || r.status === 'paused')
-          badge.textContent = active.length > 0
-            ? `🐝 ${active.length} swarm run${active.length === 1 ? '' : 's'} active`
-            : lastBad !== undefined
-              ? `🐝 last swarm run: ${lastBad.status}`
-              : board.runs.length > 0 ? '🐝 swarm idle' : ''
-          badge.className = lastBad !== undefined && active.length === 0 ? 'dsh-swarm-badge alert' : 'dsh-swarm-badge'
-          badge.style.display = badge.textContent.length === 0 ? 'none' : 'block'
+          const view = badgeView(board.runs)
+          badge.textContent = view.text
+          badge.className = view.alert ? 'dsh-swarm-badge alert' : 'dsh-swarm-badge'
+          badge.style.display = view.text.length === 0 ? 'none' : 'block'
         })
         .catch(() => { /* host offline — leave the badge as-is */ })
     }
