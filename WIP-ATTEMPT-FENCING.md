@@ -1,39 +1,70 @@
-wip(J19): attempt fencing — implemented, one test still red
+# J19 attempt fencing — precise diagnosis
 
-NOT FOR MAIN until tests/service.test.ts "watchdog escalates after 3 nudges"
-passes. 89/90 pass; only that test fails.
+## Status: NOT WORKING. Do not merge. 89/90 on this branch.
 
-What is done and believed correct:
+`tests/service.test.ts > watchdog escalates after 3 nudges` fails. Baseline passes it
+in 62 ms, so this branch is the cause.
 
-- Task gains `attemptId` (types.ts). Each launch mints `att-<ts>-<rand>` and
-  publishes it on `task/started`, so the fold knows which attempt owns the task.
-- projection.ts discards writes whose attemptId is not the task's current attempt
-  (task/completed, task/failed, task/reviewed, task/heartbeat). Events with no
-  attemptId (legacy, operator-driven) remain permitted so old logs still fold and
-  manual retries are never blocked.
-- service.ts records the fence in `liveAttempts` synchronously at launch — BEFORE
-  the child is spawned — and every terminal write inside the settle handler carries
-  its attemptId. A superseded attempt's result is logged and discarded.
+## What the probes proved
 
-The fence immediately proved its worth: it caught a REAL race between boot orphan
-recovery and asynchronous dispatch. `recoverOrphans` guarded only on `inFlight`,
-which does not exist during the async window of a launch, so recovery could fail a
-task that had just started — the same "host restarted mid-flight" failure the live
-smoke hit earlier. Recovery now also skips any task holding a fence, which is the
-authoritative ownership signal because it is set synchronously.
+Instrumenting the settle path produced exactly TWO lines per run:
 
-Remaining failure, precisely characterised:
+    [J19] SETTLE      task=a mine=att-...-kfrnhnpx live=att-...-3u7cegni ok=true stop=completed
+    [J19] SUPERSEDED  task=a mine=att-...-kfrnhnpx live=att-...-3u7cegni status=running attempts=2 ok=true
 
-In the watchdog test the fake uses holdAll, so a child's `deps.start()` promise
-stays pending until fake.release(). The watchdog escalates (attempt 1 -> retrying),
-attempt 2 launches and also holds. On release, attempt 1's settle takes the
-superseded branch; attempt 2's settle then does not commit and the task is left
-`running` with only task/started + task/agent-started recorded. The fence entry for
-attempt 2 is intact, so the mismatch is inside the settle path rather than the
-watchdog. In production an aborted child settles promptly (the abort actually
-resolves the provider call), so this window is largely a harness artefact — but the
-fence must not depend on that, so it needs a real fix rather than a test tweak.
+Read that carefully:
 
-Next step to try: instrument the attempt-2 settle to log `liveAttempts.get(key)`
-versus its own `attemptId` at entry, and check whether `clearSpawnTimeout()` or the
-`fresh.status !== running` branch is being taken first.
+1. **Only ONE settle fires — attempt 1's.** Attempt 2's `.then()` callback never reaches
+   the settle block. `[J19] SETTLE` and `[J19] NONRUNNING` never appear a second time.
+2. **Attempt 1 resolved as `ok=true stop=completed`**, even though the watchdog aborted
+   it. So the abort did not settle attempt 1's held promise; `fake.release()` did.
+3. **Attempt 2 is the live attempt** (`live=att-...3u7cegni`) and the task is `running`
+   with `attempts=2`. The retry genuinely launched.
+
+Conclusion: the fence comparison itself is behaving correctly here (attempt 1 is rightly
+superseded), but **attempt 2's result never reaches the settle path**. The fault is
+upstream of the fence — in `spawnTaskAgent`'s result path or the `ensureAnchor` chain —
+not in the fence logic.
+
+## Ruled out
+
+- `abortAware` is only set in the two J8 tests (~lines 1401/1425), not in the watchdog
+  test, so an abort-driven settle cannot be what resolved attempt 1.
+- A missing `await`: `adoptTaskReport` is synchronous on this branch.
+- Fence clearing: an earlier revision of this branch DID clear `liveAttempts` in the
+  superseded branch, which made the live attempt's own settle look superseded. Fixed —
+  the probes above are from AFTER that fix.
+
+## Next step (do this first)
+
+Probe immediately after `const outcome = await spawnTaskAgent(...)` in `startSpawn`,
+logging the attemptId and outcome, plus a probe at the TOP of the
+`ensureAnchor(...).then(...)` callback logging that it was entered. That separates:
+
+  (a) the `.then()` never running for attempt 2 (the anchor promise rejected and
+      `.catch()` swallowed it — look for a "crashed dispatcher bookkeeping" warning);
+  (b) the `.then()` running but `spawnTaskAgent` never resolving (its internal
+      `run.result` never settles for the second child); or
+  (c) the `.then()` running and resolving, with an early `return` before the probes.
+
+Most likely (b): the fake's `release()` drains `this.held` with `splice(0)`, so if
+attempt 2's child was pushed to `held` AFTER release ran, its promise stays pending
+forever. That is a TEST-harness ordering issue rather than a product defect — which is
+precisely why the fence must not be allowed to depend on it.
+
+## Value delivered so far
+
+The fence found and fixed a REAL defect on the way in: `recoverOrphans` guarded only on
+`inFlight`, which does not exist during a launch's async window, so boot recovery could
+fail a task that had just started — the same `host restarted mid-flight` failure seen in
+the live smoke run. Recovery now also skips any task holding a fence, which is the
+authoritative ownership signal because it is set synchronously at launch.
+
+## How to verify when it is fixed
+
+1. `npx vitest run tests/service.test.ts -t "watchdog escalates"` must pass.
+2. `npx vitest run` — all 90 on this branch.
+3. Merge `main` in, then `npx vitest run` again: the fault-matrix identity assertions
+   (FM1/FM4/FM9) tighten automatically from counting to full attempt-identity checks.
+   Those three currently pass on main *because* fencing is absent; after the merge they
+   become real verification of it.
