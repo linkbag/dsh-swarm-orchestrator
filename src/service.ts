@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { exec, execFile, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { zstdDecompressSync } from 'node:zlib'
@@ -11,6 +12,7 @@ import { Service } from '@deepseek-ai/cordis'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-subagent'
 import { PLUGIN_VERSION, type SwarmConfig } from './config.js'
+import { checkEffortSupport, parseEffortSupport, type EffortSupport } from './preflight.js'
 import { validateDag } from './domain/dag.js'
 import { DutyTableStore } from './domain/duty-table.js'
 import { EventStore } from './domain/event-store.js'
@@ -282,6 +284,13 @@ export class SwarmService extends Service {
    * late result can always be recognised as belonging to a superseded one.
    */
   private readonly liveAttempts = new Map<string, string>()
+  /**
+   * J21: the deployment's declared effort support, read once from settings.yaml.
+   * undefined = the file could not be read, in which case no preflight warnings are
+   * emitted (we do not warn about what we cannot know).
+   */
+  private effortSupportCache: EffortSupport | undefined
+  private effortSupportRead = false
   /** The dispatching agent per run — provenance and cwd source, never the spawn route (see ensureAnchor). */
   private readonly runParents = new Map<string, Agent>()
   /** Service-owned idle anchor agents every spawn of a run is routed through. */
@@ -1133,6 +1142,66 @@ export class SwarmService extends Service {
     return chain[Math.min(Math.max(0, attemptNumber - 1), chain.length - 1)]
   }
 
+  /**
+   * J21: the deployment's declared effort support, from settings.yaml. Read once.
+   * Returns undefined when the file cannot be located or parsed — the check is
+   * then skipped entirely rather than guessing.
+   */
+  private effortSupport(): EffortSupport | undefined {
+    if (this.effortSupportRead) return this.effortSupportCache
+    this.effortSupportRead = true
+    try {
+      const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '', '.dsh')
+      for (const candidate of [join(home, 'settings.yaml'), join(homedir(), '.dsh', 'settings.yaml')]) {
+        if (!existsSync(candidate)) continue
+        this.effortSupportCache = parseEffortSupport(readFileSync(candidate, 'utf8'))
+        return this.effortSupportCache
+      }
+    } catch {
+      // unreadable settings: no preflight, J18's graceful degradation still applies
+    }
+    return undefined
+  }
+
+  /**
+   * J21 preflight: drop effort pins that the deployment's settings declare
+   * unsupported for a candidate's model, and surface why.
+   *
+   * The pin is normally applied by the agent/request waterfall at request time, so
+   * an unsupported pair was only discovered when the child's first request died with
+   * UNSUPPORTED_REASONING_EFFORT — six tasks in one run. Removing a declared-
+   * incompatible candidate's pin BEFORE the spawn avoids that wasted child entirely.
+   * Candidates with unknown models are left untouched: absence of a declaration is
+   * not proof of unsupportability (deepseek models declare no maps and accept efforts).
+   */
+  private preflightEffort(
+    roleId: string,
+    candidates: Array<{ provider: string; model: string }>,
+    effort: string | undefined,
+  ): Array<{ provider: string; model: string }> {
+    if (effort === undefined || candidates.length === 0) return candidates
+    const support = this.effortSupport()
+    if (support === undefined) return candidates
+    const warnings: string[] = []
+    const filtered: Array<{ provider: string; model: string }> = []
+    for (const c of candidates) {
+      const check = checkEffortSupport(c.model, effort, support)
+      if (!check.incompatible) {
+        filtered.push(c)
+        continue
+      }
+      warnings.push(`${roleId}: ${c.provider}/${c.model} does not declare reasoningEfforts in settings.yaml — effort "${effort}" dropped for this candidate`)
+    }
+    for (const w of warnings) this.ctx.logger('swarm').warn('preflight: %s', w)
+    if (filtered.length === 0 && warnings.length > 0) {
+      // Every candidate rejected the pin: run the original chain WITHOUT the effort
+      // preference rather than refusing to run — the effort is a preference.
+      this.ctx.logger('swarm').warn('preflight: every candidate for role %s rejects effort %s — running without an effort pin', roleId, effort)
+      return candidates.map((c) => ({ ...c }))
+    }
+    return filtered
+  }
+
   /** J2/P5: machine-check the evidence contract. Returns file warnings (advisory) and command failures (hard). */
   private async checkEvidence(task: Task): Promise<{ fileWarnings: string[]; commandFailures: string[] }> {
     const result = { fileWarnings: [] as string[], commandFailures: [] as string[] }
@@ -1457,7 +1526,10 @@ export class SwarmService extends Service {
       const offset = task.attempts % candidates.length
       candidates = [...candidates.slice(offset), ...candidates.slice(0, offset)]
     }
+    // J21: drop declared-incompatible effort pins BEFORE spawning, so the failure
+    // mode that killed 6 tasks in one run never wastes a child.
     const effort = this.resolveEffort(role, task.attempts + 1)
+    candidates = this.preflightEffort(task.role, candidates, effort)
     const controller = new AbortController()
     const key = taskKeyOf(task)
     // J19: fence this attempt. The id is published with `task/started` and every
