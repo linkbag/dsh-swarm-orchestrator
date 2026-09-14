@@ -54,13 +54,15 @@ This plugin takes the coordination seriously so you don't have to:
 - **Failure is a state, not a mystery.** Provider timeouts, quota exhaustion, bad evidence — each is detected, reported plainly, and handled: retries with resume hints, run pause/resume instead of burn-down, automatic model rotation after repeated failures.
 - **Scoped to where you are.** Each chat's Swarm tab shows the runs for that chat's workspace; a persisted switch reveals everything on the machine when you want the full picture.
 - **One run per goal, reviewed before built.** Dispatching into a workspace with an active run raises a warning (or a block, your choice); and unless you opt out, an architect agent reviews the dispatcher's plan into PLAN.md before any builder starts.
-- **Memory-safe concurrency.** Swarm agents run in-process on the DSH host, sharing its Node.js heap. A global cap (`maxTotalConcurrentAgents`, default 5) ensures concurrent runs from different workspaces share the agent budget (3+2, not 5+5) — preventing the heap exhaustion that can crash the host when too many agents run simultaneously.
+- **Memory-safe concurrency.** Swarm agents run in-process on the DSH host, sharing its Node.js heap. A global cap (`maxTotalConcurrentAgents`, default 20) ensures concurrent runs from different workspaces share the agent budget — preventing the heap exhaustion that can crash the host when too many agents run simultaneously.
+- **Every agent stays on the board.** Task agents cannot spawn hidden sub-agents of their own (`maxSubagentDepth`, default 2). Without that bound an agent could delegate to helpers the dispatcher cannot see or account for — not counted by the global cap, not tracked by the watchdog, not shown on the board, yet all sharing the host heap. Measured on a real machine: one task spawned 12 such hidden helpers while the board showed a single task.
 - **Work outlives its agent.** Every task agent writes a small completion report as its final action. If the host restarts and kills an agent between finishing the work and being recorded, the dispatcher adopts the on-disk report instead of throwing the finished work away and re-running the task. A task can also never sit `dispatching` forever: `spawnTimeoutSeconds` is a hard ceiling the heartbeat watchdog cannot provide.
+- **The right effort for the right model.** If a role's pinned reasoning effort is not supported by one of its fallback models, the dispatcher drops the pin for that candidate before spawning — preventing the `UNSUPPORTED_REASONING_EFFORT` crash that killed 6 tasks in one run.
 - **Every agent stays on the board.** A task agent cannot spawn subagents of its own (`maxSubagentDepth`, default 1). Without that bound an agent could delegate to helpers the dispatcher cannot see or account for — not counted by the global cap, not tracked by the watchdog, not shown on the board, yet all sharing the host heap. Measured on a real machine: one task spawned 12 such hidden helpers while the board showed a single task.
 
 > ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** with the default cap of 5 total agents. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` to 3 in the Runtime settings.
 
-### Reliability notes (v0.5.8)
+### Reliability notes (v0.5.8 – v0.6.4)
 
 Diagnosed from 47 recorded runs / 184 task failures, then fixed and regression-tested:
 
@@ -190,7 +192,8 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
   require: dsh-swarm-orchestrator
   config:
     storageDir: !!js dshHomePath("storages/swarm")   # event log + duty table
-    maxConcurrent: 5            # simultaneous task agents
+    maxConcurrent: 10           # simultaneous task agents per run
+    maxTotalConcurrentAgents: 20 # global cap across ALL runs (they share the budget)
     adaptiveConcurrency: true   # shrink on provider pain, recover on success
     spawnStaggerMs: 750         # pace launches within a wave
     nudgeAfterMinutes: 20       # board marker for long-silent tasks (0 = off)
@@ -203,7 +206,9 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
     retryBackoffBaseMs: 5000    # retry backoff: base × 2^attempt before retrying
     circuitBreakerThreshold: 3  # failures in 30s before pausing all retries (0 = off)
     circuitBreakerCooldownMs: 60000  # circuit breaker pause duration
-    maxTotalConcurrentAgents: 5 # global cap on concurrent agents across ALL runs
+    spawnTimeoutSeconds: 3600   # hard ceiling on one task run (0 = off)
+    maxSubagentDepth: 2         # delegation-depth cap for task agents (1 = no grandchildren)
+    bootGraceSeconds: 3         # wait after plugin load before orphan recovery
 ```
 
 ## Runtime control
@@ -248,7 +253,7 @@ Written plainly, because a limit you discover in production costs far more than 
 
 ## Status
 
-v0.6.4, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**100 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
+v0.6.4, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**104 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, tool-filter sanitisation, preflight effort validation, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
 
 ## License
 
