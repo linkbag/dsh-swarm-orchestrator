@@ -232,9 +232,23 @@ Changes are **applied immediately** (no restart) and **persisted to `runtime.jso
 - **Per-role reasoning effort** rides DSH's `agent/request` waterfall, scoped to tracked swarm children only.
 - **Deterministic replay**: state is a fold over the event log, with legality guards — a hostile or duplicated event stream cannot resurrect an aborted run or complete a task twice.
 
+## Known limits
+
+Written plainly, because a limit you discover in production costs far more than one you read here.
+
+- **The board reports disk truth, and the disk can lag the model.** A task agent may finish its work without performing every bookkeeping step the protocol asks of it (for example, writing its `.dsh-swarm/task-<id>.json` report). The board shows what was actually recorded, not what the agent claimed. Treat a task's summary as evidence of what was recorded, and verify deliverables yourself.
+- **Evidence contracts are advisory for files, hard for commands.** A missing or empty `evidence.files` entry becomes a board warning, not a closed task; only a failing `evidence.commands` entry blocks completion. Scope control is therefore a completion-time audit, not write interception — nothing stops an agent from writing outside its declared `writes` scope; the dispatcher only warns about overlapping scopes at dispatch time.
+- **State is file-backed and serialised within one DSH process.** Concurrent processes editing the same workspace's swarm state are not coordinated. Run one host per workspace.
+- **Attempt identity is not yet enforced (J19).** Each task publishes an `attempts` counter, but not a per-attempt identity. A result that arrives from an attempt already superseded by a retry cannot currently be told apart from the live attempt's result, and the settle path guards on task *status* rather than on *who* produced it. `tests/fault-matrix.test.ts` records this gap (FM1/FM4/FM9) and will tighten automatically once fencing lands. The practical consequence: if you retry a task while its previous child is still running, the older child's outcome may still be recorded.
+- **Member messaging is one-directional.** Task agents can report progress to the dispatcher; they cannot message each other. Coordination happens through the DAG (dependencies and write scopes), not conversation.
+- **One role may hold several concurrent tasks.** The dispatcher bounds concurrency by role and globally, not one-open-task-per-agent, so a single role can own multiple in-flight tasks at once.
+- **Recovery is bounded per boot, not globally.** Orphan recovery requeues a stranded task at most once per host start. A host that restarts repeatedly will requeue the same unwilling task repeatedly — by design, so an unfinished task is not silently abandoned.
+- **The version in the board header is the version loaded at boot**, not the version on disk. Editing `duty-table.json` by hand also requires a host restart; changes made through the Roster UI apply live.
+- **`lib/` is built, not committed.** Source changes to `client/` are invisible until `npm run build` runs; `tests/bundle-freshness.test.ts` fails if the bundle is stale.
+
 ## Status
 
-v0.5.9, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (88 tests: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment), plus live verification on a real deployment.
+v0.6.4, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**100 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
 
 ## License
 

@@ -2,6 +2,45 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.4
+
+Verification and candour release. No scheduler behaviour changed.
+
+### Added
+
+- **A fault matrix (`J20`)** — `tests/fault-matrix.test.ts`, 10 adversarial tests over
+  the dispatcher's invariants. Every defect found in this project (J16, J17, J18) was
+  discovered in a **live** run rather than by the scenario-based tests; this moves that
+  discovery into CI. Scenarios, and the reference scenario each translates: late writes
+  and a 20-return late burst ("50 late writes"); terminal overruns ("40 terminal
+  overruns"); a 12-way tick storm proving in-flight tasks are not double-launched
+  ("7-way claim race"); abort during in-flight work ("concurrent takeover");
+  cold-restart recovery including 13 repeated recoveries against a terminal run (the
+  shape of the real zombie incident); a 40-heartbeat burst ("42-message burst"); a
+  12-task / 3-level DAG; and a bounded-retry check.
+
+  Invariants asserted: terminal tasks never move again; a superseded attempt's result
+  never overwrites newer work; one live attempt per task with monotonic attempts;
+  `attempts` equals the `task/started` count; a run always reaches a terminal state;
+  retries stay within `maxRetries`.
+
+  The matrix immediately earned its keep: three of its tests fail on the
+  attempt-**identity** assertions, because the dispatcher has no attempt identity at
+  all — the exact gap the parked `wip/attempt-fencing` branch addresses. Those
+  assertions tighten **automatically** once fencing lands, so the same file verifies
+  the fence without a test edit.
+
+- **A "Known limits" section in the README (EN + ZH).** Stated plainly, because a limit
+  discovered in production costs far more than one read up front. It records, among
+  others: the board reports disk truth and the disk can lag the model; evidence
+  contracts are advisory for files and hard only for commands, so scope control is a
+  completion-time audit and not write interception; state is serialised within one DSH
+  process only; **attempt identity is not yet enforced, so a retry launched while the
+  previous child is still running can still have the older child's result recorded**;
+  member messaging is one-directional; one role may hold several concurrent tasks;
+  recovery is bounded per boot rather than globally; the board's version string is the
+  version loaded at boot; and `lib/` is built, not committed.
+
 ## 0.6.3
 
 Flow-chart and surface legibility.
