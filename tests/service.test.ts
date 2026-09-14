@@ -447,6 +447,44 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(fake.calls.length).toBe(2)
   }, 20000)
 
+  // ── J21: preflight effort validation ─────────────────────────────────────
+  it('J21: checkEffortSupport flags a declared model without an efforts map', async () => {
+    const { parseEffortSupport, checkEffortSupport } = await import('../src/preflight.js')
+    const settings = [
+      'llm-pi-ai:',
+      '  providers:',
+      '    zai:',
+      '      models:',
+      '        - id: glm-5.3-flash',
+      '          reasoningEfforts:',
+      '            max: max',
+      '        - id: glm-5.3',
+    ].join('\n')
+    const support = parseEffortSupport(settings)
+    expect(support.supported.has('glm-5.3-flash')).toBe(true)
+    expect(support.declaredWithoutMap.has('glm-5.3')).toBe(true)
+    // The exact production mismatch: max pinned on glm-5.3.
+    const check = checkEffortSupport('glm-5.3', 'max', support)
+    expect(check.incompatible).toBe(true)
+    expect(check.warning).toMatch(/glm-5\.3/)
+  })
+
+  it('J21: a model with no declaration is not judged', async () => {
+    const { parseEffortSupport, checkEffortSupport } = await import('../src/preflight.js')
+    // deepseek models declare no effort maps but accept efforts.
+    const settings = 'llm-deepseek:\n  models:\n    - id: deepseek-v4-flash\n'
+    const support = parseEffortSupport(settings)
+    expect(checkEffortSupport('deepseek-v4-flash', 'max', support).incompatible).toBe(false)
+  })
+
+  it('J21: an unreadable settings file yields no declarations, so no warnings', async () => {
+    const { parseEffortSupport, checkEffortSupport } = await import('../src/preflight.js')
+    const support = parseEffortSupport('')
+    expect(support.supported.size).toBe(0)
+    expect(support.declaredWithoutMap.size).toBe(0)
+    expect(checkEffortSupport('anything', 'max', support).incompatible).toBe(false)
+  })
+
   it('swarm_report authenticates tracked child sessions only', async () => {
     const { service, fake } = await bootRunnable()
 
@@ -1140,6 +1178,13 @@ describe('swarm service (integration, fake subagents)', () => {
     // The task requeues and the fake spawn now succeeds (holdAll still on, but the
     // watchdog-aborted child's controller is done — the requeued spawn will hold too,
     // so release and complete).
+    //
+    // Wait for the RETRY's spawn before releasing: release() drains the held list
+    // with splice(0), so a child pushed to held AFTER release has already run would
+    // never settle and the run would hang forever. This ordering matters — release
+    // must happen only once every child we intend to complete is already in the
+    // queue.
+    await waitFor(() => fake.calls.length >= 2, 8000, 'retry spawned')
     fake.release()
     await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 8000, 'run completes after escalation')
   })

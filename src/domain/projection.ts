@@ -45,6 +45,21 @@ export function fold(events: readonly SwarmEventRecord[], state = newState()): S
   return state
 }
 
+/**
+ * J19: whether an event carries a superseded attempt's id.
+ *
+ * `task.attemptId` names the attempt currently allowed to write to a task. An event
+ * naming a *different* attempt is a late write from work already replaced — applying
+ * it would let a zombie overwrite live results. Events with no attemptId are legacy
+ * or operator-driven and stay permitted, so an upgraded log still folds and a manual
+ * retry is never blocked by its own bookkeeping.
+ */
+function staleAttempt(task: Task, d: Record<string, unknown>): boolean {
+  const claimed = d.attemptId
+  if (typeof claimed !== 'string' || claimed.length === 0) return false
+  return task.attemptId !== undefined && task.attemptId !== claimed
+}
+
 function apply(state: SwarmState, event: SwarmEventRecord): void {
   const { kind, runId, taskId, data } = event
   const d = (data ?? {}) as Record<string, unknown>
@@ -153,6 +168,9 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       case 'task/started':
         task.status = 'running'
         task.attempts += 1
+        // J19: a new attempt becomes the one and only writer for this task.
+        if (typeof d.attemptId === 'string') task.attemptId = d.attemptId
+        else delete task.attemptId
         task.agent = {
           label: str('label') ?? task.agent?.label ?? `swarm:${taskId}`,
           provider: str('provider') ?? task.agent?.provider,
@@ -165,6 +183,9 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         if (typeof d.sessionId === 'string') task.agent = { ...(task.agent ?? { label: `swarm:${taskId}` }), label: task.agent?.label ?? `swarm:${taskId}` }
         break
       case 'task/heartbeat':
+        // J19: a superseded attempt must not even annotate the live task — its note
+        // would misrepresent work the current attempt has not done.
+        if (staleAttempt(task, d)) break
         if (typeof d.note === 'string') task.lastNote = d.note
         task.lastNoteAt = event.at
         break
@@ -179,6 +200,8 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         break
       }
       case 'task/completed':
+        // J19: a superseded attempt's success must not close the live task.
+        if (staleAttempt(task, d)) break
         task.status = 'completed'
         if (typeof d.summary === 'string') {
           task.summary = d.summary
@@ -186,6 +209,10 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         }
         break
       case 'task/failed': {
+        // J19: a superseded attempt's failure must not knock down the live task —
+        // this is the fence that stops a zombie's late error from aborting a run
+        // whose retry is already making progress.
+        if (staleAttempt(task, d)) break
         const retrying = d.retry === true
         task.status = retrying ? 'retrying' : 'failed'
         task.lastNote = str('reason') ?? task.lastNote
@@ -213,6 +240,9 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         if (d.human === true) task.humanReview = true
         break
       case 'task/reviewed': {
+        // J19: a review verdict produced for a superseded attempt is not a verdict
+        // on the current one.
+        if (staleAttempt(task, d)) break
         const verdict = str('verdict') ?? 'error'
         const feedback = str('feedback')
         if (feedback !== undefined) task.reviewFeedback = feedback

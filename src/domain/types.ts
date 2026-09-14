@@ -79,6 +79,16 @@ export interface Task extends TaskSpec {
   runId: string
   status: TaskStatus
   attempts: number
+  /**
+   * J19 attempt fence: identity of the attempt currently allowed to move this task.
+   *
+   * `attempts` is only a counter — it says how many attempts there have been, not
+   * which one is live. Without an identity, a result from a superseded attempt can
+   * land after the retry that replaced it and overwrite newer work. Every terminal
+   * transition carries the attemptId it was produced under, and the fold discards
+   * any that belongs to an older attempt.
+   */
+  attemptId?: string
   agent?: { label: string; provider?: string; model?: string }
   blockedReason?: string
   lastNote?: string

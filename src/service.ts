@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { exec, execFile, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
 import { zstdDecompressSync } from 'node:zlib'
@@ -11,6 +12,7 @@ import { Service } from '@deepseek-ai/cordis'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-subagent'
 import { PLUGIN_VERSION, type SwarmConfig } from './config.js'
+import { checkEffortSupport, parseEffortSupport, type EffortSupport } from './preflight.js'
 import { validateDag } from './domain/dag.js'
 import { DutyTableStore } from './domain/duty-table.js'
 import { EventStore } from './domain/event-store.js'
@@ -168,6 +170,8 @@ interface InFlight {
   controller: AbortController
   taskKey: string
   childSessionId?: string
+  /** J19: the attempt this flight represents, so a superseded one can be told apart. */
+  attemptId?: string
 }
 
 /** Structural view of ctx.agents for anchor creation (see ensureAnchor). */
@@ -274,6 +278,19 @@ export class SwarmService extends Service {
   private state: SwarmState = newState()
   private stateDirty = true
   private readonly inFlight = new Map<string, InFlight>()
+  /**
+   * J19: task key → the attempt id currently permitted to write that task.
+   * Set when an attempt launches and re-set by every subsequent attempt, so a
+   * late result can always be recognised as belonging to a superseded one.
+   */
+  private readonly liveAttempts = new Map<string, string>()
+  /**
+   * J21: the deployment's declared effort support, read once from settings.yaml.
+   * undefined = the file could not be read, in which case no preflight warnings are
+   * emitted (we do not warn about what we cannot know).
+   */
+  private effortSupportCache: EffortSupport | undefined
+  private effortSupportRead = false
   /** The dispatching agent per run — provenance and cwd source, never the spawn route (see ensureAnchor). */
   private readonly runParents = new Map<string, Agent>()
   /** Service-owned idle anchor agents every spawn of a run is routed through. */
@@ -288,7 +305,7 @@ export class SwarmService extends Service {
   private readonly recentFailures = new Map<string, number[]>()
   /** H-2 circuit breaker: runId → resume-after timestamp (retries paused while active). */
   private readonly circuitBreakerUntil = new Map<string, number>()
-  private readonly sessionTasks = new Map<string, { taskKey: string; effort?: string }>()
+  private readonly sessionTasks = new Map<string, { taskKey: string; effort?: string; attemptId?: string }>()
   private tickScheduled = false
 
   constructor(ctx: Context, config: SwarmConfig) {
@@ -393,12 +410,17 @@ export class SwarmService extends Service {
       if (task.status !== 'running' && task.status !== 'dispatching' && task.status !== 'reviewing') continue
       const run = state.runs.get(task.runId)
       if (run?.status !== 'running') { skipped++; continue }
-      // J13: never touch a task this process is actively running. Recovery runs
+      // J13/J19: never touch a task this process is actively running. Recovery runs
       // asynchronously after boot, and in a one-shot/headless host the dispatching
-      // agent can already have launched a task by then — that task is not an
-      // orphan, and failing it kills live work (observed live: a smoke run showed
+      // agent can already have launched a task by then — that task is not an orphan,
+      // and failing it kills live work (observed live: a smoke run showed
       // task/started -> agent-started -> failed("host restarted mid-flight")
-      // -> heartbeat). An in-memory flight is the authoritative ownership signal.
+      // -> heartbeat).
+      //
+      // A published attempt fence is the authoritative ownership signal: a launch
+      // records it synchronously, BEFORE the child is spawned, so it is already set
+      // for every task in the window where `inFlight` does not yet exist.
+      if (this.liveAttempts.has(taskKeyOf(task))) continue
       if (this.inFlight.has(taskKeyOf(task))) continue
       this.events.append('task/failed', {
         runId: task.runId, taskId: task.id,
@@ -448,7 +470,7 @@ export class SwarmService extends Service {
         flight.controller.abort()
         this.events.append('task/failed', {
           runId: task.runId, taskId: task.id,
-          data: { retry: task.attempts <= this.swarmConfig.maxRetries, reason: `stale: no progress for ${Math.round(staleMs / 1000)}s (watchdog)` },
+          data: { attemptId: flight.attemptId, retry: task.attempts <= this.swarmConfig.maxRetries, reason: `stale: no progress for ${Math.round(staleMs / 1000)}s (watchdog)` },
         })
         this.ctx.logger('swarm').warn('watchdog aborted stale task %s', key)
         continue
@@ -473,6 +495,7 @@ export class SwarmService extends Service {
             this.events.append('task/failed', {
               runId: task.runId, taskId: task.id,
               data: {
+                attemptId: flight.attemptId,
                 retry: task.attempts <= this.swarmConfig.maxRetries,
                 reason: `watchdog escalation: ${count} nudges over ${Math.round(silentMs / 60000)} min of silence — child reclaimed`,
               },
@@ -796,7 +819,17 @@ export class SwarmService extends Service {
     if (taskId !== undefined && taskId.length > 0 && task.id !== taskId) {
       throw new Error(`task ${taskId} is not assigned to this agent (this agent owns "${task.id}")`)
     }
-    this.events.append('task/heartbeat', { runId: task.runId, taskId: task.id, data: { note } })
+    // J19: a superseded member may not post notes against the live task — its
+    // progress describes work that has been discarded, and the board would show it
+    // as if the current attempt had done it.
+    const mine = this.liveAttempts.get(entry.taskKey)
+    if (mine !== undefined && task.attemptId !== undefined && task.attemptId !== mine) {
+      throw new Error('this attempt has been superseded — the task was retried or reassigned, so your result is no longer accepted')
+    }
+    this.events.append('task/heartbeat', {
+      runId: task.runId, taskId: task.id,
+      data: { ...(entry.attemptId !== undefined ? { attemptId: entry.attemptId } : {}), note },
+    })
     return 'ok'
   }
 
@@ -1109,6 +1142,66 @@ export class SwarmService extends Service {
     return chain[Math.min(Math.max(0, attemptNumber - 1), chain.length - 1)]
   }
 
+  /**
+   * J21: the deployment's declared effort support, from settings.yaml. Read once.
+   * Returns undefined when the file cannot be located or parsed — the check is
+   * then skipped entirely rather than guessing.
+   */
+  private effortSupport(): EffortSupport | undefined {
+    if (this.effortSupportRead) return this.effortSupportCache
+    this.effortSupportRead = true
+    try {
+      const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '', '.dsh')
+      for (const candidate of [join(home, 'settings.yaml'), join(homedir(), '.dsh', 'settings.yaml')]) {
+        if (!existsSync(candidate)) continue
+        this.effortSupportCache = parseEffortSupport(readFileSync(candidate, 'utf8'))
+        return this.effortSupportCache
+      }
+    } catch {
+      // unreadable settings: no preflight, J18's graceful degradation still applies
+    }
+    return undefined
+  }
+
+  /**
+   * J21 preflight: drop effort pins that the deployment's settings declare
+   * unsupported for a candidate's model, and surface why.
+   *
+   * The pin is normally applied by the agent/request waterfall at request time, so
+   * an unsupported pair was only discovered when the child's first request died with
+   * UNSUPPORTED_REASONING_EFFORT — six tasks in one run. Removing a declared-
+   * incompatible candidate's pin BEFORE the spawn avoids that wasted child entirely.
+   * Candidates with unknown models are left untouched: absence of a declaration is
+   * not proof of unsupportability (deepseek models declare no maps and accept efforts).
+   */
+  private preflightEffort(
+    roleId: string,
+    candidates: Array<{ provider: string; model: string }>,
+    effort: string | undefined,
+  ): Array<{ provider: string; model: string }> {
+    if (effort === undefined || candidates.length === 0) return candidates
+    const support = this.effortSupport()
+    if (support === undefined) return candidates
+    const warnings: string[] = []
+    const filtered: Array<{ provider: string; model: string }> = []
+    for (const c of candidates) {
+      const check = checkEffortSupport(c.model, effort, support)
+      if (!check.incompatible) {
+        filtered.push(c)
+        continue
+      }
+      warnings.push(`${roleId}: ${c.provider}/${c.model} does not declare reasoningEfforts in settings.yaml — effort "${effort}" dropped for this candidate`)
+    }
+    for (const w of warnings) this.ctx.logger('swarm').warn('preflight: %s', w)
+    if (filtered.length === 0 && warnings.length > 0) {
+      // Every candidate rejected the pin: run the original chain WITHOUT the effort
+      // preference rather than refusing to run — the effort is a preference.
+      this.ctx.logger('swarm').warn('preflight: every candidate for role %s rejects effort %s — running without an effort pin', roleId, effort)
+      return candidates.map((c) => ({ ...c }))
+    }
+    return filtered
+  }
+
   /** J2/P5: machine-check the evidence contract. Returns file warnings (advisory) and command failures (hard). */
   private async checkEvidence(task: Task): Promise<{ fileWarnings: string[]; commandFailures: string[] }> {
     const result = { fileWarnings: [] as string[], commandFailures: [] as string[] }
@@ -1171,10 +1264,13 @@ export class SwarmService extends Service {
       throw new Error(`task ${taskId} is not awaiting a human review`)
     }
     const reviews = (task.reviews ?? 0) + 1
+    // J19: pin the verdict to the attempt it judges, so a human decision about an
+    // old attempt cannot close a task that has since been retried.
+    const fence = task.attemptId !== undefined ? { attemptId: task.attemptId } : {}
     if (verdict === 'approve') {
-      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'approve', feedback: 'approved by human review' } })
+      this.events.append('task/reviewed', { runId, taskId, data: { ...fence, verdict: 'approve', feedback: 'approved by human review' } })
     } else {
-      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'reject', reviews, feedback: 'rejected by human review — fix and resubmit' } })
+      this.events.append('task/reviewed', { runId, taskId, data: { ...fence, verdict: 'reject', reviews, feedback: 'rejected by human review — fix and resubmit' } })
     }
     this.scheduleTick()
   }
@@ -1430,11 +1526,21 @@ export class SwarmService extends Service {
       const offset = task.attempts % candidates.length
       candidates = [...candidates.slice(offset), ...candidates.slice(0, offset)]
     }
+    // J21: drop declared-incompatible effort pins BEFORE spawning, so the failure
+    // mode that killed 6 tasks in one run never wastes a child.
     const effort = this.resolveEffort(role, task.attempts + 1)
+    candidates = this.preflightEffort(task.role, candidates, effort)
     const controller = new AbortController()
     const key = taskKeyOf(task)
+    // J19: fence this attempt. The id is published with `task/started` and every
+    // terminal write for it carries the same id; the fold discards writes whose id
+    // is not the task's current attempt. This is what stops a superseded (or zombie)
+    // child from overwriting the work of the retry that replaced it — the guard
+    // below could previously only compare *status*, not *identity*.
+    const attemptId = `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    this.liveAttempts.set(key, attemptId)
     const spawnTimeoutMs = this.rt('spawnTimeoutSeconds') * 1000
-    this.inFlight.set(key, { controller, taskKey: key })
+    this.inFlight.set(key, { controller, taskKey: key, attemptId })
 
     const startSpawn = (): void => {
       const deps = this.spawnDeps()
@@ -1510,14 +1616,14 @@ export class SwarmService extends Service {
             })
           },
           onStarted: (childSessionId) => {
-            this.trackChildSession(childSessionId, key, effort)
+            this.trackChildSession(childSessionId, key, effort, attemptId)
             this.events.append('task/agent-started', { runId, taskId: task.id, data: { sessionId: childSessionId } })
           },
           // J18: the child rejected the pinned reasoning effort (the fallback model
           // does not support it). Clear the pin so the retry makes an unconstrained
           // request instead of dying on the same mismatch.
           onDropEffort: (childSessionId) => {
-            this.trackChildSession(childSessionId, key, undefined)
+            this.trackChildSession(childSessionId, key, undefined, attemptId)
             this.ctx.logger('swarm').warn(
               'task %s: model rejected reasoning effort %s — retrying without an effort pin',
               task.id, String(effort),
@@ -1530,8 +1636,35 @@ export class SwarmService extends Service {
         const fresh = this.view().tasks.get(key)
         if (fresh === undefined) return
         if (this.view().runs.get(runId)?.status === 'aborted' || this.view().runs.get(runId)?.status === 'paused') return
-        // The watchdog (or abort path) may already have recorded a terminal transition.
-        if (fresh.status !== 'running' && fresh.status !== 'dispatching') return
+        // J19 attempt fence. Two checks, and both are needed:
+        //  - this.liveAttempts still names MY attempt (a retry/takeover has not
+        //    replaced me since I launched), and
+        //  - the folded task agrees (the watchdog or an abort path may already have
+        //    recorded a terminal transition).
+        // The old guard could only test status, so a late result from a superseded
+        // attempt was indistinguishable from the live one's.
+        if (this.liveAttempts.get(key) !== attemptId) {
+          this.ctx.logger('swarm').warn(
+            'task %s: discarding result from superseded attempt %s — a newer attempt owns the task',
+            task.id, attemptId,
+          )
+          // J19: do NOT touch the fence here. `liveAttempts` names the attempt that
+          // replaced this one; clearing it would make the live attempt's own settle
+          // look superseded too, and its result would be discarded (task stranded
+          // `running`/`failed` while the work actually succeeded). The fence is
+          // released by whoever aborts it (abort/pause/resume) or by the attempt
+          // that owns it once it settles. Just re-tick so the task still moves on
+          // if the watchdog had already requeued it.
+          this.scheduleTick()
+          return
+        }
+        if (fresh.status !== 'running' && fresh.status !== 'dispatching') {
+          // J19: another authority (watchdog, boot orphan recovery, pause) has already
+          // reclaimed this task while our child was still settling. Release the fence
+          // so the retry path is not blocked by an attempt that can no longer commit.
+          if (this.liveAttempts.get(key) === attemptId) this.liveAttempts.delete(key)
+          return
+        }
         if (outcome.ok) {
           this.growConcurrency(runId)
           // J2/P5: the evidence contract gates completion. File warnings are advisory
@@ -1542,6 +1675,7 @@ export class SwarmService extends Service {
               this.events.append('task/failed', {
                 runId, taskId: task.id,
                 data: {
+                  attemptId,
                   retry: fresh.attempts <= this.swarmConfig.maxRetries,
                   reason: `evidence contract failed — ${evidence.commandFailures[0]}`,
                 },
@@ -1557,7 +1691,7 @@ export class SwarmService extends Service {
           }
           this.events.append('task/completed', {
             runId, taskId: task.id,
-            data: { summary: outcome.summary ?? '' },
+            data: { attemptId, summary: outcome.summary ?? '' },
           })
           if (task.reviewBy !== undefined && task.reviewBy.length > 0) {
             if (task.reviewGate === 'human') {
@@ -1578,7 +1712,7 @@ export class SwarmService extends Service {
           if (adopted !== undefined) {
             this.events.append('task/completed', {
               runId, taskId: task.id,
-              data: { summary: adopted },
+              data: { attemptId, summary: adopted },
             })
             if (task.reviewBy !== undefined && task.reviewBy.length > 0 && task.reviewGate !== 'human') {
               void this.runReview(runId, task.id, task.reviewBy)
@@ -1601,7 +1735,7 @@ export class SwarmService extends Service {
           const retry = fresh.attempts <= this.swarmConfig.maxRetries
           this.events.append('task/failed', {
             runId, taskId: task.id,
-            data: { retry, reason },
+            data: { attemptId, retry, reason },
           })
           // H-2: record for the circuit breaker (trips when threshold reached).
           this.recordFailure(runId)
@@ -1619,13 +1753,17 @@ export class SwarmService extends Service {
       }).catch((err: unknown) => {
         this.inFlight.delete(key)
         clearSpawnTimeout()
+        // J19: only the attempt that still owns the fence may release it — deleting
+        // unconditionally would strip the fence from a newer attempt and make its
+        // own result look superseded.
+        if (this.liveAttempts.get(key) === attemptId) this.liveAttempts.delete(key)
         this.ctx.logger('swarm').warn('task %s crashed dispatcher bookkeeping: %s', key, String(err))
         // J10: bookkeeping failed, but the child may have finished and written its
         // report. Adopt it so a dispatcher fault does not discard finished work.
         try {
           const adopted = this.adoptTaskReport(runId, task)
           if (adopted !== undefined && this.view().tasks.get(key)?.status === 'running') {
-            this.events.append('task/completed', { runId, taskId: task.id, data: { summary: adopted } })
+            this.events.append('task/completed', { runId, taskId: task.id, data: { attemptId, summary: adopted } })
             this.scheduleTick()
           }
         } catch {
@@ -1636,6 +1774,7 @@ export class SwarmService extends Service {
     this.events.append('task/started', {
       runId, taskId: task.id,
       data: {
+        attemptId,
         label: `swarm:${task.id}`,
         provider: candidates[0]?.provider,
         model: candidates[0]?.model,
@@ -1650,12 +1789,16 @@ export class SwarmService extends Service {
    * Approve → task stands; reject → requeue with feedback (capped at reviewLoops,
    * then fail-open with reviewExhausted); reviewer unavailable → fail-open.
    */
-  private async runReview(runId: string, taskId: string, reviewerRoleId: string): Promise<void> {
+  private async runReview(runId: string, taskId: string, reviewerRoleId: string, attemptId?: string): Promise<void> {
     const key = `${runId}/${taskId}`
+    // J19: pin the verdict to the attempt it judges. A verdict arriving after the
+    // task was retried describes a superseded attempt and must not close the new one.
+    const d = (fields: Record<string, unknown>): Record<string, unknown> =>
+      attemptId !== undefined ? { attemptId, ...fields } : fields
     const reviewerRole = this.duty.role(reviewerRoleId)
     const run = this.view().runs.get(runId)
     if (reviewerRole === undefined || run === undefined) {
-      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'error', feedback: `reviewer role "${reviewerRoleId}" or run context unavailable` } })
+      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: `reviewer role "${reviewerRoleId}" or run context unavailable` }) })
       this.checkRunCompletion(runId)
       return
     }
@@ -1664,7 +1807,7 @@ export class SwarmService extends Service {
       // No reviewer route — fail-open per the review contract.
       this.events.append('task/reviewed', {
         runId, taskId,
-        data: { verdict: 'error', feedback: `no model route for reviewer role "${reviewerRoleId}": pin a provider/model in the Swarm Roster` },
+        data: d({ verdict: 'error', feedback: `no model route for reviewer role "${reviewerRoleId}": pin a provider/model in the Swarm Roster` }),
       })
       this.checkRunCompletion(runId)
       return
@@ -1679,7 +1822,7 @@ export class SwarmService extends Service {
     const parent = await this.ensureAnchor(runId)
     if (parent === undefined) {
       this.inFlight.delete(key)
-      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'error', feedback: 'no spawn anchor available (agents service absent and the dispatching session is gone)' } })
+      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: 'no spawn anchor available (agents service absent and the dispatching session is gone)' }) })
       this.checkRunCompletion(runId)
       return
     }
@@ -1709,7 +1852,7 @@ export class SwarmService extends Service {
       })
     } catch (err) {
       this.inFlight.delete(key)
-      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'error', feedback: String(err instanceof Error ? err.message : err) } })
+      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: String(err instanceof Error ? err.message : err) }) })
       this.checkRunCompletion(runId)
       return
     }
@@ -1719,7 +1862,7 @@ export class SwarmService extends Service {
     if (this.view().tasks.get(key)?.status !== 'reviewing') return // watchdog/abort raced us
 
     if (!outcome.ok) {
-      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'error', feedback: outcome.reason ?? `reviewer stopped: ${outcome.stopReason ?? 'unknown'}` } })
+      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: outcome.reason ?? `reviewer stopped: ${outcome.stopReason ?? 'unknown'}` }) })
       this.checkRunCompletion(runId)
       return
     }
@@ -1728,12 +1871,12 @@ export class SwarmService extends Service {
     if (verdict === 'reject') {
       const reviews = (this.view().tasks.get(key)?.reviews ?? 0) + 1
       const exhausted = reviews >= this.swarmConfig.reviewLoops
-      this.events.append('task/reviewed', { runId, taskId, data: { verdict: 'reject', reviews, ...(exhausted ? { exhausted: true } : {}), feedback } })
+      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'reject', reviews, ...(exhausted ? { exhausted: true } : {}), feedback }) })
       if (exhausted) this.checkRunCompletion(runId)
       else this.scheduleTick()
       return
     }
-    this.events.append('task/reviewed', { runId, taskId, data: { verdict: verdict === 'approve' ? 'approve' : 'error', feedback: verdict === 'approve' ? feedback : 'reviewer gave no explicit verdict (fail-open)' } })
+    this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: verdict === 'approve' ? 'approve' : 'error', feedback: verdict === 'approve' ? feedback : 'reviewer gave no explicit verdict (fail-open)' }) })
     this.checkRunCompletion(runId)
   }
 
@@ -1804,8 +1947,12 @@ export class SwarmService extends Service {
   }
 
   /** Track a spawned child session for report authentication + effort pinning. */
-  trackChildSession(childSessionId: string, taskKey: string, effort?: string): void {
-    this.sessionTasks.set(childSessionId, { taskKey, ...(effort !== undefined ? { effort } : {}) })
+  trackChildSession(childSessionId: string, taskKey: string, effort?: string, attemptId?: string): void {
+    this.sessionTasks.set(childSessionId, {
+      taskKey,
+      ...(effort !== undefined ? { effort } : {}),
+      ...(attemptId !== undefined ? { attemptId } : {}),
+    })
   }
 
   forgetChildSession(childSessionId: string): void {
