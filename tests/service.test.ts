@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -37,6 +37,14 @@ class FakeSubagents {
   quotaCount = 0
   /** Throw a provider-class error on the first call only (A6 rotation). */
   failOnce = false
+  /**
+   * J22: invoked immediately before `failOnce` throws. A test that needs a file to
+   * exist when the child dies writes it here rather than before `dispatch`, so the
+   * file is created DURING the attempt — which is what production looks like, since
+   * the child writes its report as its final action. Writing it earlier would make
+   * it indistinguishable from a stale report left by a previous run.
+   */
+  beforeFail?: (call: StartCall) => void
   /** Throw the real depth-guard error, as the provider does when maxDepth is exceeded (J14). */
   throwDepthError = false
   /**
@@ -66,6 +74,7 @@ class FakeSubagents {
     }
     if (this.failOnce && !this.failedOnce) {
       this.failedOnce = true
+      this.beforeFail?.(call)
       throw new Error('boom: stream idle timeout')
     }
     if (this.throwDepthError) {
@@ -1585,20 +1594,23 @@ describe('swarm service (integration, fake subagents)', () => {
     const { service, fake, dir } = await bootRunnable({ maxRetries: 0 })
     fake.failOnce = true // the child dies after writing its work
 
+    // The agent finished the work and wrote its report, then died before the
+    // dispatcher could record it — exactly the production "landed on disk" case.
+    // Written from the spawn-time hook so it lands during the attempt (J22).
+    fake.beforeFail = () => {
+      mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
+      writeFileSync(
+        join(dir, '.dsh-swarm', 'task-hand.json'),
+        JSON.stringify({ taskId: 'hand', status: 'completed', summary: 'work landed before the crash' }),
+      )
+    }
+
     const result = service.dispatch({
       title: 'durable handoff',
       spec: 's',
       tasks: [{ id: 'hand', subject: 'H', description: 'd', role: 'builder' }],
     }, makeDispatcher(dir) as never)
     service.endorse(result.runId)
-
-    // The agent finished the work and wrote its report, then died before the
-    // dispatcher could record it — exactly the production "landed on disk" case.
-    mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
-    writeFileSync(
-      join(dir, '.dsh-swarm', 'task-hand.json'),
-      JSON.stringify({ taskId: 'hand', status: 'completed', summary: 'work landed before the crash' }),
-    )
 
     await waitFor(
       () => service.snapshot().tasks.find((t) => t.id === 'hand')?.status === 'completed',
@@ -1612,6 +1624,14 @@ describe('swarm service (integration, fake subagents)', () => {
   it('J10: a report that does not claim completion is NOT adopted', async () => {
     const { service, fake, dir } = await bootRunnable({ maxRetries: 0 })
     fake.failOnce = true
+    // Fresh (written during the attempt), so the ONLY reason to refuse is the status.
+    fake.beforeFail = () => {
+      mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
+      writeFileSync(
+        join(dir, '.dsh-swarm', 'task-half.json'),
+        JSON.stringify({ taskId: 'half', status: 'in-progress', summary: 'still going' }),
+      )
+    }
 
     const result = service.dispatch({
       title: 'no false adoption',
@@ -1620,18 +1640,47 @@ describe('swarm service (integration, fake subagents)', () => {
     }, makeDispatcher(dir) as never)
     service.endorse(result.runId)
 
-    mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
-    writeFileSync(
-      join(dir, '.dsh-swarm', 'task-half.json'),
-      JSON.stringify({ taskId: 'half', status: 'in-progress', summary: 'still going' }),
-    )
-
     await waitFor(
       () => ['failed', 'retrying'].includes(service.snapshot().tasks.find((t) => t.id === 'half')?.status ?? ''),
       8000,
       'incomplete report left the task failed',
     )
     expect(service.snapshot().tasks.find((t) => t.id === 'half')?.status).not.toBe('completed')
+  }, 15000)
+
+  // ── J22: an adopted report must belong to the attempt that is settling ────
+  // Live trigger: `.dsh-swarm/task-<id>.json` is keyed by task id, not by run. A
+  // compatibility run reused the ids alpha/beta from an earlier run and both agents
+  // found (and had to correct) a stale "completed" report already sitting there.
+  // Had either child died before writing its own report, the dispatcher would have
+  // adopted that earlier run's file as proof of work this attempt never did.
+  it('J22: a completed report left behind by an earlier run is NOT adopted', async () => {
+    const { service, fake, dir } = await bootRunnable({ maxRetries: 0 })
+    fake.failOnce = true
+
+    // The previous run's report: same task id, claims completion, well-formed.
+    mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
+    const stale = join(dir, '.dsh-swarm', 'task-stale.json')
+    writeFileSync(stale, JSON.stringify({ taskId: 'stale', status: 'completed', summary: 'work from an earlier run' }))
+    const earlier = new Date(Date.now() - 60_000)
+    utimesSync(stale, earlier, earlier)
+
+    const result = service.dispatch({
+      title: 'stale report',
+      spec: 's',
+      tasks: [{ id: 'stale', subject: 'S', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => ['failed', 'retrying'].includes(service.snapshot().tasks.find((t) => t.id === 'stale')?.status ?? ''),
+      8000,
+      'stale report rejected so the task is charged as failed',
+      () => 'tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, t.summary])),
+    )
+    const task = service.snapshot().tasks.find((t) => t.id === 'stale')
+    expect(task?.status).not.toBe('completed')
+    expect(task?.summary ?? '').not.toMatch(/earlier run/)
   }, 15000)
 
   it('J10: the task prompt instructs the agent to write its report last', async () => {

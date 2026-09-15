@@ -171,6 +171,8 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         // J19: a new attempt becomes the one and only writer for this task.
         if (typeof d.attemptId === 'string') task.attemptId = d.attemptId
         else delete task.attemptId
+        // J22: the reference point for "was this report written by the live attempt?".
+        task.attemptStartedAt = event.at
         task.agent = {
           label: str('label') ?? task.agent?.label ?? `swarm:${taskId}`,
           provider: str('provider') ?? task.agent?.provider,

@@ -89,6 +89,16 @@ export interface Task extends TaskSpec {
    * any that belongs to an older attempt.
    */
   attemptId?: string
+  /**
+   * J22: when the live attempt started (the `task/started` timestamp).
+   *
+   * An on-disk task report is adopted only if it was written *during* this attempt.
+   * Without a reference point the dispatcher trusted any well-formed
+   * `task-<id>.json` claiming completion — including one left behind by an earlier
+   * run that reused the same task id, or by an earlier attempt whose evidence gate
+   * had already failed.
+   */
+  attemptStartedAt?: number
   agent?: { label: string; provider?: string; model?: string }
   blockedReason?: string
   lastNote?: string

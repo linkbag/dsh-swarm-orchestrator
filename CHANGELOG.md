@@ -2,6 +2,37 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.6
+
+Reliability fix. Dispatch behaviour is unchanged except in one failure path.
+
+### Fixed
+
+- **An adopted task report must belong to the attempt that is settling.** The handoff
+  file `.dsh-swarm/task-<id>.json` is keyed by task id, not by run, so every run that
+  reuses an id shares it. Adoption checked only that the file was well-formed, claimed
+  `status: "completed"`, and named the right task — so a child that died before writing
+  its own report could be credited with an **earlier run's** work, and a task whose
+  evidence gate had already failed in an earlier attempt could be marked complete by
+  the very report that attempt wrote. Adoption now also requires the file to have been
+  written during the live attempt (`mtime >= task/started`). An older report is logged
+  and ignored, and the task is charged as failed instead of completed.
+
+  The live trigger: the post-upgrade compatibility run reused the task ids `alpha` and
+  `beta` from an earlier run in the same workspace. Both agents independently found the
+  previous run's reports still on disk and rewrote them — which is what kept that run
+  honest, not the dispatcher.
+
+### Verification
+
+- `J22` (`tests/service.test.ts`): a well-formed, aged `completed` report for the same
+  task id is not adopted, and the task is charged as failed. Confirmed to fail with the
+  guard removed — the task completed on the stale file.
+- The two `J10` cases now write their reports from a spawn-time hook, so each isolates
+  one reason to refuse adoption: a fresh report with the wrong status, and a stale
+  report with the right one.
+- 116 tests pass.
+
 ## 0.6.5
 
 Client-only correction. No scheduler behaviour changed.

@@ -62,13 +62,14 @@ This plugin takes the coordination seriously so you don't have to:
 
 > ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** with the default cap of 5 total agents. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` to 3 in the Runtime settings.
 
-### Reliability notes (v0.5.8 – v0.6.5)
+### Reliability notes (v0.5.8 – v0.6.6)
 
 Diagnosed from 47 recorded runs / 184 task failures, then fixed and regression-tested:
 
 - **Evidence commands run under PowerShell** (bash elsewhere) from the workspace root, and the `evidence.commands` schema says so. Previously they were handed to `cmd.exe`, so a perfectly normal PowerShell gate (`if (Test-Path …) { exit 0 }`) failed the task — 32% of all recorded task failures. Prefer `evidence.files` where a file check can express the gate: it involves no shell at all.
 - **`modlens` is denied to swarm roles** by default in the shipped roster guidance: it is an interactive tool that asks the user a question, and swarm children run non-interactively. Add it back per-role from the Roster if your deployment has a headless vision provider.
 - **A task report that does not claim `"status": "completed"` is never adopted** — adoption cannot mask unfinished work.
+- **An adopted report must also have been written by the live attempt.** `.dsh-swarm/task-<id>.json` is keyed by task id, not by run, so reusing an id silently shares the file across runs. A report older than the current attempt's `task/started` is now ignored (and logged) instead of being credited as this attempt's work.
 - **Recovery is scoped to running runs.** Orphan recovery only requeues tasks whose run is still running, so a terminal run's tasks stay frozen instead of being re-failed on every host restart.
 
 ## The dashboard
@@ -253,7 +254,7 @@ Written plainly, because a limit you discover in production costs far more than 
 
 ## Status
 
-v0.6.5, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**115 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, tool-filter sanitisation, preflight effort validation, the global status-badge label, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
+v0.6.6, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**116 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, tool-filter sanitisation, preflight effort validation, the global status-badge label, stale task-report rejection, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
 
 ## License
 

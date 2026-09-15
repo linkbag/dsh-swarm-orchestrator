@@ -767,6 +767,10 @@ export class SwarmService extends Service {
    * its final action; if that file is present and well-formed when the child dies,
    * the work is real and is recorded as completed instead of failed.
    *
+   * J22 narrowed "present" to "written during the live attempt": the path is shared
+   * across runs and attempts, so presence alone also described files this attempt
+   * had nothing to do with.
+   *
    * Returns the summary to record, or undefined when there is nothing to adopt.
    */
   private adoptTaskReport(runId: string, task: Task): string | undefined {
@@ -777,6 +781,21 @@ export class SwarmService extends Service {
     try {
       const info = statSync(reportPath)
       if (!info.isFile() || info.size === 0 || info.size > 256 * 1024) return undefined
+      // J22: the report must have been written DURING the live attempt. The path is
+      // keyed by task id, not by run, so a previous run that reused the id leaves a
+      // well-formed "completed" file behind; and an earlier attempt of this same run
+      // may have written one before its evidence gate failed. Crediting either would
+      // mark work complete that this attempt never did. Adoption exists to rescue a
+      // child that finished and died — that report is by definition newer than the
+      // `task/started` that launched it.
+      const startedAt = (this.view().tasks.get(taskKeyOf(task)) ?? task).attemptStartedAt
+      if (startedAt !== undefined && info.mtimeMs < startedAt) {
+        this.ctx.logger('swarm').warn(
+          'ignoring stale task report for %s: written %ss before the live attempt started',
+          task.id, ((startedAt - info.mtimeMs) / 1000).toFixed(1),
+        )
+        return undefined
+      }
       raw = readFileSync(reportPath, 'utf8')
     } catch {
       return undefined
