@@ -5,8 +5,10 @@ import { useEffect, useState } from 'react'
 import { boardStore, type Board } from './board-store'
 import { DutyTableEditor } from './DutyTableEditor'
 import { RuntimeSettings } from './RuntimeSettings'
+import { statusT, useT } from './locale'
 
 export function SwarmSettingsSection(): JSX.Element {
+  const t = useT()
   const [board, setBoard] = useState<Board | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -29,19 +31,22 @@ export function SwarmSettingsSection(): JSX.Element {
   return (
     <div className="dsh-swarm-settings">
       <h3>
-        🐝 Swarm orchestration
+        {t('section.title')}
         {board !== null && <span className="dsh-swarm-dim" style={{ marginLeft: 8, fontWeight: 400, fontSize: '0.8em' }}>v{board.version}</span>}
       </h3>
       <p className="dsh-swarm-dim">
-        Role-based multi-agent runs. Open any chat's <b>Swarm</b> tab for the live board;
-        this section manages the model roster everywhere.
+        {t('section.description')}
       </p>
-      {error !== null && <p className="dsh-swarm-action-error">swarm host offline: {error}</p>}
+      {error !== null && <p className="dsh-swarm-action-error">{t('section.offline', { error })}</p>}
       {board !== null && (
         <p className="dsh-swarm-dim">
-          {board.runs.length} run{board.runs.length === 1 ? '' : 's'} total
-          {' · '}{active.length} active{active.length > 0 ? ` (${active.map((r) => r.status).join(', ')})` : ''}
-          {' · '}{done.length} finished
+          {t('section.summary', {
+            total: board.runs.length,
+            plural: board.runs.length === 1 ? '' : 's',
+            active: active.length,
+            detail: active.length > 0 ? ` (${active.map((r) => statusT(r.status)).join(', ')})` : '',
+            done: done.length,
+          })}
         </p>
       )}
       <DutyTableEditor board={board} onSaved={() => {}} />

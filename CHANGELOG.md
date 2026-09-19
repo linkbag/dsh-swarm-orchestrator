@@ -2,6 +2,32 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.8
+
+The Swarm interface now speaks your language.
+
+### Added
+
+- **简体中文 interface, following the DSH language preference automatically.**
+  Every Swarm surface — board columns, flow chart, roster editor, runtime tuning,
+  the header popover, the dispatch card and the global 🐝 badge — translates through
+  the client locale service: a `swarm` namespace registered in English and 简体中文,
+  bound once, read at render time. Switching Settings → General → Language re-renders
+  the Swarm UI in place; no reload. Statuses (planning / 运行中 / 评审中 / …), column
+  names, field labels, placeholders, tooltips and time-ago strings are all covered.
+  Unknown statuses and host-originated content (task summaries, error bodies) pass
+  through untranslated, by design.
+- **🐝 badge labels are injectable templates** translated through the same service,
+  re-rendered on locale changes.
+
+### Verification
+
+- `tests/locale.test.ts` — 7 tests: en/zh key parity (a missing key renders as a raw
+  `tab.board`-style key in one language only — the ugliest failure mode), non-empty +
+  CJK spot checks, `{var}` interpolation, status passthrough, English fallback without
+  a locale service, and active-locale switching through a bound service.
+- 135 tests pass.
+
 ## 0.6.7
 
 Client fix for DSH 0.1.6. No scheduler behaviour changed.

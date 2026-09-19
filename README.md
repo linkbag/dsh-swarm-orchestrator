@@ -84,6 +84,7 @@ A **Swarm** tab lives next to Chat in the web GUI, in three views:
 - **Roster** — the duty-table editor: per-role model pickers fed by your live catalog, fallback-chain ordering, effort ladder, concurrency caps, tool filters, personas, custom roles, and an override lock for "hands off my table". The pickers list only providers you have configured in DSH (with API keys) and follow changes automatically — DSH 0.1.6+ required.
 - **Everywhere else** — a 🐝 status button in every session header, a small badge for active runs, and a live progress card right in chat where the run was dispatched.
 - **Workspace-aware** — each chat's Swarm tab shows the runs for that chat's workspace; an **All** switch reveals every run on the machine. The roster stays global (one table, all workspaces).
+- **Language** — the Swarm UI follows the DSH language preference (Settings → General → Language) automatically: English and 简体中文 ship in the box, switching re-renders in place.
 
 ## How a run works
 
@@ -257,7 +258,7 @@ Written plainly, because a limit you discover in production costs far more than 
 
 ## Status
 
-v0.6.7, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**128 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, tool-filter sanitisation, preflight effort validation, the global status-badge label, stale task-report rejection, the model-catalog wire faces, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
+v0.6.8, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**135 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, tool-filter sanitisation, preflight effort validation, the global status-badge label, stale task-report rejection, the model-catalog wire faces, interface localization, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
 
 ## License
 

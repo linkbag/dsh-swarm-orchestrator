@@ -2,6 +2,7 @@
 // (active runs + latest statuses from the board), so the swarm is visible
 // and one glance away even on surfaces where chat tabs do not render.
 import { useEffect, useState } from 'react'
+import { statusT, useT } from './locale'
 
 interface LiveBoard {
   runs: Array<{ id: string; title: string; status: string }>
@@ -16,6 +17,7 @@ function statusColor(status: string): string {
 }
 
 export function SwarmHeaderButton(): JSX.Element {
+  const t = useT()
   const [open, setOpen] = useState(false)
   const [runs, setRuns] = useState<LiveBoard['runs']>([])
 
@@ -42,21 +44,21 @@ export function SwarmHeaderButton(): JSX.Element {
     <div className="dsh-swarm-hbtn-wrap">
       <button
         className="dsh-swarm-hbtn"
-        title="Swarm runs"
+        title={t('header.title')}
         onClick={() => { setOpen(!open) }}
       >🐝</button>
       {open && (
         <div className="dsh-swarm-hpop">
-          <b>Swarm runs</b>
-          {runs.length === 0 && <p className="dsh-swarm-dim">no runs yet — dispatch one from any chat</p>}
+          <b>{t('header.title')}</b>
+          {runs.length === 0 && <p className="dsh-swarm-dim">{t('header.empty')}</p>}
           {runs.map((r) => (
             <div key={r.id} className="dsh-swarm-hpop-row">
-              <span className="dsh-swarm-tvc-dot" style={{ background: statusColor(r.status) }} title={r.status} />
+              <span className="dsh-swarm-tvc-dot" style={{ background: statusColor(r.status) }} title={statusT(r.status)} />
               <span>{r.title.length > 42 ? r.title.slice(0, 42) + '…' : r.title}</span>
-              <span className="dsh-swarm-dim">{r.status}</span>
+              <span className="dsh-swarm-dim">{statusT(r.status)}</span>
             </div>
           ))}
-          <p className="dsh-swarm-dim">open a chat's Swarm tab for the live board · Settings → Swarm for the roster</p>
+          <p className="dsh-swarm-dim">{t('header.footer')}</p>
         </div>
       )}
     </div>

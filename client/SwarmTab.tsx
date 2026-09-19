@@ -3,12 +3,15 @@ import { boardStore, type Board, type BoardTask } from './board-store'
 import { DutyTableEditor } from './DutyTableEditor'
 import { FlowChart } from './FlowChart'
 import { RuntimeSettings } from './RuntimeSettings'
+import { statusT, useT, t as translate } from './locale'
 
-const STATUS_COLUMNS: Array<{ key: string; label: string; statuses: string[] }> = [
-  { key: 'queued', label: 'Queued', statuses: ['pending', 'retrying'] },
-  { key: 'running', label: 'Running', statuses: ['dispatching', 'running', 'reviewing'] },
-  { key: 'done', label: 'Done', statuses: ['completed'] },
-  { key: 'attention', label: 'Failed / Blocked', statuses: ['failed', 'blocked'] },
+type T = (key: string, vars?: Record<string, string | number>) => string
+
+const STATUS_COLUMNS: Array<{ key: string; labelKey: string; statuses: string[] }> = [
+  { key: 'queued', labelKey: 'col.queued', statuses: ['pending', 'retrying'] },
+  { key: 'running', labelKey: 'col.running', statuses: ['dispatching', 'running', 'reviewing'] },
+  { key: 'done', labelKey: 'col.done', statuses: ['completed'] },
+  { key: 'attention', labelKey: 'col.attention', statuses: ['failed', 'blocked'] },
 ]
 
 function statusColor(status: string): string {
@@ -22,17 +25,18 @@ function statusColor(status: string): string {
   }
 }
 
-function timeAgo(at: number): string {
+function timeAgo(at: number, t: T): string {
   // Clock skew (manual time changes, TZ shifts) can make timestamps land in
   // the "future" — clamp so nothing reads as a negative age.
   const seconds = Math.max(0, Math.round((Date.now() - at) / 1000))
-  if (seconds < 60) return `${seconds}s ago`
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`
-  if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`
-  return `${Math.round(seconds / 86400)}d ago`
+  if (seconds < 60) return t('time.seconds', { n: seconds })
+  if (seconds < 3600) return t('time.minutes', { n: Math.round(seconds / 60) })
+  if (seconds < 86400) return t('time.hours', { n: Math.round(seconds / 3600) })
+  return t('time.days', { n: Math.round(seconds / 86400) })
 }
 
 export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
+  const t = useT()
   const [board, setBoard] = useState<Board | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
@@ -123,27 +127,27 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
       <header className="dsh-swarm-header">
         <h2>Swarm</h2>
         <div className="dsh-swarm-segments" role="tablist">
-          <button className={view === 'board' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('board') }}>Board</button>
-          <button className={view === 'flow' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('flow') }}>Flow</button>
-          <button className={view === 'roster' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('roster') }}>Roster</button>
+          <button className={view === 'board' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('board') }}>{t('tab.board')}</button>
+          <button className={view === 'flow' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('flow') }}>{t('tab.flow')}</button>
+          <button className={view === 'roster' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('roster') }}>{t('tab.roster')}</button>
         </div>
   // Workspace scope switch: visible whenever the tab knows which chat it is in.
   {sessionId !== undefined && (
-    <div className="dsh-swarm-segments" role="tablist" title="Which runs this tab shows">
+    <div className="dsh-swarm-segments" role="tablist" title={t('scope.title')}>
       <button
         className={scope === 'workspace' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'}
         disabled={cwdUnresolvable}
-        title={cwdUnresolvable ? "Couldn't resolve this chat's workspace — showing all runs" : 'Show runs from this workspace'}
+        title={cwdUnresolvable ? t('scope.unresolvableTitle') : t('scope.showWorkspace')}
         onClick={() => { switchScope('workspace') }}
-      >This workspace</button>
+      >{t('scope.workspace')}</button>
       <button
         className={scope === 'all' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'}
         onClick={() => { switchScope('all') }}
-      >All</button>
+      >{t('scope.all')}</button>
     </div>
   )}
         <span className={error !== null ? 'dsh-swarm-pill warn' : 'dsh-swarm-pill'}>
-          {error !== null ? 'host offline' : board !== null ? `v${board.version} · seq ${board.seq} · ${runs.length} run${runs.length === 1 ? '' : 's'}` : 'connecting…'}
+          {error !== null ? t('pill.offline') : board !== null ? t('pill.info', { version: board.version, seq: board.seq, count: runs.length, plural: runs.length === 1 ? '' : 's' }) : t('pill.connecting')}
         </span>
       </header>
 
@@ -151,7 +155,7 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
         <>
           {cwdUnresolvable && sessionId !== undefined && (
             <p className="dsh-swarm-dim" style={{ padding: '8px 16px 0' }}>
-              Couldn't resolve this chat's workspace — showing the shared roster for all workspaces.
+              {t('roster.unresolvable')}
             </p>
           )}
           <DutyTableEditor board={board} onSaved={() => {}} />
@@ -161,16 +165,14 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
         run !== null ? (
           <FlowChart run={run} tasks={tasks} />
         ) : (
-          <div className="dsh-swarm-placeholder"><p>No run selected — dispatch a run or pick one on the Board first.</p></div>
+          <div className="dsh-swarm-placeholder"><p>{t('flow.noRun')}</p></div>
         )
       ) : board === null && error === null ? (
-        <div className="dsh-swarm-placeholder"><p>Connecting to the swarm host…</p></div>
+        <div className="dsh-swarm-placeholder"><p>{t('board.connecting')}</p></div>
       ) : runs.length === 0 ? (
         <div className="dsh-swarm-placeholder">
-          <p>No swarm runs yet.</p>
-          <p className="dsh-swarm-dim">
-            Ask the agent to decompose work and call <code>swarm_dispatch</code>; runs appear here live.
-          </p>
+          <p>{t('board.emptyTitle')}</p>
+          <p className="dsh-swarm-dim">{t('board.emptyHint')}</p>
         </div>
       ) : (
         <div className="dsh-swarm-body">
@@ -183,7 +185,7 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
               >
                 <span className="dsh-swarm-run-dot" style={{ background: statusColor(r.status) }} />
                 <span className="dsh-swarm-run-title">{r.title}</span>
-                <span className="dsh-swarm-run-meta">{r.status} · {timeAgo(r.createdAt)}</span>
+                <span className="dsh-swarm-run-meta">{statusT(r.status)} · {timeAgo(r.createdAt, t)}</span>
               </button>
             ))}
           </aside>
@@ -194,7 +196,7 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                 <div>
                   <h3>{run.title}</h3>
                   <p className="dsh-swarm-dim">{run.spec.length > 220 ? run.spec.slice(0, 220) + '…' : run.spec}</p>
-                  <p className="dsh-swarm-dim">created {timeAgo(run.createdAt)}{run.completedAt !== undefined && run.createdAt !== undefined ? ` · finished ${timeAgo(run.completedAt)}` : ` · elapsed ${timeAgo(run.createdAt)}`}</p>
+                  <p className="dsh-swarm-dim">{t('run.created', { time: timeAgo(run.createdAt, t) })}{run.completedAt !== undefined && run.createdAt !== undefined ? ` · ${t('run.finished', { time: timeAgo(run.completedAt, t) })}` : ` · ${t('run.elapsed', { time: timeAgo(run.createdAt, t) })}`}</p>
                   {(() => {
                     const cwd = run.dispatch?.cwd
                     if (cwd === undefined) return null
@@ -203,24 +205,24 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                       r.id !== run.id && (r.status === 'planning' || r.status === 'running' || r.status === 'paused')
                       && r.dispatch?.cwd !== undefined && norm(r.dispatch.cwd) === norm(cwd))
                     return siblings.length > 0
-                      ? <p className="dsh-swarm-run-banner">⚠ {siblings.length} other active run{siblings.length === 1 ? '' : 's'} in this workspace: {siblings.map((s) => s.title).join(' · ')}</p>
+                      ? <p className="dsh-swarm-run-banner">⚠ {t('run.others', { count: siblings.length, plural: siblings.length === 1 ? '' : 's', titles: siblings.map((s) => s.title).join(' · ') })}</p>
                       : null
                   })()}
                 </div>
                 <div className="dsh-swarm-run-actions">
                   {(run.status === 'planning') && (
                     <button className="dsh-swarm-btn primary" disabled={busy} onClick={() => { void runAction({ action: 'endorse', runId: run.id }) }}>
-                      ✓ Endorse &amp; Launch
+                      {t('run.endorse')}
                     </button>
                   )}
                   {(run.status === 'paused' || run.status === 'failed') && (
-                    <button className="dsh-swarm-btn primary" disabled={busy} title="Requeue failed tasks and keep completed ones" onClick={() => { void runAction({ action: 'resume', runId: run.id }) }}>
-                      ↻ Resume
+                    <button className="dsh-swarm-btn primary" disabled={busy} title={t('run.resumeTitle')} onClick={() => { void runAction({ action: 'resume', runId: run.id }) }}>
+                      {t('run.resume')}
                     </button>
                   )}
                   {(run.status === 'running' || run.status === 'planning' || run.status === 'paused') && (
                     <button className="dsh-swarm-btn danger" disabled={busy} onClick={() => { void runAction({ action: 'abort', runId: run.id }) }}>
-                      Abort
+                      {t('run.abort')}
                     </button>
                   )}
                 </div>
@@ -229,24 +231,29 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                 <p className="dsh-swarm-run-banner">⏸ {run.pauseReason}</p>
               )}
               {run.status === 'failed' && (
-                <p className="dsh-swarm-run-banner">✖ Run failed — see the Failed/Blocked column. Fix the cause, then Resume to requeue failed tasks (completed tasks are kept).</p>
+                <p className="dsh-swarm-run-banner">{t('run.failedBanner')}</p>
               )}
               {actionError !== null && <p className="dsh-swarm-action-error">{actionError}</p>}
 
               {run.report !== undefined && (
                 <details className="dsh-swarm-report" open>
                   <summary>
-                    Run report — {run.report.taskCount} tasks in {Math.round(run.report.durationMs / 1000)}s
-                    {' · '}{run.report.stats.fallbacks} fallback{run.report.stats.fallbacks === 1 ? '' : 's'}
-                    {' · '}{run.report.stats.retries} retr{run.report.stats.retries === 1 ? 'y' : 'ies'}
-                    {' · '}{run.report.stats.reviewsPassed}/{run.report.stats.reviewsPassed + run.report.stats.reviewsRejected} reviews passed
+                    {t('run.report', {
+                      count: run.report.taskCount,
+                      seconds: Math.round(run.report.durationMs / 1000),
+                      fallbacks: run.report.stats.fallbacks,
+                      plural: run.report.stats.fallbacks === 1 ? '' : 's',
+                      retries: run.report.stats.retries,
+                      passed: run.report.stats.reviewsPassed,
+                      total: run.report.stats.reviewsPassed + run.report.stats.reviewsRejected,
+                    })}
                   </summary>
                   <ul>
                     {run.report.tasks.map((t) => (
                       <li key={t.id}>
                         <code>{t.id}</code> <kbd>{t.role}</kbd>
                         {t.model !== undefined && <em> {t.model}</em>}
-                        {t.reviewExhausted === true && <strong title="review loop exhausted"> ⚠</strong>}
+                        {t.reviewExhausted === true && <strong title={translate('run.reviewExhausted')}> ⚠</strong>}
                         {t.summary !== undefined && <span> — {t.summary.length > 200 ? t.summary.slice(0, 200) + '…' : t.summary}</span>}
                       </li>
                     ))}
@@ -259,7 +266,7 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                   const columnTasks = tasks.filter((t) => column.statuses.includes(t.status))
                   return (
                     <section key={column.key} className="dsh-swarm-column">
-                      <h4>{column.label} <span className="dsh-swarm-count">{columnTasks.length}</span></h4>
+                      <h4>{t(column.labelKey)} <span className="dsh-swarm-count">{columnTasks.length}</span></h4>
                       {columnTasks.map((task) => (
                         <button
                           key={task.id}
@@ -273,12 +280,12 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                             {task.agent?.model !== undefined && <code>{task.agent.provider ?? ''}/{task.agent.model}</code>}
                             {task.attempts > 1 && <em>×{task.attempts}</em>}
                             {task.reviewBy !== undefined && (task.reviewed === true
-                              ? <em title={`reviewed by ${task.reviewBy}`}>✓✓</em>
+                              ? <em title={translate('task.reviewedByTitle', { role: task.reviewBy })}>✓✓</em>
                               : task.humanReview === true
-                                ? <em title="awaiting human review">👤</em>
-                                : <em title={`review loop: ${task.reviewBy}`}>↻{task.reviews ?? 0}</em>)}
+                                ? <em title={translate('task.humanReviewTitle')}>👤</em>
+                                : <em title={translate('task.reviewLoopTitle', { role: task.reviewBy })}>↻{task.reviews ?? 0}</em>)}
                             {task.nudgedAt !== undefined && (
-                              <em title={`no progress note recently — the watchdog is watching this task`} style={{ color: 'rgb(227, 148, 36)' }}>🔕</em>
+                              <em title={translate('task.noNoteTitle')} style={{ color: 'rgb(227, 148, 36)' }}>🔕</em>
                             )}
                           </span>
                           {task.lastNote !== undefined && (() => {
@@ -286,7 +293,7 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                             return (
                               <span
                                 className={stale ? 'dsh-swarm-task-note stale' : 'dsh-swarm-task-note'}
-                                title={stale && task.lastNoteAt !== undefined ? `note from ${timeAgo(task.lastNoteAt)}` : undefined}
+                                title={stale && task.lastNoteAt !== undefined ? translate('task.noteFrom', { time: timeAgo(task.lastNoteAt, translate) }) : undefined}
                               >
                                 {task.lastNote.length > 90 ? task.lastNote.slice(0, 90) + '…' : task.lastNote}
                               </span>
@@ -309,66 +316,66 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                 <button className="dsh-swarm-btn ghost" onClick={() => { setSelectedTask(null) }}>✕</button>
               </header>
               <dl>
-                <dt>Task</dt><dd><code>{selectedTask.id}</code></dd>
-                <dt>Status</dt><dd style={{ color: statusColor(selectedTask.status) }}>{selectedTask.status}{selectedTask.blockedReason !== undefined ? ` — ${selectedTask.blockedReason}` : ''}</dd>
-                <dt>Role</dt><dd><kbd>{selectedTask.role}</kbd></dd>
-                <dt>Model</dt>
-                <dd>{selectedTask.agent?.model !== undefined ? `${selectedTask.agent.provider ?? ''} / ${selectedTask.agent.model}` : 'deployment default'}</dd>
+                <dt>{t('field.task')}</dt><dd><code>{selectedTask.id}</code></dd>
+                <dt>{t('field.status')}</dt><dd style={{ color: statusColor(selectedTask.status) }}>{statusT(selectedTask.status)}{selectedTask.blockedReason !== undefined ? ` — ${selectedTask.blockedReason}` : ''}</dd>
+                <dt>{t('field.role')}</dt><dd><kbd>{selectedTask.role}</kbd></dd>
+                <dt>{t('field.model')}</dt>
+                <dd>{selectedTask.agent?.model !== undefined ? `${selectedTask.agent.provider ?? ''} / ${selectedTask.agent.model}` : t('field.deploymentDefault')}</dd>
                 {selectedTask.blockedBy !== undefined && selectedTask.blockedBy.length > 0 && (
                   <>
-                    <dt>Depends on</dt><dd>{selectedTask.blockedBy.map((b) => <code key={b}>{b}</code>)}</dd>
+                    <dt>{t('field.dependsOn')}</dt><dd>{selectedTask.blockedBy.map((b) => <code key={b}>{b}</code>)}</dd>
                   </>
                 )}
                 {selectedTask.reviewBy !== undefined && (
                   <>
-                    <dt>Reviewed by</dt><dd><kbd>{selectedTask.reviewBy}</kbd>{selectedTask.reviewed === true ? ' ✓' : ''}{(selectedTask.reviews ?? 0) > 0 ? ` (${selectedTask.reviews} round${selectedTask.reviews === 1 ? '' : 's'})` : ''}{selectedTask.reviewExhausted === true ? ' — loop exhausted, output stands' : ''}</dd>
+                    <dt>{t('field.reviewedBy')}</dt><dd><kbd>{selectedTask.reviewBy}</kbd>{selectedTask.reviewed === true ? ' ✓' : ''}{(selectedTask.reviews ?? 0) > 0 ? ` ${t('field.rounds', { count: selectedTask.reviews ?? 0, plural: (selectedTask.reviews ?? 0) === 1 ? '' : 's' })}` : ''}{selectedTask.reviewExhausted === true ? t('field.loopExhausted') : ''}</dd>
                   </>
                 )}
                 {selectedTask.writes !== undefined && selectedTask.writes.length > 0 && (
                   <>
-                    <dt>Write scope</dt><dd>{selectedTask.writes.map((f) => <code key={f}>{f}</code>).join(' ')}</dd>
+                    <dt>{t('field.writeScope')}</dt><dd>{selectedTask.writes.map((f) => <code key={f}>{f}</code>).join(' ')}</dd>
                   </>
                 )}
-                <dt>Attempts</dt><dd>{selectedTask.attempts}</dd>
-                <dt>Updated</dt><dd>{timeAgo(selectedTask.updatedAt)}</dd>
+                <dt>{t('field.attempts')}</dt><dd>{selectedTask.attempts}</dd>
+                <dt>{t('field.updated')}</dt><dd>{timeAgo(selectedTask.updatedAt, t)}</dd>
               </dl>
-              <h4>Brief</h4>
+              <h4>{t('field.brief')}</h4>
               <p className="dsh-swarm-brief">{selectedTask.description}</p>
               {selectedTask.summary !== undefined && selectedTask.summary.length > 0 && (
                 <>
-                  <h4>Final summary</h4>
+                  <h4>{t('field.finalSummary')}</h4>
                   <p className="dsh-swarm-brief">{selectedTask.summary}</p>
                 </>
               )}
               {selectedTask.reviewFeedback !== undefined && selectedTask.reviewFeedback.length > 0 && (
                 <>
-                  <h4>Reviewer feedback</h4>
+                  <h4>{t('field.reviewerFeedback')}</h4>
                   <p className="dsh-swarm-brief">{selectedTask.reviewFeedback}</p>
                 </>
               )}
               {selectedTask.lastNote !== undefined && selectedTask.lastNote !== selectedTask.summary && (
                 <>
-                  <h4>Latest note</h4>
+                  <h4>{t('field.latestNote')}</h4>
                   <p className="dsh-swarm-brief">{selectedTask.lastNote}</p>
                 </>
               )}
               {(selectedTask.humanReview === true && selectedTask.status === 'reviewing') && (
                 <>
-                  <h4>Human review pending</h4>
+                  <h4>{t('review.pending')}</h4>
                   <div className="dsh-swarm-tvc-actions">
                     <button
                       className="dsh-swarm-btn primary"
                       disabled={busy}
                       onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'approve' }).then(() => setSelectedTask(null)) }}
                     >
-                      ✓ Approve
+                      {t('review.approve')}
                     </button>
                     <button
                       className="dsh-swarm-btn danger"
                       disabled={busy}
                       onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'reject' }) }}
                     >
-                      ✖ Reject (send back with feedback)
+                      {t('review.reject')}
                     </button>
                   </div>
                 </>
@@ -379,7 +386,7 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                   disabled={busy}
                   onClick={() => { void runAction({ action: 'retry-task', runId: selectedTask.runId, taskId: selectedTask.id }) }}
                 >
-                  ↻ Retry task
+                  {t('task.retry')}
                 </button>
               )}
             </aside>

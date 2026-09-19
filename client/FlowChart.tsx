@@ -7,6 +7,7 @@
 // (bottom-center → top-center). The canvas scales to fit the pane.
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { BoardRun, BoardTask } from './board-store'
+import { statusT, useT, type Translate } from './locale'
 
 const NODE_W = 200
 const NODE_H = 68        // uniform — deterministic layout
@@ -25,20 +26,21 @@ function statusColor(status: string): string {
   return 'rgba(125, 125, 125, 0.7)'
 }
 
-function phaseLabel(task: BoardTask): string {
+function phaseLabel(task: BoardTask, t: Translate): string {
   switch (task.status) {
-    case 'completed': return task.reviewed === true ? 'done · reviewed' : 'done'
-    case 'reviewing': return task.humanReview === true ? 'human review' : `review · ${task.reviewBy ?? ''}`
-    case 'running': return 'running'
-    case 'dispatching': return 'dispatching'
-    case 'retrying': return `retrying (attempt ${task.attempts + 1})`
-    case 'failed': return 'failed'
-    case 'blocked': return 'blocked'
-    default: return (task.blockedBy ?? []).length > 0 ? 'waiting' : 'queued'
+    case 'completed': return task.reviewed === true ? t('phase.doneReviewed') : t('phase.done')
+    case 'reviewing': return task.humanReview === true ? t('phase.humanReview') : t('phase.review', { role: task.reviewBy ?? '' })
+    case 'running': return t('phase.running')
+    case 'dispatching': return t('phase.dispatching')
+    case 'retrying': return t('phase.retrying', { n: task.attempts + 1 })
+    case 'failed': return t('phase.failed')
+    case 'blocked': return t('phase.blocked')
+    default: return (task.blockedBy ?? []).length > 0 ? t('phase.waiting') : t('phase.queued')
   }
 }
 
 export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] }): JSX.Element {
+  const t = useT()
   const layout = useMemo(() => {
     // Longest-path ranking: tasks with no blockers sit in wave 0.
     const rankOf = new Map<string, number>()
@@ -115,16 +117,16 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
   const bottomCx = (x: number): number => x + NODE_W / 2
   const topCx = (x: number): number => x + NODE_W / 2
 
-  const schedulerStatus = run.status === 'planning' ? 'awaiting endorsement' : run.status
+  const schedulerStatus = run.status === 'planning' ? t('flow.awaitingEndorsement') : statusT(run.status)
 
   return (
     <div className="dsh-swarm-flow">
       <div className="dsh-swarm-flow-legend">
-        <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('completed') }} /> done</span>
-        <span><span className="dsh-swarm-tvc-dot live" style={{ background: statusColor('running') }} /> running</span>
-        <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('reviewing') }} /> review</span>
-        <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('failed') }} /> failed</span>
-        <span><span className="dsh-swarm-tvc-dot" style={{ background: 'rgba(125, 125, 125, 0.6)' }} /> queued</span>
+        <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('completed') }} /> {t('legend.done')}</span>
+        <span><span className="dsh-swarm-tvc-dot live" style={{ background: statusColor('running') }} /> {t('legend.running')}</span>
+        <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('reviewing') }} /> {t('legend.review')}</span>
+        <span><span className="dsh-swarm-tvc-dot" style={{ background: statusColor('failed') }} /> {t('legend.failed')}</span>
+        <span><span className="dsh-swarm-tvc-dot" style={{ background: 'rgba(125, 125, 125, 0.6)' }} /> {t('legend.queued')}</span>
       </div>
       <div ref={wrapRef} className="dsh-swarm-flow-fit" style={{ height: Math.round(layout.height * scale) }}>
         <div
@@ -208,7 +210,7 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
             className="dsh-swarm-flow-node scheduler"
             style={{ left: schedulerX, top: 0, width: NODE_W, height: SCHEDULER_H, zIndex: 1 }}
           >
-            <div className="dsh-swarm-flow-node-title">⌘ scheduler</div>
+            <div className="dsh-swarm-flow-node-title">{t('flow.scheduler')}</div>
             <div className="dsh-swarm-flow-node-sub">{schedulerStatus}</div>
           </div>
 
@@ -223,7 +225,7 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
                 className="dsh-swarm-flow-wave"
                 style={{ left: layout.width / 2, top: labelY, transform: 'translateX(-50%)', zIndex: 1 }}
               >
-                wave {r + 1}{parallel ? ` · ${row.length} parallel` : ''}
+                {t('flow.wave', { n: r + 1 })}{parallel ? t('flow.parallelCount', { count: row.length }) : ''}
               </div>
             )
           })}
@@ -241,14 +243,14 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
                 key={task.id}
                 className="dsh-swarm-flow-node"
                 style={{ left: pos.x, top: pos.y, width: NODE_W, height: NODE_H, borderColor: color, zIndex: 1 }}
-                title={`${task.subject}${(task.writes ?? []).length > 0 ? `\nwrites: ${(task.writes ?? []).join(', ')}` : ''}`}
+                title={`${task.subject}${(task.writes ?? []).length > 0 ? `\n${t('flow.writesTitle', { paths: (task.writes ?? []).join(', ') })}` : ''}`}
               >
                 <div className="dsh-swarm-flow-node-title">
                   <span className="dsh-swarm-flow-dot" style={{ background: color }} />
                   <code>{task.id}</code>
                   <span className="dsh-swarm-flow-role">{task.role}</span>
                 </div>
-                <div className="dsh-swarm-flow-node-sub">{phaseLabel(task)}</div>
+                <div className="dsh-swarm-flow-node-sub">{phaseLabel(task, t)}</div>
                 {writeHint !== '' && <div className="dsh-swarm-flow-node-writes">{writeHint}</div>}
               </div>
             )
@@ -259,8 +261,8 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
             className="dsh-swarm-flow-node report"
             style={{ left: layout.width / 2 - NODE_W / 2, top: layout.reportY, width: NODE_W, height: REPORT_H, zIndex: 1 }}
           >
-            <div className="dsh-swarm-flow-node-title">📄 run report</div>
-            <div className="dsh-swarm-flow-node-sub">{run.status === 'completed' ? 'generated' : run.status === 'failed' ? 'failed' : 'on completion'}</div>
+            <div className="dsh-swarm-flow-node-title">{t('flow.report')}</div>
+            <div className="dsh-swarm-flow-node-sub">{run.status === 'completed' ? t('flow.generated') : run.status === 'failed' ? t('phase.failed') : t('flow.onCompletion')}</div>
           </div>
         </div>
       </div>

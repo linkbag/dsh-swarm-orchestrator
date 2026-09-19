@@ -4,13 +4,16 @@
 // uses. Data bridge: the node half's /swarm HTTP+SSE routes; the live model
 // catalog comes from the llm RPC face — `ctx.remote.llm.*` on DSH 0.1.6+,
 // the legacy `connection.api` face before that (see client/catalog.ts).
+// Interface text follows the DSH language preference via the locale service
+// (see client/locale.ts).
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import { SwarmTab } from './SwarmTab'
 import { SwarmSettingsSection } from './SwarmSettingsSection'
 import { SwarmHeaderButton } from './SwarmHeaderButton'
 import { SwarmDispatchCard } from './ToolDispatchCard'
-import { badgeView } from './badge'
+import { badgeView, type BadgeLabels } from './badge'
 import { setFacesGetter, type LegacyApiLike, type RemoteLike } from './catalog'
+import { initLocale, setLocaleService, t, type LocaleLike } from './locale'
 import css from './swarm.css'
 
 export const name = 'dsh-swarm-orchestrator-client'
@@ -19,9 +22,10 @@ export const name = 'dsh-swarm-orchestrator-client'
  * Required client services (cordis fiber inject — the loader treats module exports as the plugin object).
  * `remote`, `remote.llm` and `remote.session` are the 0.1.6 typert Remote faces the
  * model catalog calls (the same keys the shipped model-selection UI declares);
- * `connection` remains for the legacy ≤0.1.5 wire-face fallback.
+ * `connection` remains for the legacy ≤0.1.5 wire-face fallback; `locale` carries
+ * the language preference and dictionary registry the Swarm UI translates through.
  */
-export const inject = ['slots', 'connection', 'remote', 'remote.llm', 'remote.session']
+export const inject = ['slots', 'connection', 'remote', 'remote.llm', 'remote.session', 'locale']
 
 export function apply(ctx: ClientContext): (() => void) | void {
   let style: HTMLStyleElement | null = null
@@ -45,6 +49,13 @@ export function apply(ctx: ClientContext): (() => void) | void {
     const remote = (ctx as unknown as { remote?: unknown }).remote as RemoteLike | undefined
     return { api, remote }
   })
+
+  // Localization: register the swarm dictionaries and keep the service reachable
+  // for hooks (`useT`) and non-React surfaces (the badge). The UI follows the
+  // DSH language preference (Settings → General → Language) automatically.
+  const locale = (ctx as unknown as { locale?: LocaleLike }).locale
+  initLocale(locale)
+  setLocaleService(locale)
 
   ctx.slots.inject('conversation.view' as never, () =>
     ctx.slots.register(
@@ -90,7 +101,18 @@ export function apply(ctx: ClientContext): (() => void) | void {
       void fetch('/swarm/board')
         .then((r) => r.json() as Promise<{ runs?: Array<{ status: string; createdAt?: number }> }>)
         .then((board) => {
-          const view = badgeView(board.runs)
+          const statusWord = (status: string): string => {
+            const translated = t(`status.${status}`)
+            return translated === `status.${status}` ? status : translated
+          }
+          const labels: BadgeLabels = {
+            active: t('badge.active'),
+            paused: t('badge.paused'),
+            awaiting: t('badge.awaiting'),
+            last: t('badge.last'),
+            status: statusWord,
+          }
+          const view = badgeView(board.runs, labels)
           badge.textContent = view.text
           badge.className = view.alert ? 'dsh-swarm-badge alert' : 'dsh-swarm-badge'
           badge.style.display = view.text.length === 0 ? 'none' : 'block'
@@ -101,6 +123,8 @@ export function apply(ctx: ClientContext): (() => void) | void {
     source.onmessage = update
     source.onerror = () => { badge.style.display = 'none' }
     const poll = setInterval(update, 60000)
+    // A language switch must re-label the badge too — refetch and re-render.
+    const offLocale = locale?.subscribe?.(() => { update() })
     update()
     // Teardown: closed when the plugin's style element is removed (apply disposer).
     const observer = new MutationObserver(() => {

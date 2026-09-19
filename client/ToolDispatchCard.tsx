@@ -3,6 +3,7 @@
 // and the created run id. Structural typing only: the tool block shape is
 // mirrored locally so the bundle keeps its externals table unchanged.
 import { useEffect, useState } from 'react'
+import { statusT, useT } from './locale'
 
 interface TaskSpecView {
   id?: string
@@ -73,22 +74,25 @@ function dotColor(status: string): string {
   return 'rgba(125, 125, 125, 0.6)'
 }
 
-function statusLabel(tasks: LiveTask[]): { text: string; live: boolean } {
-  if (tasks.length === 0) return { text: 'queued', live: false }
-  if (tasks.every((t) => t.status === 'completed')) return { text: 'all done', live: false }
-  if (tasks.some((t) => t.status === 'failed' || t.status === 'blocked')) return { text: 'needs attention', live: true }
+type Translate = (key: string, vars?: Record<string, string | number>) => string
+
+function statusLabel(tasks: LiveTask[], t: Translate): { text: string; live: boolean } {
+  if (tasks.length === 0) return { text: t('card.queued'), live: false }
+  if (tasks.every((t) => t.status === 'completed')) return { text: t('card.allDone'), live: false }
+  if (tasks.some((t) => t.status === 'failed' || t.status === 'blocked')) return { text: t('card.needsAttention'), live: true }
   const running = tasks.filter((t) => t.status === 'running' || t.status === 'dispatching' || t.status === 'reviewing').length
-  return { text: `${running} running · ${tasks.length - running} queued`, live: running > 0 }
+  return { text: t('card.progress', { running, queued: tasks.length - running }), live: running > 0 }
 }
 
 export function SwarmDispatchCard({ block }: { block: ToolBlock }): JSX.Element {
+  const t = useT()
   const settled = 'kind' in block
   const args = parseArgs(settled ? block.call?.argsRaw ?? undefined : block.argsRaw)
   const state = stateOf(block)
   const output = settled ? resultText(block) : null
   const runId = state === 'ok' ? runIdFrom(output) : null
   const tasks = Array.isArray(args.tasks) ? args.tasks : []
-  const title = args.title !== undefined && args.title.length > 0 ? args.title : '(untitled run)'
+  const title = args.title !== undefined && args.title.length > 0 ? args.title : t('card.untitled')
 
   // K3: once the run id is known, ride the board SSE and show live per-task dots.
   const [live, setLive] = useState<LiveTask[] | null>(null)
@@ -120,19 +124,19 @@ export function SwarmDispatchCard({ block }: { block: ToolBlock }): JSX.Element 
   }, [runId])
 
   const dotTasks: LiveTask[] = live ?? tasks.map((t) => ({ id: t.id ?? '?', status: 'pending' }))
-  const progress = statusLabel(dotTasks)
+  const progress = statusLabel(dotTasks, t)
 
   return (
     <div className="dsh-swarm-tvc">
       <div className="dsh-swarm-tvc-head">
-        <span className="dsh-swarm-tvc-title">🐝 Swarm: {title}</span>
-        {state === 'running' && <span className="dsh-swarm-pill">dispatching…</span>}
-        {state === 'ok' && runId !== null && <span className="dsh-swarm-pill">run created</span>}
-        {state === 'error' && <span className="dsh-swarm-pill warn">failed</span>}
+        <span className="dsh-swarm-tvc-title">{t('card.swarmTitle', { title })}</span>
+        {state === 'running' && <span className="dsh-swarm-pill">{t('card.dispatchingPill')}</span>}
+        {state === 'ok' && runId !== null && <span className="dsh-swarm-pill">{t('card.runCreated')}</span>}
+        {state === 'error' && <span className="dsh-swarm-pill warn">{t('card.failedPill')}</span>}
       </div>
       {state === 'ok' && (
         <div className="dsh-swarm-tvc-meta">
-          {runId !== null ? <>run <span className="dsh-swarm-tvc-runid">{runId}</span>{runStatus !== null ? ` · ${runStatus}` : ''} — live progress on the Swarm tab</> : output}
+          {runId !== null ? <>{t('card.live', { runId, status: runStatus !== null ? statusT(runStatus) : '' })}</> : output}
         </div>
       )}
       {state === 'error' && output !== null && <div className="dsh-swarm-tvc-error">{output}</div>}
@@ -152,8 +156,8 @@ export function SwarmDispatchCard({ block }: { block: ToolBlock }): JSX.Element 
                 <span>{spec?.subject ?? ''}</span>
                 <span className="dsh-swarm-tvc-meta">
                   {spec?.role ?? 'builder'}
-                  {spec?.reviewBy !== undefined ? ` · reviewed by ${spec.reviewBy}` : ''}
-                  {spec?.blockedBy !== undefined && spec.blockedBy.length > 0 ? ` · after ${spec.blockedBy.join(', ')}` : ''}
+                  {spec?.reviewBy !== undefined ? t('card.reviewedBy', { role: spec.reviewBy }) : ''}
+                  {spec?.blockedBy !== undefined && spec.blockedBy.length > 0 ? t('card.after', { list: spec.blockedBy.join(', ') }) : ''}
                 </span>
               </li>
             )
@@ -162,7 +166,7 @@ export function SwarmDispatchCard({ block }: { block: ToolBlock }): JSX.Element 
       )}
       <div className="dsh-swarm-tvc-meta">
         {state === 'running'
-          ? (args.endorse === true ? 'endorsed — dispatching now' : 'awaiting your endorsement on the Swarm tab')
+          ? (args.endorse === true ? t('card.endorsed') : t('card.awaitingEndorsement'))
           : state === 'ok' ? progress.text : ''}
       </div>
     </div>
