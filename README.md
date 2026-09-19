@@ -42,6 +42,9 @@ It has already shipped real work: the first production run reverse-engineered a 
 
 <img width="1045" height="507" alt="image" src="https://github.com/user-attachments/assets/ab727b4a-c75a-41fe-be3c-3f68e9499c88" />
 
+## Optional hybrid workteam
+<img width="1057" height="541" alt="image" src="https://github.com/user-attachments/assets/9259d6f0-ea08-4aaa-9a5b-8f0302a839b4" />
+
 ## Why not just ask one agent?
 
 Because one agent serializes. Long research tasks queue behind quick edits, context fills up, quality drifts, and nothing checks the output but the same model that wrote it.
