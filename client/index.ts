@@ -15,8 +15,13 @@ import css from './swarm.css'
 
 export const name = 'dsh-swarm-orchestrator-client'
 
-/** Required client services (cordis fiber inject — the loader treats module exports as the plugin object). */
-export const inject = ['slots', 'connection']
+/**
+ * Required client services (cordis fiber inject — the loader treats module exports as the plugin object).
+ * `remote` + `remote.llm` are the 0.1.6 typert Remote face the model catalog calls
+ * (the same inject keys the shipped Models settings page declares); `connection`
+ * remains for the legacy ≤0.1.5 wire-face fallback.
+ */
+export const inject = ['slots', 'connection', 'remote', 'remote.llm']
 
 export function apply(ctx: ClientContext): (() => void) | void {
   let style: HTMLStyleElement | null = null

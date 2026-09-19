@@ -19,6 +19,11 @@ Client fix for DSH 0.1.6. No scheduler behaviour changed.
   call — and keeps the legacy face as a fallback, so one published bundle serves old
   and new hosts alike. A provider that refuses discovery is skipped instead of
   blanking the picker, and the failure message now names the face that is missing.
+  The Remote face is inject-guarded: the client plugin now declares `remote` +
+  `remote.llm` in its cordis inject — the same keys the shipped Models settings page
+  declares — otherwise access fails with `cannot get property "remote" without
+  inject`. (Model pickers therefore need DSH 0.1.6+; board, flow and roster editing
+  work without it.)
 
 ### Verification
 
