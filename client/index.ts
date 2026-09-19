@@ -2,15 +2,15 @@
 // roster/duty-table editor). Registered as a conversation.view entry
 // (chat → trajectory → swarm), the same additive-tab mechanism ui-trajectory
 // uses. Data bridge: the node half's /swarm HTTP+SSE routes; the live model
-// catalog comes from the connection service's llm RPCs (the same ones the
-// official Models settings page uses).
+// catalog comes from the llm RPC face — `ctx.remote.llm.*` on DSH 0.1.6+,
+// the legacy `connection.api` face before that (see client/catalog.ts).
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import { SwarmTab } from './SwarmTab'
 import { SwarmSettingsSection } from './SwarmSettingsSection'
 import { SwarmHeaderButton } from './SwarmHeaderButton'
 import { SwarmDispatchCard } from './ToolDispatchCard'
 import { badgeView } from './badge'
-import { setApiGetter } from './catalog'
+import { setFacesGetter, type LegacyApiLike, type RemoteLike } from './catalog'
 import css from './swarm.css'
 
 export const name = 'dsh-swarm-orchestrator-client'
@@ -30,9 +30,15 @@ export function apply(ctx: ClientContext): (() => void) | void {
     }
   }
 
-  setApiGetter(() => {
-    const connection = ctx.get('connection') as { api?: unknown } | undefined
-    return connection?.api as never
+  setFacesGetter(() => {
+    // Both faces, read lazily at fetch time: `ctx.remote` on DSH 0.1.6+, the
+    // legacy `connection.api` wire face on hosts that still ship it.
+    let api: LegacyApiLike | undefined
+    try {
+      api = (ctx.get('connection') as { api?: unknown } | undefined)?.api as LegacyApiLike | undefined
+    } catch { api = undefined }
+    const remote = (ctx as unknown as { remote?: unknown }).remote as RemoteLike | undefined
+    return { api, remote }
   })
 
   ctx.slots.inject('conversation.view' as never, () =>

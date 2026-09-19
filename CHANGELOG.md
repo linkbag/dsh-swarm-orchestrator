@@ -2,6 +2,40 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.7
+
+Client fix for DSH 0.1.6. No scheduler behaviour changed.
+
+### Fixed
+
+- **The Roster's model pickers went blank ("host connection unavailable") on
+  DSH 0.1.6.** 0.1.6 moved client RPCs from the `connection.api` wire face to the
+  typert Remote face (`ctx.remote.llm.*`); the `connection` service still exists but
+  carries connection *state* only, so the catalog's api handle resolved to
+  `undefined` and every dropdown degraded to a single "inherit deployment default"
+  entry. The catalog now speaks the remote face — `listProviders`,
+  `listConfigurableProviders`, then per-provider `discoverModels`, which for routes
+  the adapters already know answers from the adapter's own registry without a network
+  call — and keeps the legacy face as a fallback, so one published bundle serves old
+  and new hosts alike. A provider that refuses discovery is skipped instead of
+  blanking the picker, and the failure message now names the face that is missing.
+
+### Verification
+
+- `tests/catalog.test.ts` — 7 tests over both faces: the remote build (providers
+  merged from `listProviders` and the configurable directory; per-provider discovery;
+  a refusing provider skipped, not fatal), the legacy fallback, remote-wins-when-both
+  exist, and a diagnostic that names both missing faces.
+- **J21 preflight learned the 0.1.6 settings shape.** The 0.1.6 rewrite of
+  `settings.yaml` dropped every per-model `reasoningEfforts:` map, which made the
+  preflight flag *every* pi-ai model as effort-unknown and drop all effort pins. The
+  parser now recognises the new shape: a file that declares no maps judges no model,
+  and `agent-default-model` (`provider`/`model` + `reasoningEffort`) counts as
+  first-hand evidence that this exact model/effort pair runs. The old map format is
+  still parsed for older hosts. `tests/preflight-live.test.ts` now pins the real
+  0.1.6 file.
+- 123 tests pass.
+
 ## 0.6.6
 
 Reliability fix. Dispatch behaviour is unchanged except in one failure path.

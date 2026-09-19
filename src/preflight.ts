@@ -31,6 +31,12 @@ export interface EffortSupport {
  * Kept tolerant: the file is the operator's, not ours, and a parse failure must
  * never break a dispatch. Only declarations under llm-pi-ai style provider blocks
  * carry effort maps today; deepseek models declare none and accept efforts anyway.
+ *
+ * DSH 0.1.6 rewrote the file: per-model `reasoningEfforts:` maps are gone, and the
+ * only effort fact left is `agent-default-model` (the deployment's default model
+ * with its `reasoningEffort`) — first-hand evidence that this exact model/effort
+ * pair runs. A file that declares no maps therefore declares nothing about any
+ * model, so nothing is judged incompatible on it.
  */
 export function parseEffortSupport(settingsYaml: string): EffortSupport {
   const supported = new Set<string>()
@@ -45,6 +51,10 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
     let insideValidatingRoot = false
     let currentModel: string | null = null
     let sawEffortsForCurrent = false
+    let sawAnyEffortsMap = false
+    let insideDefaultModel = false
+    let defaultModelId: string | null = null
+    let defaultModelHasEffort = false
     for (const raw of lines) {
       const line = raw.trimEnd()
       if (/^\S/.test(line)) {
@@ -53,8 +63,15 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
           declaredWithoutMap.add(currentModel)
         }
         insideValidatingRoot = [...EFFORT_VALIDATING_ROOTS].some((r) => line.startsWith(r + ':'))
+        insideDefaultModel = line.startsWith('agent-default-model:')
         currentModel = null
         sawEffortsForCurrent = false
+        continue
+      }
+      if (insideDefaultModel) {
+        const id = line.match(/^\s*model:\s*(\S+)\s*$/)
+        if (id) defaultModelId = id[1]
+        if (/^\s*reasoningEffort:\s*\S/.test(line)) defaultModelHasEffort = true
         continue
       }
       if (!insideValidatingRoot) continue
@@ -66,11 +83,16 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
         continue
       }
       if (/^reasoningEfforts:\s*$/.test(line.trim())) {
+        sawAnyEffortsMap = true
         sawEffortsForCurrent = true
         if (currentModel !== null) supported.add(currentModel)
       }
     }
     if (currentModel !== null && !sawEffortsForCurrent) declaredWithoutMap.add(currentModel)
+    // The 0.1.6 shape: without per-model maps the file judges no model.
+    if (!sawAnyEffortsMap) declaredWithoutMap.clear()
+    // The deployment's default model runs with its declared effort — known-good.
+    if (defaultModelId !== null && defaultModelHasEffort) supported.add(defaultModelId)
   } catch {
     // tolerant: an unreadable file simply yields no declarations
   }
