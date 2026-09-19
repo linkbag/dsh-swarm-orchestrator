@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { boardStore, type Board, type BoardRole } from './board-store'
-import { fetchModelCatalog, type ModelCatalog } from './catalog'
+import { fetchModelCatalog, subscribeCatalogUpdates, type ModelCatalog } from './catalog'
 
 const EFFORTS = ['', 'minimal', 'low', 'medium', 'high', 'max'] as const
 const BUILTIN_ROLES = ['architect', 'builder', 'reviewer', 'integrator']
@@ -102,6 +102,11 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
       document.removeEventListener('visibilitychange', onFocus)
     }
   }, [refreshCatalog])
+
+  // Preferred: the Host pushes catalog invalidations as events (adapters
+  // re-registered, settings rewritten, credentials changed) — refresh on each
+  // instead of waiting for the poll. A no-$on host keeps the poll above.
+  useEffect(() => subscribeCatalogUpdates(refreshCatalog), [refreshCatalog])
 
   const modelsByProvider = useMemo(() => {
     const map = new Map<string, Array<{ id: string; name: string }>>()

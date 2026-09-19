@@ -24,19 +24,24 @@ Client fix for DSH 0.1.6. No scheduler behaviour changed.
   declares — otherwise access fails with `cannot get property "remote" without
   inject`. (Model pickers therefore need DSH 0.1.6+; board, flow and roster editing
   work without it.)
-- **The pickers list configured providers only, and stay current.** `listProviders()`
-  returns routes an adapter activated through configuration, so shipped-but-unconfigured
-  and drafted providers no longer appear next to real ones. The Roster also re-fetches
-  the catalog every 30s and whenever the tab or window regains focus — a key added in
-  Settings shows up (and a removed one drops out) without a manual refresh.
+- **The pickers list configured providers only, from the Host's own catalog, and
+  stay current.** The primary source is now `remote.session.modelCatalog()` — the
+  same Host-generation catalog the composer's model picker renders, so every
+  configured provider's models appear uniformly. (The per-provider discovery
+  fallback could only answer for adapters that register model discovery, which is
+  why DeepSeek models were missing while zai showed.) Updates arrive as Host events
+  (`llm/adapters-updated`, `settings/document-updated`,
+  `credentials/reference-updated`) instead of waiting on the 30s poll, which remains
+  as a fallback for hosts without the event face.
 
 ### Verification
 
-- `tests/catalog.test.ts` — 8 tests over both faces: the remote build (providers
-  merged from `listProviders` and the configurable directory; configured-only
-  filtering with a dormant route excluded; per-provider discovery; a refusing provider
-  skipped, not fatal), the legacy fallback, remote-wins-when-both exist, and a
-  diagnostic that names both missing faces.
+- `tests/catalog.test.ts` — 12 tests over all faces: the Host session catalog
+  (DeepSeek models included; refusal falls back), the llm face (configured-only
+  filtering with a dormant route excluded; per-provider discovery; a refusing
+  provider skipped, not fatal), the legacy fallback, remote-wins-when-both exist,
+  catalog-event subscriptions with dispose, and a diagnostic that names both missing
+  faces.
 - **J21 preflight learned the 0.1.6 settings shape.** The 0.1.6 rewrite of
   `settings.yaml` dropped every per-model `reasoningEfforts:` map, which made the
   preflight flag *every* pi-ai model as effort-unknown and drop all effort pins. The

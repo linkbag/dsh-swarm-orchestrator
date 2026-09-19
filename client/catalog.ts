@@ -22,18 +22,32 @@ export interface CatalogProvider { provider: string; displayName?: string }
 export interface CatalogModel { provider: string; id: string; name: string }
 export interface ModelCatalog { providers: CatalogProvider[]; models: CatalogModel[] }
 
-interface RemoteReply<T> { ok: boolean; value?: T; error?: { message?: string } }
+interface RemoteReply<T> { ok: boolean; value?: T; error?: { code?: string; message?: string } }
 interface RemoteProviderEntry { id?: string; name?: string }
 interface RemoteConfigurableProvider { provider?: string; displayName?: string; settingsNs?: string }
 interface RemoteDiscoveredModel { id?: string; name?: string }
 
-/** 0.1.6+: the typert Remote face reached as `ctx.remote`. */
+/** One provider group of the Host-generation session catalog (`remote.session.modelCatalog`). */
+interface SessionCatalogGroup { id?: string; name?: string; models?: Array<{ id?: string; name?: string }> }
+interface SessionCatalogValue { groups?: SessionCatalogGroup[] }
+
+/**
+ * 0.1.6+: the typert Remote face reached as `ctx.remote`. The session catalog is
+ * the same Host-generation catalog the composer's model picker renders — every
+ * configured provider's models, DeepSeek included. `$on` carries the Host events
+ * (`llm/adapters-updated`, `settings/document-updated`,
+ * `credentials/reference-updated`) that fire when any of that changes.
+ */
 export interface RemoteLike {
-  llm: {
+  session?: {
+    modelCatalog(): Promise<RemoteReply<SessionCatalogValue>>
+  }
+  llm?: {
     listProviders(): Promise<RemoteReply<RemoteProviderEntry[]>>
     listConfigurableProviders(): Promise<RemoteReply<RemoteConfigurableProvider[]>>
     discoverModels(settingsNs: string, request: { provider?: string }): Promise<RemoteReply<RemoteDiscoveredModel[]>>
   }
+  $on?(event: string, handler: () => void): () => void
 }
 
 /** ≤0.1.5: the legacy `connection.api` wire face. */
@@ -56,15 +70,71 @@ export function setFacesGetter(getter: () => CatalogFaces): void {
 
 export async function fetchModelCatalog(): Promise<ModelCatalog> {
   const faces = getFaces()
-  if (faces?.remote?.llm !== undefined) return fromRemote(faces.remote)
+  const remote = faces?.remote
+  // 1. The Host-generation session catalog — the composer's own source, so it
+  //    covers every configured provider (zai, DeepSeek, …) uniformly.
+  if (typeof remote?.session?.modelCatalog === 'function') {
+    try {
+      return await fromSessionCatalog(remote)
+    } catch { /* a refused session catalog falls through to the llm face */ }
+  }
+  // 2. The llm Remote face: registered routes + per-provider adapter discovery.
+  if (remote?.llm !== undefined) return fromRemoteLlm(remote)
+  // 3. ≤0.1.5: the legacy `connection.api` wire face.
   if (faces?.api?.llm !== undefined) return fromLegacyApi(faces.api)
   throw new Error('host connection unavailable (no ctx.remote face and no legacy connection.api — is the plugin older than the host?)')
 }
 
-async function fromRemote(remote: RemoteLike): Promise<ModelCatalog> {
+async function fromSessionCatalog(remote: RemoteLike): Promise<ModelCatalog> {
+  const reply = await remote.session!.modelCatalog()
+  if (!reply.ok) {
+    const code = reply.error?.code !== undefined ? `${reply.error.code}: ` : ''
+    throw new Error(`${code}${reply.error?.message ?? 'session model catalog failed'}`)
+  }
+  const providers = new Map<string, CatalogProvider>()
+  const models = new Map<string, CatalogModel>()
+  for (const group of reply.value?.groups ?? []) {
+    if (group?.id === undefined) continue
+    if (!providers.has(group.id)) {
+      providers.set(group.id, { provider: group.id, ...(group.name !== undefined ? { displayName: group.name } : {}) })
+    }
+    for (const model of group.models ?? []) {
+      if (model?.id === undefined) continue
+      const key = `${group.id}/${model.id}`
+      if (!models.has(key)) models.set(key, { provider: group.id, id: model.id, name: model.name ?? model.id })
+    }
+  }
+  return {
+    providers: [...providers.values()].sort((a, b) => a.provider.localeCompare(b.provider)),
+    models: [...models.values()].sort((a, b) => a.provider === b.provider ? a.id.localeCompare(b.id) : a.provider.localeCompare(b.provider)),
+  }
+}
+
+/**
+ * Fire `handler` when anything that can change the catalog changes on the Host
+ * (adapters re-registered, settings rewritten, credentials added/removed).
+ * Returns the combined disposer, or undefined when the host has no `$on` face.
+ */
+export function subscribeCatalogUpdates(handler: () => void): (() => void) | undefined {
+  const $on = getFaces()?.remote?.$on
+  if (typeof $on !== 'function') return undefined
+  const disposers = ['llm/adapters-updated', 'settings/document-updated', 'credentials/reference-updated']
+    .map((event) => {
+      try { return $on.call(undefined, event, handler) } catch { return undefined }
+    })
+  return () => {
+    for (const dispose of disposers) {
+      try { dispose?.() } catch { /* best-effort unsubscribe */ }
+    }
+  }
+}
+
+async function fromRemoteLlm(remote: RemoteLike): Promise<ModelCatalog> {
+  const llm = remote.llm
+  if (llm === undefined) throw new Error('llm remote face unavailable')
   const [providersReply, configurablesReply] = await Promise.all([
-    remote.llm.listProviders(),
-    remote.llm.listConfigurableProviders().catch((): RemoteReply<RemoteConfigurableProvider[]> => ({ ok: false })),
+    llm.listProviders(),
+    llm.listConfigurableProviders().catch((): RemoteReply<RemoteConfigurableProvider[]> => ({ ok: false })),
   ])
   if (!providersReply.ok) {
     throw new Error(providersReply.error?.message ?? 'llm.listProviders failed')
@@ -85,7 +155,7 @@ async function fromRemote(remote: RemoteLike): Promise<ModelCatalog> {
     if (entry?.provider === undefined || entry.settingsNs === undefined) return
     if (!providers.has(entry.provider)) return // dormant route — not configured by the user
     try {
-      const reply = await remote.llm.discoverModels(entry.settingsNs, { provider: entry.provider })
+      const reply = await llm.discoverModels(entry.settingsNs, { provider: entry.provider })
       if (!reply.ok) return
       for (const model of reply.value ?? []) {
         if (model?.id === undefined) continue

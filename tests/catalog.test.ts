@@ -80,6 +80,70 @@ describe('model catalog wire faces', () => {
     expect(catalog.models.some((m) => m.provider === 'openrouter')).toBe(false)
   })
 
+  it('uses the Host session catalog when present — DeepSeek models included', async () => {
+    // The regression: discovery answers only for adapters that register it
+    // (llm-pi-ai), so DeepSeek models were missing even though the provider is
+    // configured. The session catalog is the composer's own source and covers
+    // every configured provider.
+    const sessionCatalog = {
+      groups: [
+        { id: 'zai', name: 'Z.ai', models: [{ id: 'glm-5.3-flash', name: 'GLM 5.3 Flash' }] },
+        { id: 'deepseek-official', name: 'DeepSeek', models: [{ id: 'deepseek-flash' }, { id: 'deepseek-v4-pro' }] },
+      ],
+    }
+    const modelCatalog = async () => ({ ok: true, value: sessionCatalog })
+    use({ remote: { session: { modelCatalog }, llm: remoteFace.llm } })
+    const catalog = await fetchModelCatalog()
+
+    expect(catalog.providers.map((p) => p.provider)).toEqual(['deepseek-official', 'zai'])
+    expect(catalog.providers.find((p) => p.provider === 'deepseek-official')?.displayName).toBe('DeepSeek')
+    expect(catalog.models.map((m) => `${m.provider}/${m.id}`)).toEqual([
+      'deepseek-official/deepseek-flash',
+      'deepseek-official/deepseek-v4-pro',
+      'zai/glm-5.3-flash',
+    ])
+    // A model without a display name falls back to its id.
+    expect(catalog.models.find((m) => m.id === 'deepseek-v4-pro')?.name).toBe('deepseek-v4-pro')
+  })
+
+  it('falls back to llm discovery when the session catalog is refused', async () => {
+    const modelCatalog = async () => ({ ok: false, error: { code: 'x', message: 'session catalog refused' } })
+    use({ remote: { session: { modelCatalog }, llm: remoteFace.llm } })
+    const catalog = await fetchModelCatalog()
+    expect([...new Set(catalog.models.map((m) => m.provider))]).toEqual(['zai'])
+  })
+
+  it('refreshes on Host catalog events and unsubscribes on dispose', async () => {
+    const seen: string[] = []
+    const subscribed: string[] = []
+    const remote = {
+      ...remoteFace,
+      $on: (event: string, handler: () => void) => {
+        subscribed.push(event)
+        seen.push(`on:${event}`)
+        // Fire once per subscription so the handler wiring is observable.
+        handler()
+        return () => { seen.push(`off:${event}`) }
+      },
+    } as unknown as CatalogFaces['remote']
+    use({ remote })
+
+    let calls = 0
+    const { subscribeCatalogUpdates } = await import('../client/catalog.js')
+    const dispose = subscribeCatalogUpdates(() => { calls += 1 })
+
+    expect(calls).toBe(3)
+    expect(subscribed).toEqual(['llm/adapters-updated', 'settings/document-updated', 'credentials/reference-updated'])
+    dispose?.()
+    expect(seen.filter((entry) => entry.startsWith('off:'))).toHaveLength(3)
+  })
+
+  it('reports no event subscription on a host without $on', async () => {
+    const { subscribeCatalogUpdates } = await import('../client/catalog.js')
+    use({ remote: remoteFace as unknown as CatalogFaces['remote'] })
+    expect(subscribeCatalogUpdates(() => {})).toBeUndefined()
+  })
+
   it('dedupes models a provider reports twice', async () => {
     use({ remote: remoteFace })
     const catalog = await fetchModelCatalog()
