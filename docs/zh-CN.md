@@ -42,6 +42,8 @@
 
 <img width="1059" height="475" alt="image" src="https://github.com/user-attachments/assets/f52b26ae-2c24-49d0-b713-1b584f92c043" />
 
+## 可选混合模型编队
+<img width="2113" height="1081" alt="image" src="https://github.com/user-attachments/assets/f35f0370-06a2-46da-b598-41152f1ebcc1" />
 
 ## 为什么不只问一个 Agent
 
