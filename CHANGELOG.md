@@ -50,7 +50,7 @@ Client fix for DSH 0.1.6. No scheduler behaviour changed.
   first-hand evidence that this exact model/effort pair runs. The old map format is
   still parsed for older hosts. `tests/preflight-live.test.ts` now pins the real
   0.1.6 file.
-- 123 tests pass.
+- 128 tests pass.
 
 ## 0.6.6
 

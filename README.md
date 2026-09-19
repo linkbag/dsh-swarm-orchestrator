@@ -62,7 +62,7 @@ This plugin takes the coordination seriously so you don't have to:
 
 > ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** with the default cap of 5 total agents. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` to 3 in the Runtime settings.
 
-### Reliability notes (v0.5.8 – v0.6.6)
+### Reliability notes (v0.5.8 – v0.6.7)
 
 Diagnosed from 47 recorded runs / 184 task failures, then fixed and regression-tested:
 
@@ -78,7 +78,7 @@ A **Swarm** tab lives next to Chat in the web GUI, in three views:
 
 - **Board** — runs on the left, task columns (Queued / Running / Done / Failed) front and center. Click a task for its full brief, model, attempt count, interim agent notes, reviewer feedback, and retry. Completed runs fold into a report with per-task summaries and fallback/retry/review stats.
 - **Flow** — the task DAG as a living flow chart: the scheduler at the top, tasks fanned out into parallel waves (same wave = runs concurrently), dependency arrows turning green as blockers complete, reviewer and write-scope hints on each node, all converging into the run report. You can see at a glance what ran in parallel, what ran in sequence, and exactly how far the run has gotten.
-- **Roster** — the duty-table editor: per-role model pickers fed by your live catalog, fallback-chain ordering, effort ladder, concurrency caps, tool filters, personas, custom roles, and an override lock for "hands off my table".
+- **Roster** — the duty-table editor: per-role model pickers fed by your live catalog, fallback-chain ordering, effort ladder, concurrency caps, tool filters, personas, custom roles, and an override lock for "hands off my table". The pickers list only providers you have configured in DSH (with API keys) and follow changes automatically — DSH 0.1.6+ required.
 - **Everywhere else** — a 🐝 status button in every session header, a small badge for active runs, and a live progress card right in chat where the run was dispatched.
 - **Workspace-aware** — each chat's Swarm tab shows the runs for that chat's workspace; an **All** switch reveals every run on the machine. The roster stays global (one table, all workspaces).
 
@@ -254,7 +254,7 @@ Written plainly, because a limit you discover in production costs far more than 
 
 ## Status
 
-v0.6.7, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**123 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, tool-filter sanitisation, preflight effort validation, the global status-badge label, stale task-report rejection, the model-catalog wire faces, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
+v0.6.7, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**128 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, tool-filter sanitisation, preflight effort validation, the global status-badge label, stale task-report rejection, the model-catalog wire faces, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
 
 ## License
 
