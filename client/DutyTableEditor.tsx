@@ -85,6 +85,24 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
 
   useEffect(() => { refreshCatalog() }, [refreshCatalog])
 
+  // Auto-update: adding an API key happens in Settings — another surface — so the
+  // catalog re-fetches on a short poll and whenever this tab or the window
+  // regains focus. Newly configured providers then appear without any manual
+  // refresh, and removed ones drop out.
+  useEffect(() => {
+    const poll = window.setInterval(refreshCatalog, 30_000)
+    const onFocus = (): void => {
+      if (document.visibilityState === 'visible') refreshCatalog()
+    }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onFocus)
+    return () => {
+      window.clearInterval(poll)
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onFocus)
+    }
+  }, [refreshCatalog])
+
   const modelsByProvider = useMemo(() => {
     const map = new Map<string, Array<{ id: string; name: string }>>()
     for (const model of catalog?.models ?? []) {

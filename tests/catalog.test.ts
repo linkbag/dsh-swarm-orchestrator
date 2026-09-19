@@ -14,7 +14,11 @@ function use(partial: Partial<CatalogFaces>): void {
   setFacesGetter(() => partial as CatalogFaces)
 }
 
-/** The 0.1.6 remote face: zai answers from its registry, deepseek refuses. */
+/**
+ * The 0.1.6 remote face: zai and deepseek are configured (registered routes);
+ * openrouter is shipped-but-dormant — known to the adapter, never registered,
+ * so it must not appear in the pickers.
+ */
 const remoteFace = {
   llm: {
     listProviders: async () => ({
@@ -26,6 +30,7 @@ const remoteFace = {
       value: [
         { provider: 'zai', displayName: 'Z.ai', settingsNs: 'llm.zai' },
         { provider: 'deepseek-official', displayName: 'DeepSeek', settingsNs: 'llm.deepseek' },
+        { provider: 'openrouter', displayName: 'OpenRouter (shipped, unconfigured)', settingsNs: 'llm.openrouter' },
       ],
     }),
     discoverModels: async (_ns: string, request: { provider?: string }) => {
@@ -58,12 +63,21 @@ describe('model catalog wire faces', () => {
     use({ remote: remoteFace })
     const catalog = await fetchModelCatalog()
 
+    // Configured providers only: the dormant openrouter route is excluded even
+    // though the configurable directory knows it.
     expect(catalog.providers.map((p) => p.provider)).toEqual(['deepseek-official', 'zai'])
+    expect(catalog.providers.some((p) => p.provider === 'openrouter')).toBe(false)
     expect(catalog.providers.find((p) => p.provider === 'zai')?.displayName).toBe('Z.ai')
 
     // deepseek refused discovery — it must be absent, not fatal.
     expect(catalog.models.map((m) => `${m.provider}/${m.id}`)).toEqual(['zai/glm-5.3', 'zai/glm-5.3-flash'])
     expect(catalog.models.find((m) => m.id === 'glm-5.3-flash')?.name).toBe('GLM 5.3 Flash')
+  })
+
+  it('never offers models for a provider the user has not configured', async () => {
+    use({ remote: remoteFace })
+    const catalog = await fetchModelCatalog()
+    expect(catalog.models.some((m) => m.provider === 'openrouter')).toBe(false)
   })
 
   it('dedupes models a provider reports twice', async () => {

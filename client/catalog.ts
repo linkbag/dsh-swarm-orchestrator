@@ -70,22 +70,20 @@ async function fromRemote(remote: RemoteLike): Promise<ModelCatalog> {
     throw new Error(providersReply.error?.message ?? 'llm.listProviders failed')
   }
 
+  // Only REGISTERED routes: an adapter activates a route when the user configures
+  // it, so this list is exactly "providers the user has set up in DSH". The
+  // configurable directory also knows dormant routes (shipped-but-unconfigured,
+  // user drafts); those must not appear in the pickers.
   const providers = new Map<string, CatalogProvider>()
   for (const entry of providersReply.value ?? []) {
     if (entry?.id === undefined) continue
     providers.set(entry.id, { provider: entry.id, ...(entry.name !== undefined ? { displayName: entry.name } : {}) })
   }
-  for (const entry of configurablesReply.ok ? configurablesReply.value ?? [] : []) {
-    if (entry?.provider === undefined || providers.has(entry.provider)) continue
-    providers.set(entry.provider, {
-      provider: entry.provider,
-      ...(entry.displayName !== undefined ? { displayName: entry.displayName } : {}),
-    })
-  }
 
   const models = new Map<string, CatalogModel>()
   await Promise.all((configurablesReply.ok ? configurablesReply.value ?? [] : []).map(async (entry) => {
     if (entry?.provider === undefined || entry.settingsNs === undefined) return
+    if (!providers.has(entry.provider)) return // dormant route — not configured by the user
     try {
       const reply = await remote.llm.discoverModels(entry.settingsNs, { provider: entry.provider })
       if (!reply.ok) return
