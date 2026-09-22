@@ -173,6 +173,11 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         else delete task.attemptId
         // J22: the reference point for "was this report written by the live attempt?".
         task.attemptStartedAt = event.at
+        // A fresh attempt is silent by definition: the previous attempt's note and
+        // its timestamp must not feed this attempt's watchdog silence clock (that
+        // carryover reclaimed a healthy 7-minute-old retry as "61 min silent").
+        delete task.lastNote
+        delete task.lastNoteAt
         task.agent = {
           label: str('label') ?? task.agent?.label ?? `swarm:${taskId}`,
           provider: str('provider') ?? task.agent?.provider,

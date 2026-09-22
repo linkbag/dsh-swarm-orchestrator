@@ -27,6 +27,13 @@ export interface RoleConfig {
   toolFilter?: { deny?: string[]; allow?: string[] }
   /** Per-role concurrency cap (C3); unset = the global maxConcurrent applies. */
   maxConcurrent?: number
+  /**
+   * Per-role hard ceiling for the spawn phase only (child has not reported
+   * started), in seconds; unset = the global spawnTimeoutSeconds applies. Once
+   * the child has started, liveness is governed by progress checkpoints instead
+   * of a fixed clock.
+   */
+  spawnTimeoutSeconds?: number
   /** Ordered fallback chain tried when the primary model is unavailable. */
   fallbacks: ModelRef[]
   /** Per-child persona shadowing the deployment persona for agents in this role. */

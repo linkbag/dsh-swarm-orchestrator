@@ -62,6 +62,7 @@ export interface BoardRole {
   effortFallbacks?: string[]
   toolFilter?: { deny?: string[]; allow?: string[] }
   maxConcurrent?: number
+  spawnTimeoutSeconds?: number
   fallbacks: Array<{ provider: string; model: string }>
   persona?: string
 }

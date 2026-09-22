@@ -2,6 +2,57 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.9
+
+Scheduler correctness release — diagnosed from the overnight StockSelector run
+(W00–W15): a review that failed open, a healthy retry killed after 7 minutes, and a
+run stranded in `retrying` for 7+ hours until a human resumed it.
+
+### Fixed
+
+- **The review verdict is parsed from the complete final message.** The review prompt
+  places `VERDICT: …` at the end of the reply, but the parser read `outcome.summary` —
+  truncated at 2000 chars — so every review thorough enough to exceed the cap failed
+  open. (Item 1.)
+- **One explicit re-ask before failing open.** A reviewer that omits the verdict line
+  gets its own assessment back with the demand for the exact line; only a second
+  refusal fails open. (Item 8.)
+- **The watchdog reclaim honors finished work.** The stale, escalation, and
+  spawn-ceiling paths now run the J10 report adoption before charging a failure —
+  W01's attempt 2 had written a completed report moments before the watchdog killed
+  it, and the old path discarded it. (Item 4.)
+- **A reclaim arms the H-1 retry-backoff timer.** The watchdog paths had no settle
+  handler to arm it, and dispatcher ticks are event-driven — so the tick's
+  "too soon" skip never got its follow-up tick. This is what stranded the run for
+  seven hours. (Item 3.)
+- **`recoverOrphans` re-arms stranded `retrying` tasks and schedules a boot tick per
+  running run.** A restart kills the in-memory retry timer; recovery used to skip
+  `retrying` entirely. (Item 3.)
+- **A fresh attempt starts with a clean silence clock.** `task/started` clears the
+  previous attempt's note/timestamp and a relaunch resets the nudge counters — a
+  healthy 7-minute-old retry is no longer reclaimed as "61 min silent". (Item 2.)
+
+### Added
+
+- **Progress-based liveness replaces the fixed spawn kill (item 7).** The spawn
+  ceiling is now a *sliding no-progress window* — re-armed by every heartbeat
+  (default `spawnTimeoutSeconds`): a working child is never killed for elapsed
+  time; a silent one is reclaimed after the window, with report adoption. The
+  pre-start blind spot the ceiling was built for is unchanged.
+- **Per-role `spawnTimeoutSeconds`** in the duty table (Roster field included),
+  overriding the runtime default for the spawn phase.
+- **Reviewers start from the task's own report** (`.dsh-swarm/task-<id>.json`) and
+  are asked to re-run evidence commands rather than trust the builder's claims.
+  (Item 5.)
+
+### Verification
+
+- New tests: a verdict beyond the 2000-char cap is approved (item 1); the re-ask is
+  spawned once and its verdict recorded (item 8); the projection clears the previous
+  attempt's note on `task/started` (item 2); watchdog escalation adopts a fresh
+  on-disk report instead of failing (item 4).
+- 136 tests pass.
+
 ## 0.6.8
 
 The Swarm interface now speaks your language.

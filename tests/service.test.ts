@@ -367,6 +367,9 @@ describe('swarm service (integration, fake subagents)', () => {
     // Caught by the live end-to-end audit: the reviewer emitted no "VERDICT:" line,
     // the task completed fail-open, and the run report showed reviewsPassed=0 with
     // nothing to distinguish that from a clean pass.
+    //
+    // Item 8 added one re-ask before the fail-open — so BOTH reviewer passes must
+    // refuse to give a verdict for this test to exercise the fail-open path.
     const { ctx, service, fake, dir } = await bootSwarm()
     contexts.push(ctx)
     dirs.push(dir)
@@ -375,8 +378,8 @@ describe('swarm service (integration, fake subagents)', () => {
     table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3' }
     service.setDutyTable(table, 'test')
 
-    // The reviewer's output carries no verdict at all.
-    fake.script = { 1: 'looks fine to me, nothing to add' }
+    // The reviewer's output carries no verdict at all — and neither does the re-ask.
+    fake.script = { 1: 'looks fine to me, nothing to add', 2: 'still no explicit verdict here' }
 
     const result = service.dispatch({
       title: 'fail-open review',
@@ -395,6 +398,41 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(run.stats?.reviewsPassed).toBe(0)
     expect(service.snapshot().tasks.find((t) => t.id === 'a')?.reviewUnavailable).toBe(true)
     expect(service.snapshot().tasks.find((t) => t.id === 'a')?.reviewed).toBe(false)
+    // Item 8: the reviewer was re-asked once before the fail-open.
+    expect(fake.calls.length).toBe(3)
+  })
+
+  it('Item 8: a reviewer that forgets the verdict is re-asked once, then recorded', async () => {
+    // The overnight StockSelector run failed W00's review open because the
+    // reviewer wrote a long assessment and no verdict line. Item 8 gives the
+    // reviewer one explicit re-ask; when it then produces the line, the review
+    // is recorded as a real pass instead of a fail-open.
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3' }
+    service.setDutyTable(table, 'test')
+
+    fake.script = { 1: 'looks fine to me, nothing to add', 2: 'VERDICT: APPROVE' }
+
+    const result = service.dispatch({
+      title: 're-ask review',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', reviewBy: 'reviewer' }],
+    }, makeDispatcher() as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 8000, 'run completes with the re-asked verdict')
+
+    const run = service.snapshot().runs.find((r) => r.id === result.runId)!
+    expect(service.snapshot().tasks.find((t) => t.id === 'a')?.status).toBe('completed')
+    expect(service.snapshot().tasks.find((t) => t.id === 'a')?.reviewed).toBe(true)
+    expect(service.snapshot().tasks.find((t) => t.id === 'a')?.reviewUnavailable).toBeUndefined()
+    expect(run.stats?.reviewsPassed).toBe(1)
+    expect(run.stats?.reviewsUnavailable).toBe(0)
+    expect(fake.calls.length).toBe(3)
   })
 
   it('J18: an unsupported reasoning effort is detected', () => {

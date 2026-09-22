@@ -65,7 +65,7 @@ This plugin takes the coordination seriously so you don't have to:
 
 > ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** with the default cap of 5 total agents. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` to 3 in the Runtime settings.
 
-### Reliability notes (v0.5.8 – v0.6.7)
+### Reliability notes (v0.5.8 – v0.6.9)
 
 Diagnosed from 47 recorded runs / 184 task failures, then fixed and regression-tested:
 
@@ -258,7 +258,7 @@ Written plainly, because a limit you discover in production costs far more than 
 
 ## Status
 
-v0.6.8, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**135 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, tool-filter sanitisation, preflight effort validation, the global status-badge label, stale task-report rejection, the model-catalog wire faces, interface localization, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
+v0.6.9, running in daily use. The test suite covers the dispatcher end-to-end against a fake spawn provider (**136 tests**: dispatch, endorsement, architect injection, review loops, human gates, fallback rotation, circuit breaker, retry backoff, quota pause/resume, rescue paths, evidence contracts, write-scope warnings, event-log legality, delegation depth, tool filter, workspace scoping, notification containment, attempt accounting, tool-filter sanitisation, preflight effort validation, the global status-badge label, stale task-report rejection, the model-catalog wire faces, interface localization, watchdog liveness and reclaim adoption, and a **fault matrix** of 10 adversarial tests over the dispatcher's invariants), plus live verification on a real deployment and an isolated end-to-end smoke run.
 
 ## License
 

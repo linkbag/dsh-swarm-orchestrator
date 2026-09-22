@@ -315,6 +315,16 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
               </div>
             </div>
             <div className="dsh-swarm-field">
+              <span>{t('roster.field.spawnTimeout')}</span>
+              <input
+                className="dsh-swarm-input" type="number" min={0} step={300}
+                value={role.spawnTimeoutSeconds ?? ''}
+                placeholder={board?.runtime?.spawnTimeoutSeconds !== undefined ? String(board.runtime.spawnTimeoutSeconds) : t('roster.ph.spawnTimeout')}
+                title={t('roster.spawnTimeoutHint')}
+                onChange={(event) => { updateRole(role.id, { spawnTimeoutSeconds: event.target.value === '' ? undefined : Number(event.target.value) }) }}
+              />
+            </div>
+            <div className="dsh-swarm-field">
               <span>{t('roster.field.toolFilter')}</span>
               <input
                 className="dsh-swarm-input" placeholder={t('roster.ph.toolFilter')}
