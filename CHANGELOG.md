@@ -2,45 +2,6 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
-## 0.6.10
-
-Freeze-incident audit and client hardening.
-
-### Audited (the 2026-09-22 "web ui freezes" report)
-
-The plugin was removed from the deployment after a restart froze the UI. The
-audit exonerated the 0.6.9 dispatcher on every axis: the host bundle imports
-cleanly; the client bundle evaluates cleanly under a stubbed module loader; and
-booting the real plugin against a copy of the production event store (3.7 MB,
-3,885 events, 50 runs, 281 tasks) settles in ~40 ms appending **zero** events.
-The event log itself shows the run completed normally and no flood occurred.
-The freeze coincided with the platform's auto-updater installing DSH
-0.1.7-alpha.2 into the global root **without any companion packages** and
-restarting the service from there — a second, incomplete DSH install beside the
-working local one.
-
-### Fixed
-
-- **The client plugin no longer hard-injects version-specific service faces.**
-  `inject` is now `['slots']` only; `connection`, `remote`, `remote.llm`,
-  `remote.session` and `locale` are wired through a dynamically scoped
-  `ctx.inject([...], cb)` that fires only when the host actually provides them
-  all. On any host missing or renaming one of them, the plugin still activates
-  and degrades (English labels, no live model catalog) instead of stalling the
-  client tree. All raw service property reads are guarded — an undeclared
-  access throws on cordis, and an escaping throw from the catalog getter is how
-  a degraded host becomes a broken UI.
-
-### Verification
-
-- `tests/client-hardening.test.ts` (4) — pins the soft `inject`, forbids
-  re-hardening any optional face, asserts the scoped wiring exists, and checks
-  every `ctx.<service>` property read sits inside a `try` block.
-- `tests/boot-audit-live.test.ts` (1) — boots the plugin against the real
-  production store and asserts zero appended events, no storm, no hang; skips
-  when the store is absent. This makes the incident's decisive audit permanent.
-- 141 tests pass.
-
 ## 0.6.9
 
 Scheduler correctness release — diagnosed from the overnight StockSelector run

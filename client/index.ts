@@ -20,19 +20,12 @@ export const name = 'dsh-swarm-orchestrator-client'
 
 /**
  * Required client services (cordis fiber inject — the loader treats module exports as the plugin object).
- *
- * DELIBERATELY ONLY `slots`. A hard inject blocks plugin activation until the
- * named service exists — and a third-party plugin that hard-injects
- * version-specific faces (`remote.llm`, `locale`, …) will fail to activate, and
- * can stall the client tree, on any host that renames or drops one of them
- * (observed as "web ui freezes, no chat history" after an auto-updated DSH
- * shipped an incomplete companion set). Everything version-specific is wired
- * through the dynamic `ctx.inject([...], cb)` scoping in apply() instead: when
- * a face is missing on any host version the callback simply never fires and
- * the plugin degrades — English labels, no live model catalog — instead of
- * blocking activation.
+ * `remote`, `remote.llm` and `remote.session` are the 0.1.6 typert Remote faces the
+ * model catalog calls (the same keys the shipped model-selection UI declares);
+ * `connection` remains for the legacy ≤0.1.5 wire-face fallback; `locale` carries
+ * the language preference and dictionary registry the Swarm UI translates through.
  */
-export const inject = ['slots']
+export const inject = ['slots', 'connection', 'remote', 'remote.llm', 'remote.session', 'locale']
 
 export function apply(ctx: ClientContext): (() => void) | void {
   let style: HTMLStyleElement | null = null
@@ -46,54 +39,23 @@ export function apply(ctx: ClientContext): (() => void) | void {
     }
   }
 
-  // Defensive baseline, always installed FIRST: resolve lazily at fetch time.
-  // Every access is guarded — an undeclared service access throws on cordis,
-  // and an escaping throw would break the catalog fetch; degrade to undefined.
   setFacesGetter(() => {
+    // Both faces, read lazily at fetch time: `ctx.remote` on DSH 0.1.6+, the
+    // legacy `connection.api` wire face on hosts that still ship it.
     let api: LegacyApiLike | undefined
     try {
       api = (ctx.get('connection') as { api?: unknown } | undefined)?.api as LegacyApiLike | undefined
     } catch { api = undefined }
-    let remote: RemoteLike | undefined
-    try {
-      remote = (ctx as unknown as { remote?: unknown }).remote as RemoteLike | undefined
-    } catch { remote = undefined }
+    const remote = (ctx as unknown as { remote?: unknown }).remote as RemoteLike | undefined
     return { api, remote }
   })
 
-  // Localization best-effort at apply time; the scoped callback below re-wires
-  // with the real service when available. The UI follows the DSH language
-  // preference (Settings → General → Language) automatically.
-  let locale: LocaleLike | undefined
-  try {
-    locale = (ctx as unknown as { locale?: LocaleLike }).locale
-  } catch { locale = undefined }
+  // Localization: register the swarm dictionaries and keep the service reachable
+  // for hooks (`useT`) and non-React surfaces (the badge). The UI follows the
+  // DSH language preference (Settings → General → Language) automatically.
+  const locale = (ctx as unknown as { locale?: LocaleLike }).locale
   initLocale(locale)
   setLocaleService(locale)
-
-  // Upgrade wiring: a dynamically scoped inject that fires once the host
-  // provides every optional face, replacing the guarded getters above with
-  // resolved references. Missing any of them on some host version → the
-  // callback never runs, the plugin still activates, and the baseline getters
-  // keep the UI alive in degraded mode (English labels, no live catalog).
-  try {
-    (ctx as unknown as { inject?: (names: string[], cb: (scope: unknown) => void) => void }).inject?.(
-      ['connection', 'remote', 'remote.llm', 'remote.session', 'locale'],
-      (scope: unknown) => {
-        const services = scope as {
-          connection?: { api?: unknown }
-          remote?: unknown
-          locale?: LocaleLike
-        }
-        initLocale(services.locale)
-        setLocaleService(services.locale)
-        setFacesGetter(() => ({
-          api: services.connection?.api as LegacyApiLike | undefined,
-          remote: services.remote as RemoteLike | undefined,
-        }))
-      },
-    )
-  } catch { /* dynamic inject unavailable on this host — the guarded getters stand */ }
 
   ctx.slots.inject('conversation.view' as never, () =>
     ctx.slots.register(
