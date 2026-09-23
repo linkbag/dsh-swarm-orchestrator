@@ -72,14 +72,14 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
 
   useEffect(() => {
     const store = boardStore()
-    store.start()
+    const release = store.retain()
     const unsubscribe = store.subscribe((next, err) => {
       setBoard(next)
       setError(err)
     })
     return () => {
       unsubscribe()
-      store.stop()
+      release()
     }
   }, [])
 

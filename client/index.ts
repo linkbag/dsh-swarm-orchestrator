@@ -13,6 +13,7 @@ import { SwarmHeaderButton } from './SwarmHeaderButton'
 import { SwarmDispatchCard } from './ToolDispatchCard'
 import { badgeView, type BadgeLabels } from './badge'
 import { setFacesGetter, type LegacyApiLike, type RemoteLike } from './catalog'
+import { boardStore } from './board-store'
 import { initLocale, setLocaleService, t, type LocaleLike } from './locale'
 import css from './swarm.css'
 
@@ -130,45 +131,44 @@ export function apply(ctx: ClientContext): (() => void) | void {
 
   // B4: global run badge — a small fixed overlay fed by the board SSE, so run
   // activity is visible on every surface, not only inside the Swarm tab.
-  if (typeof document !== 'undefined' && typeof EventSource !== 'undefined') {
+  if (typeof document !== 'undefined') {
     const badge = document.createElement('div')
     badge.className = 'dsh-swarm-badge'
     badge.style.display = 'none'
     document.body.appendChild(badge)
-    const update = (): void => {
-      void fetch('/swarm/board')
-        .then((r) => r.json() as Promise<{ runs?: Array<{ status: string; createdAt?: number }> }>)
-        .then((board) => {
-          const statusWord = (status: string): string => {
-            const translated = t(`status.${status}`)
-            return translated === `status.${status}` ? status : translated
-          }
-          const labels: BadgeLabels = {
-            active: t('badge.active'),
-            paused: t('badge.paused'),
-            awaiting: t('badge.awaiting'),
-            last: t('badge.last'),
-            status: statusWord,
-          }
-          const view = badgeView(board.runs, labels)
-          badge.textContent = view.text
-          badge.className = view.alert ? 'dsh-swarm-badge alert' : 'dsh-swarm-badge'
-          badge.style.display = view.text.length === 0 ? 'none' : 'block'
-        })
-        .catch(() => { /* host offline — leave the badge as-is */ })
+    // ONE shared stream for the whole plugin: the badge rides the same board
+    // store as the tab, the settings section and the dispatch cards. Opening an
+    // EventSource here (as 0.6.11 and earlier did) spent a second of the
+    // browser's ~6 connections per origin for no additional information.
+    const store = boardStore()
+    const release = store.retain()
+    const render = (runs: Array<{ status: string; createdAt?: number }> | undefined): void => {
+      const statusWord = (status: string): string => {
+        const translated = t(`status.${status}`)
+        return translated === `status.${status}` ? status : translated
+      }
+      const labels: BadgeLabels = {
+        active: t('badge.active'),
+        paused: t('badge.paused'),
+        awaiting: t('badge.awaiting'),
+        last: t('badge.last'),
+        status: statusWord,
+      }
+      const view = badgeView(runs, labels)
+      badge.textContent = view.text
+      badge.className = view.alert ? 'dsh-swarm-badge alert' : 'dsh-swarm-badge'
+      badge.style.display = view.text.length === 0 ? 'none' : 'block'
     }
-    const source = new EventSource('/swarm/events')
-    source.onmessage = update
-    source.onerror = () => { badge.style.display = 'none' }
-    const poll = setInterval(update, 60000)
-    // A language switch must re-label the badge too — refetch and re-render.
-    const offLocale = locale?.subscribe?.(() => { update() })
-    update()
-    // Teardown: closed when the plugin's style element is removed (apply disposer).
+    const unsubscribe = store.subscribe((board) => { if (board !== null) render(board.runs) })
+    // A language switch must re-label the badge too — re-render from the
+    // snapshot already in hand, without touching the network.
+    const offLocale = locale?.subscribe?.(() => { render(store.get()?.runs) })
+    // Teardown: released when the plugin's style element is removed (apply disposer).
     const observer = new MutationObserver(() => {
       if (document.head.querySelector('style[data-dsh-swarm-orchestrator]') === null) {
-        source.close()
-        if (poll !== null) clearInterval(poll)
+        unsubscribe()
+        offLocale?.()
+        release()
         badge.remove()
         observer.disconnect()
       }

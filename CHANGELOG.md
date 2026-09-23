@@ -2,6 +2,47 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.12
+
+**Web-UI freeze fixed — one SSE connection for the whole plugin.**
+
+### Fixed
+
+- **The `swarm_dispatch` toolview no longer opens a stream per card.** That card
+  renders once for every historical dispatch in a chat, and each instance opened
+  its own persistent `EventSource('/swarm/events')` plus its own full-board
+  fetch. A browser allows ~6 concurrent connections per origin and an SSE stream
+  never ends, so a long history consumed the entire budget: every other request
+  on the page — chat history, the plugin-market catalog, the swarm board itself
+  — queued forever. The host stayed healthy throughout (a second client could
+  still act), which is why it read as "the UI is stuck" rather than a crash.
+  Cards now render their live dots from the shared board snapshot.
+- **The 🐝 badge, the header popover and the settings section ride that same
+  stream** instead of opening their own; the badge previously held a second SSE
+  plus a 60s poll.
+- **The shared store is reference-counted** (`retain()` / release). It is a
+  module-level singleton, so the previous `start()`/`stop()` coupling meant one
+  component unmounting killed the stream every other consumer was still riding.
+
+Result: **exactly one** `/swarm/events` connection for the plugin, one debounced
+refetch per event batch, and no per-card network traffic.
+
+### Why this was misdiagnosed twice
+
+The 2026-09-22 audit blamed the client's hard `inject` list; 0.6.11 removed it
+and the freeze persisted, which exonerated the inject. The 0.6.9/0.6.10 commits
+were never the cause either — the failure scales with *history length*, not with
+the DSH version, so it surfaced only once enough runs had accumulated.
+
+### Tests
+
+- `tests/client-connection-budget.test.ts` (3) — pins exactly one `EventSource`
+  in the client and only in `board-store.ts`, forbids per-widget board fetches,
+  and requires every consumer to `retain()` the shared store rather than
+  `stop()` it.
+- Suite: **143 tests, 142 pass**; the pre-existing `preflight-live` assertion
+  about the deployment default model still fails on this host, unchanged.
+
 ## 0.6.11
 
 Client-plugin hardening: the freeze fix from the withdrawn 0.6.9/0.6.10 line,

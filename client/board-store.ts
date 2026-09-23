@@ -103,6 +103,16 @@ type Listener = (board: Board | null, error: string | null) => void
 /**
  * Board data source: full-snapshot fetch + SSE change pings (one refetch per
  * event batch). Module-level singleton — the tab mounts/unmounts freely.
+ *
+ * CONNECTION BUDGET: this instance owns the plugin's ONLY `/swarm/events`
+ * EventSource. A browser allows ~6 concurrent connections per origin and an SSE
+ * stream never ends, so every extra stream is stolen capacity. Per-card or
+ * per-widget streams are what froze the web UI ("no chat history, no market
+ * catalog") on 2026-09-23: the `swarm_dispatch` toolview rendered once per
+ * historical dispatch, each card opened its own EventSource, and the exhausted
+ * pool queued every other request on the page forever while the host stayed
+ * healthy. Route live data through this store; never construct an EventSource
+ * elsewhere in the client.
  */
 export class BoardStore {
   private board: Board | null = null
@@ -111,6 +121,7 @@ export class BoardStore {
   private source: EventSource | null = null
   private refetchTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = false
+  private refs = 0
 
   start(): void {
     this.stopped = false
@@ -148,6 +159,25 @@ export class BoardStore {
     this.source = null
     if (this.refetchTimer !== null) clearTimeout(this.refetchTimer)
     this.refetchTimer = null
+  }
+
+  /**
+   * Reference-counted lifetime for the shared singleton: the first consumer
+   * starts the one stream, the last release stops it. Consumers MUST use this
+   * instead of start()/stop() — with several components riding the same
+   * instance, one unmount calling stop() would otherwise kill the stream every
+   * other consumer still depends on.
+   */
+  retain(): () => void {
+    this.refs += 1
+    if (this.refs === 1) this.start()
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.refs -= 1
+      if (this.refs === 0) this.stop()
+    }
   }
 
   get(): Board | null {

@@ -3,6 +3,7 @@
 // and the created run id. Structural typing only: the tool block shape is
 // mirrored locally so the bundle keeps its externals table unchanged.
 import { useEffect, useState } from 'react'
+import { boardStore } from './board-store'
 import { statusT, useT } from './locale'
 
 interface TaskSpecView {
@@ -22,12 +23,6 @@ interface DispatchArgs {
 interface LiveTask {
   id: string
   status: string
-}
-
-interface LiveBoard {
-  seq: number
-  runs: Array<{ id: string; status: string }>
-  tasks: Array<{ runId: string; id: string; status: string }>
 }
 
 /** Mirrored subset of the runtime's RunningToolCall | ToolResultNode. */
@@ -94,32 +89,31 @@ export function SwarmDispatchCard({ block }: { block: ToolBlock }): JSX.Element 
   const tasks = Array.isArray(args.tasks) ? args.tasks : []
   const title = args.title !== undefined && args.title.length > 0 ? args.title : t('card.untitled')
 
-  // K3: once the run id is known, ride the board SSE and show live per-task dots.
+  // K3: once the run id is known, ride the ONE shared board stream and show
+  // live per-task dots. Deliberately no per-card EventSource and no per-card
+  // fetch: this card renders once per historical `swarm_dispatch` call, so a
+  // stream per card exhausts the browser's ~6 connections per origin and queues
+  // every other request on the page forever (chat history, other plugins) while
+  // the host stays perfectly healthy. The shared store owns the single stream
+  // and one debounced refetch for the whole plugin.
   const [live, setLive] = useState<LiveTask[] | null>(null)
   const [runStatus, setRunStatus] = useState<string | null>(null)
   useEffect(() => {
-    if (runId === null || typeof EventSource === 'undefined') return
-    let cancelled = false
-    const refetch = (): void => {
-      void fetch('/swarm/board')
-        .then((r) => r.json() as Promise<LiveBoard>)
-        .then((board: LiveBoard) => {
-          if (cancelled) return
-          const liveTasks = board.tasks
-            .filter((t) => t.runId === runId)
-            .map((t) => ({ id: t.id, status: t.status }))
-          const run = board.runs.find((r) => r.id === runId)
-          if (liveTasks.length > 0) setLive(liveTasks)
-          if (run !== undefined) setRunStatus(run.status)
-        })
-        .catch(() => { /* transient */ })
-    }
-    refetch()
-    const source = new EventSource('/swarm/events')
-    source.onmessage = () => { refetch() }
+    if (runId === null) return
+    const store = boardStore()
+    const release = store.retain()
+    const unsubscribe = store.subscribe((board) => {
+      if (board === null) return
+      const liveTasks = board.tasks
+        .filter((t) => t.runId === runId)
+        .map((t) => ({ id: t.id, status: t.status }))
+      const run = board.runs.find((r) => r.id === runId)
+      if (liveTasks.length > 0) setLive(liveTasks)
+      if (run !== undefined) setRunStatus(run.status)
+    })
     return () => {
-      cancelled = true
-      source.close()
+      unsubscribe()
+      release()
     }
   }, [runId])
 

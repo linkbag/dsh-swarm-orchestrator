@@ -2,6 +2,7 @@
 // (active runs + latest statuses from the board), so the swarm is visible
 // and one glance away even on surfaces where chat tabs do not render.
 import { useEffect, useState } from 'react'
+import { boardStore } from './board-store'
 import { statusT, useT } from './locale'
 
 interface LiveBoard {
@@ -23,20 +24,16 @@ export function SwarmHeaderButton(): JSX.Element {
 
   useEffect(() => {
     if (!open) return
-    let cancelled = false
-    const load = (): void => {
-      void fetch('/swarm/board')
-        .then((r) => r.json() as Promise<LiveBoard>)
-        .then((board) => { if (!cancelled) setRuns(board.runs.slice(0, 6)) })
-        .catch(() => { /* transient */ })
-    }
-    load()
-    const source = new EventSource('/swarm/events')
-    source.onmessage = load
-    source.onerror = () => { source.close() }
+    // The live popover rides the shared board stream: this widget must not open
+    // a connection of its own (see the connection budget in board-store.ts).
+    const store = boardStore()
+    const release = store.retain()
+    const unsubscribe = store.subscribe((board) => {
+      if (board !== null) setRuns(board.runs.slice(0, 6))
+    })
     return () => {
-      cancelled = true
-      source.close()
+      unsubscribe()
+      release()
     }
   }, [open])
 
