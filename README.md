@@ -57,23 +57,27 @@ This plugin takes the coordination seriously so you don't have to:
 - **Failure is a state, not a mystery.** Provider timeouts, quota exhaustion, bad evidence — each is detected, reported plainly, and handled: retries with resume hints, run pause/resume instead of burn-down, automatic model rotation after repeated failures.
 - **Scoped to where you are.** Each chat's Swarm tab shows the runs for that chat's workspace; a persisted switch reveals everything on the machine when you want the full picture.
 - **One run per goal, reviewed before built.** Dispatching into a workspace with an active run raises a warning (or a block, your choice); and unless you opt out, an architect agent reviews the dispatcher's plan into PLAN.md before any builder starts.
-- **Memory-safe concurrency.** Swarm agents run in-process on the DSH host, sharing its Node.js heap. A global cap (`maxTotalConcurrentAgents`, default 20) ensures concurrent runs from different workspaces share the agent budget — preventing the heap exhaustion that can crash the host when too many agents run simultaneously.
-- **Every agent stays on the board.** Task agents cannot spawn hidden sub-agents of their own (`maxSubagentDepth`, default 2). Without that bound an agent could delegate to helpers the dispatcher cannot see or account for — not counted by the global cap, not tracked by the watchdog, not shown on the board, yet all sharing the host heap. Measured on a real machine: one task spawned 12 such hidden helpers while the board showed a single task.
-- **Work outlives its agent.** Every task agent writes a small completion report as its final action. If the host restarts and kills an agent between finishing the work and being recorded, the dispatcher adopts the on-disk report instead of throwing the finished work away and re-running the task. A task can also never sit `dispatching` forever: `spawnTimeoutSeconds` is a hard ceiling the heartbeat watchdog cannot provide.
-- **The right effort for the right model.** If a role's pinned reasoning effort is not supported by one of its fallback models, the dispatcher drops the pin for that candidate before spawning — preventing the `UNSUPPORTED_REASONING_EFFORT` crash that killed 6 tasks in one run.
-- **Every agent stays on the board.** A task agent cannot spawn subagents of its own (`maxSubagentDepth`, default 1). Without that bound an agent could delegate to helpers the dispatcher cannot see or account for — not counted by the global cap, not tracked by the watchdog, not shown on the board, yet all sharing the host heap. Measured on a real machine: one task spawned 12 such hidden helpers while the board showed a single task.
+- **Memory-safe concurrency.** Swarm agents run in-process on the DSH host, sharing its Node.js heap. A global cap (`maxTotalConcurrentAgents`, default 8) ensures concurrent runs from different workspaces share the agent budget — preventing the heap exhaustion that can crash the host when too many agents run simultaneously.
+- **Every agent stays on the board.** Task agents cannot spawn hidden sub-agents of their own (`maxSubagentDepth`, default 1). Without that bound an agent could delegate to helpers the dispatcher cannot see or account for — not counted by the global cap, not tracked by the watchdog, not shown on the board, yet all sharing the host heap. Measured on a real machine: one task spawned 12 such hidden helpers while the board showed a single task.
+- **Work outlives its agent.** Every task agent writes a small completion report as its final action. If the host restarts and kills an agent between finishing the work and being recorded, the dispatcher adopts the on-disk report instead of throwing the finished work away and re-running the task. A task can also never sit `dispatching` forever: `spawnTimeoutSeconds` arms a sliding no-progress window — it runs from creation, then every heartbeat re-arms it, so a working child is never killed for elapsed time while a child that never starts or goes silent is reclaimed (per-role override in the Roster).
+- **The right effort for the right model.** Before a child is spawned, the pinned reasoning effort is validated against the deployment's declared model capabilities: a model that cannot accept the level has the pin stripped, and the candidate chain is never filtered — the `UNSUPPORTED_REASONING_EFFORT` crash that killed 6 tasks in one run cannot happen. If a pin still reaches a model that refuses it, the child dies fast with no output, and the dispatcher retries the *same* model at the next rung of the effort ladder (`max` → `high` → … → no pin) before any model rotation — without spending the task's retry budget. Reviewer pins are validated the same way.
 
 > ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** with the default cap of 5 total agents. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` to 3 in the Runtime settings.
 
-### Reliability notes (v0.5.8 – v0.6.7)
+### Reliability notes (v0.5.8 – v0.6.17)
 
-Diagnosed from 47 recorded runs / 184 task failures, then fixed and regression-tested:
+Diagnosed from 47 recorded runs / 184 task failures plus the incidents below, then fixed and regression-tested:
 
 - **Evidence commands run under PowerShell** (bash elsewhere) from the workspace root, and the `evidence.commands` schema says so. Previously they were handed to `cmd.exe`, so a perfectly normal PowerShell gate (`if (Test-Path …) { exit 0 }`) failed the task — 32% of all recorded task failures. Prefer `evidence.files` where a file check can express the gate: it involves no shell at all.
 - **`modlens` is denied to swarm roles** by default in the shipped roster guidance: it is an interactive tool that asks the user a question, and swarm children run non-interactively. Add it back per-role from the Roster if your deployment has a headless vision provider.
 - **A task report that does not claim `"status": "completed"` is never adopted** — adoption cannot mask unfinished work.
 - **An adopted report must also have been written by the live attempt.** `.dsh-swarm/task-<id>.json` is keyed by task id, not by run, so reusing an id silently shares the file across runs. A report older than the current attempt's `task/started` is now ignored (and logged) instead of being credited as this attempt's work.
 - **Recovery is scoped to running runs.** Orphan recovery only requeues tasks whose run is still running, so a terminal run's tasks stay frozen instead of being re-failed on every host restart.
+- **Review verdicts are parsed from the complete final message** — the parser used to read a 2,000-character summary and fail every thorough review open. A reviewer that omits the verdict line now gets one explicit re-ask before failing open.
+- **Watchdog reclaims adopt finished work and arm the retry backoff.** A child that wrote its report moments before being reclaimed is credited, not failed — the old path stranded a run in `retrying` for seven hours. Orphan recovery re-arms stranded `retrying` tasks, and every fresh attempt starts with a clean silence clock.
+- **Liveness is progress-based, not elapsed-time.** The spawn ceiling is a sliding no-progress window re-armed by every heartbeat, with a per-role `spawnTimeoutSeconds` override in the Roster — a healthy child is never killed for running long.
+- **The web client holds exactly one `/swarm/events` connection**, reference-counted and shared by the tab, the badge, the header popover and every dispatch card. It previously opened one stream per rendered dispatch card, exhausting the browser's ~6-connections-per-origin budget and freezing the whole UI while the host stayed healthy.
+- **An evidence-only failure no longer re-runs the work.** One command-only recheck, then the task parks for a human (`blocked` + human review). The recorded outcome carries the exit code, the timeout state, the elapsed time and an output tail — a green-but-nonzero suite is diagnosable from the event log.
 
 ## The dashboard
 
@@ -81,7 +85,7 @@ A **Swarm** tab lives next to Chat in the web GUI, in three views:
 
 - **Board** — runs on the left, task columns (Queued / Running / Done / Failed) front and center. Click a task for its full brief, model, attempt count, interim agent notes, reviewer feedback, and retry. Completed runs fold into a report with per-task summaries and fallback/retry/review stats.
 - **Flow** — the task DAG as a living flow chart: the scheduler at the top, tasks fanned out into parallel waves (same wave = runs concurrently), dependency arrows turning green as blockers complete, reviewer and write-scope hints on each node, all converging into the run report. You can see at a glance what ran in parallel, what ran in sequence, and exactly how far the run has gotten.
-- **Roster** — the duty-table editor: per-role model pickers fed by your live catalog, fallback-chain ordering, effort ladder, concurrency caps, tool filters, personas, custom roles, and an override lock for "hands off my table". The pickers list only providers you have configured in DSH (with API keys) and follow changes automatically — DSH 0.1.6+ required.
+- **Roster** — the duty-table editor: per-role model pickers fed by your live catalog, fallback-chain ordering, effort ladder, concurrency caps, per-role spawn timeouts, tool filters, personas, custom roles, and an override lock for "hands off my table". The pickers list only providers you have configured in DSH (with API keys) and follow changes automatically — DSH 0.1.6+ required.
 - **Everywhere else** — a 🐝 status button in every session header, a small badge for active runs, and a live progress card right in chat where the run was dispatched.
 - **Workspace-aware** — each chat's Swarm tab shows the runs for that chat's workspace; an **All** switch reveals every run on the machine. The roster stays global (one table, all workspaces).
 - **Language** — the Swarm UI follows the DSH language preference (Settings → General → Language) automatically: English and 简体中文 ship in the box, switching re-renders in place.
@@ -135,8 +139,9 @@ For each role, pick a model from the dropdown. It lists **every provider configu
 Optional, per role (all have sane defaults):
 
 - **Fallback chain** — models tried in order if the primary is unavailable.
-- **Effort + effort ladder** — reasoning effort for the role, downgrading per retry.
+- **Effort + effort ladder** — the role's pinned reasoning effort; rungs advance per attempt and always end unpinned, and a level the model cannot accept is stripped before spawning.
 - **Concurrency cap** — limit simultaneous agents of this role.
+- **Spawn timeout** — per-role override of the no-progress window that reclaims a silent child.
 - **Tool filter** — deny specific tools to this role's agents (e.g. a read-only reviewer).
 - **Persona** — the role's standing instructions.
 
@@ -186,7 +191,7 @@ or the one-shot form: `/swarm build a landing page for this project` (plans it, 
 | `swarm_complete` | Mark a task completed when its work was finished outside the swarm (dispatching session only) — keeps the run record in sync with reality. |
 | `swarm_report` | Task agents post interim notes to the board (authenticated to their own task). |
 
-Tasks also accept an **evidence contract** — `evidence: { files: [...], commands: [...] }` — that is machine-checked before a task may close; a **write scope** — `writes: [files]` — that keeps concurrent builders out of each other's files (the dispatcher warns on overlap); and a **human review gate** that parks the verdict on the dashboard.
+Tasks also accept an **evidence contract** — `evidence: { files: [...], commands: [...] }` — that is machine-checked before a task may close; a **write scope** — `writes: [files]` — that keeps concurrent builders out of each other's files (the dispatcher warns on overlap); and a **human review gate** that parks the verdict on the dashboard. A failing evidence command no longer re-runs the finished work: it gets one command-only recheck, and if the command still fails — non-zero exit or timeout (`evidenceTimeoutMs`, default 120 s) — the task parks on the board for a human verdict, with the exit code and an output tail recorded in the event log.
 
 ## Configuration
 
@@ -197,8 +202,8 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
   require: dsh-swarm-orchestrator
   config:
     storageDir: !!js dshHomePath("storages/swarm")   # event log + duty table
-    maxConcurrent: 10           # simultaneous task agents per run
-    maxTotalConcurrentAgents: 20 # global cap across ALL runs (they share the budget)
+    maxConcurrent: 5            # simultaneous task agents per run
+    maxTotalConcurrentAgents: 8 # global cap across ALL runs (they share the budget)
     adaptiveConcurrency: true   # shrink on provider pain, recover on success
     spawnStaggerMs: 750         # pace launches within a wave
     nudgeAfterMinutes: 20       # board marker for long-silent tasks (0 = off)
@@ -206,13 +211,14 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
     requireArchitectReview: true  # architect reviews the dispatcher's plan into PLAN.md first
     staleTimeoutSeconds: 14400  # watchdog: silent agents get reclaimed
     maxRetries: 2               # per task
+    evidenceTimeoutMs: 120000   # per evidence command (1 s – 10 min)
     reviewLoops: 3              # review rejections per task
     notifyDispatchSession: true  # push completion notification to the dispatching chat
     retryBackoffBaseMs: 5000    # retry backoff: base × 2^attempt before retrying
     circuitBreakerThreshold: 3  # failures in 30s before pausing all retries (0 = off)
     circuitBreakerCooldownMs: 60000  # circuit breaker pause duration
-    spawnTimeoutSeconds: 3600   # hard ceiling on one task run (0 = off)
-    maxSubagentDepth: 2         # delegation-depth cap for task agents (1 = no grandchildren)
+    spawnTimeoutSeconds: 3600   # sliding no-progress window per child, re-armed by heartbeats (0 = off)
+    maxSubagentDepth: 1         # delegation-depth cap for task agents (1 = no delegation)
     bootGraceSeconds: 3         # wait after plugin load before orphan recovery
 ```
 
@@ -223,13 +229,14 @@ All concurrency, hardening, and watchdog parameters are **tunable from the dashb
 | Parameter | Default | What it controls |
 |---|---|---|
 | Max concurrent agents | 5 | Simultaneously running task agents **per run** |
-| Global agent cap | 5 | Max agents across **all** runs — concurrent runs share this budget (3+2, not 5+5). Prevents heap-exhaustion crashes when running multiple swarms in parallel |
+| Global agent cap | 8 | Max agents across **all** runs — concurrent runs share this budget (3+2, not 5+5). Prevents heap-exhaustion crashes when running multiple swarms in parallel |
 | Spawn stagger (ms) | 750 | Delay between launches in one wave — softens simultaneous provider load |
 | Retry backoff base (ms) | 5000 | Failed tasks wait base × 2^attempt before retrying (5s → 10s → 20s) — prevents synchronized retry cascades when a provider outage kills all tasks at once |
 | Circuit breaker threshold | 3 | Failures within 30 seconds before pausing all retries (0 = off) — detects provider-wide outages |
 | Circuit breaker cooldown (ms) | 60000 | How long retries pause after the breaker trips |
 | Nudge after silence (min) | 20 | Board marker for silent tasks — 0 = off |
 | Stale timeout (sec) | 14400 | Last-resort reclaim for agents that go completely silent (4 hours) |
+| Spawn timeout (sec) | 3600 | Sliding no-progress window per child — re-armed by every heartbeat, so a working child is never killed for elapsed time; a child that never starts or goes silent is reclaimed (0 = off) |
 
 Changes are **applied immediately** (no restart) and **persisted to `runtime.json`** in the swarm storage directory, overriding the profile's `cordis.patch.yml` values. They survive host restarts.
 
@@ -238,8 +245,8 @@ Changes are **applied immediately** (no restart) and **persisted to `runtime.jso
 ## Under the hood
 
 - **Host half** (Node): a `SwarmService` — duty-table store, append-only JSONL event store, projection fold, the dispatcher (parallel one-shot subagents behind a service-owned anchor agent), review loop, watchdog, pause/resume, and `/swarm/*` HTTP + SSE routes.
-- **Client half** (browser): the Swarm tab, the chat progress card, the header popover, and the Settings section — all fed by board snapshots over SSE. Model pickers use the same LLM RPCs as the Models settings page.
-- **Per-role reasoning effort** rides DSH's `agent/request` waterfall, scoped to tracked swarm children only.
+- **Client half** (browser): the Swarm tab, the chat progress card, the header popover, and the Settings section — all fed by board snapshots over a single reference-counted SSE connection. Model pickers use the same LLM RPCs as the Models settings page.
+- **Per-role reasoning effort** rides DSH's `agent/request` waterfall, scoped to tracked swarm children only — validated against the deployment's declared model capabilities before the child is spawned (dispatch and review pins alike), and recorded on `task/started`.
 - **Deterministic replay**: state is a fold over the event log, with legality guards — a hostile or duplicated event stream cannot resurrect an aborted run or complete a task twice.
 
 ## Known limits
@@ -247,9 +254,8 @@ Changes are **applied immediately** (no restart) and **persisted to `runtime.jso
 Written plainly, because a limit you discover in production costs far more than one you read here.
 
 - **The board reports disk truth, and the disk can lag the model.** A task agent may finish its work without performing every bookkeeping step the protocol asks of it (for example, writing its `.dsh-swarm/task-<id>.json` report). The board shows what was actually recorded, not what the agent claimed. Treat a task's summary as evidence of what was recorded, and verify deliverables yourself.
-- **Evidence contracts are advisory for files, hard for commands.** A missing or empty `evidence.files` entry becomes a board warning, not a closed task; only a failing `evidence.commands` entry blocks completion. Scope control is therefore a completion-time audit, not write interception — nothing stops an agent from writing outside its declared `writes` scope; the dispatcher only warns about overlapping scopes at dispatch time.
+- **Evidence contracts are advisory for files, hard for commands.** A missing or empty `evidence.files` entry becomes a board warning, not a closed task; only a failing `evidence.commands` entry blocks completion (after one command-only recheck, a persistent failure parks the task for a human rather than re-running the work). Scope control is therefore a completion-time audit, not write interception — nothing stops an agent from writing outside its declared `writes` scope; the dispatcher only warns about overlapping scopes at dispatch time.
 - **State is file-backed and serialised within one DSH process.** Concurrent processes editing the same workspace's swarm state are not coordinated. Run one host per workspace.
-- **Attempt identity is not yet enforced (J19).** Each task publishes an `attempts` counter, but not a per-attempt identity. A result that arrives from an attempt already superseded by a retry cannot currently be told apart from the live attempt's result, and the settle path guards on task *status* rather than on *who* produced it. `tests/fault-matrix.test.ts` records this gap (FM1/FM4/FM9) and will tighten automatically once fencing lands. The practical consequence: if you retry a task while its previous child is still running, the older child's outcome may still be recorded.
 - **Member messaging is one-directional.** Task agents can report progress to the dispatcher; they cannot message each other. Coordination happens through the DAG (dependencies and write scopes), not conversation.
 - **One role may hold several concurrent tasks.** The dispatcher bounds concurrency by role and globally, not one-open-task-per-agent, so a single role can own multiple in-flight tasks at once.
 - **Recovery is bounded per boot, not globally.** Orphan recovery requeues a stranded task at most once per host start. A host that restarts repeatedly will requeue the same unwilling task repeatedly — by design, so an unfinished task is not silently abandoned.
