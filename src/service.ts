@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { exec, execFile, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { promisify } from 'node:util'
@@ -20,7 +20,7 @@ import { RuntimeStore } from './domain/runtime-store.js'
 import { fold, isReady, newState, runningCount, taskKeyOf, type SwarmState } from './domain/projection.js'
 import type { BoardSnapshot } from './board.js'
 import { buildBoardSnapshot } from './board.js'
-import { spawnTaskAgent, buildReviewPrompt, parseVerdict, taskReportRelPath, type SpawnDeps } from './dispatch/spawn.js'
+import { spawnTaskAgent, buildReviewPrompt, buildReviewReaskPrompt, parseVerdict, taskReportRelPath, type SpawnDeps } from './dispatch/spawn.js'
 import type { DispatchInput, DispatchResult, DutyTable, ModelRef, RoleConfig, Run, RunDispatchContext, Task, TaskSpec } from './domain/types.js'
 
 const execAsync = promisify(exec)
@@ -172,6 +172,13 @@ interface InFlight {
   childSessionId?: string
   /** J19: the attempt this flight represents, so a superseded one can be told apart. */
   attemptId?: string
+  /**
+   * Item 7: re-arms the spawn ceiling once the child has started. The ceiling is
+   * then a sliding no-progress timer — every heartbeat re-arms it, so a working
+   * child is never killed for elapsed time, while a silent one is reclaimed
+   * after the window with the same J10 adoption the settle path uses.
+   */
+  resetSpawnTimer?: () => void
 }
 
 /** Structural view of ctx.agents for anchor creation (see ensureAnchor). */
@@ -406,7 +413,13 @@ export class SwarmService extends Service {
     const state = fold(this.events.all())
     let recovered = false
     let skipped = 0
+    const runningRuns = new Set<string>()
+    let strandedRetrying = false
     for (const task of state.tasks.values()) {
+      if (task.runId !== undefined) {
+        const ownerRun = state.runs.get(task.runId)
+        if (ownerRun?.status === 'running') runningRuns.add(task.runId)
+      }
       if (task.status !== 'running' && task.status !== 'dispatching' && task.status !== 'reviewing') continue
       const run = state.runs.get(task.runId)
       if (run?.status !== 'running') { skipped++; continue }
@@ -432,6 +445,22 @@ export class SwarmService extends Service {
     if (skipped > 0) {
       this.ctx.logger('swarm').info('skipped %d orphaned task(s) whose run is not running (terminal runs stay frozen)', skipped)
     }
+    // Item 3: `retrying` tasks lost their backoff timer to the restart. They are
+    // NOT re-failed here (appending a failure would flip them back to `retrying`
+    // and every boot would re-fail them in a loop — FM6); instead one dispatch
+    // tick relaunches them, since their backoff (measured from updatedAt) is
+    // long past by the time a restart happened.
+    for (const task of state.tasks.values()) {
+      if (task.status === 'retrying' && runningRuns.has(task.runId)) {
+        strandedRetrying = true
+        this.ctx.logger('swarm').info('retrying task %s/%s re-armed after restart', task.runId, task.id)
+      }
+    }
+    if (strandedRetrying) this.ctx.logger('swarm').info('re-armed stranded retrying task(s) after restart')
+    // Item 3: a boot with zero new events never dispatches — the tick loop is
+    // event-driven. Schedule one tick per surviving running run so pending and
+    // recovered tasks are re-evaluated instead of waiting for outside activity.
+    if (runningRuns.size > 0) this.scheduleTick()
   }
 
   /**
@@ -463,15 +492,49 @@ export class SwarmService extends Service {
         continue
       }
       if (this.view().runs.get(task.runId)?.status === 'aborted') continue
-      if (now - task.updatedAt > staleMs) {
+      const reclaim = (reason: string): void => {
+        // Item 4: the child may have finished the work before going silent —
+        // adopt a fresh on-disk report instead of discarding it (same J10
+        // contract as the settle path; the J22 freshness check inside
+        // adoptTaskReport keeps a predecessor's report from counting).
         this.inFlight.delete(key)
         this.nudgeCount.delete(key)
         this.nudgedAt.delete(key)
         flight.controller.abort()
+        const adopted = this.adoptTaskReport(task.runId, task)
+        if (adopted !== undefined) {
+          this.events.append('task/completed', {
+            runId: task.runId, taskId: task.id,
+            data: { attemptId: flight.attemptId, summary: adopted },
+          })
+          if (task.reviewBy !== undefined && task.reviewBy.length > 0 && task.reviewGate !== 'human') {
+            void this.runReview(task.runId, task.id, task.reviewBy, flight.attemptId)
+          } else {
+            this.scheduleTick()
+          }
+          this.ctx.logger('swarm').info('watchdog reclaim adopted the on-disk report for %s', key)
+          return
+        }
+        const retry = task.attempts <= this.swarmConfig.maxRetries
         this.events.append('task/failed', {
           runId: task.runId, taskId: task.id,
-          data: { attemptId: flight.attemptId, retry: task.attempts <= this.swarmConfig.maxRetries, reason: `stale: no progress for ${Math.round(staleMs / 1000)}s (watchdog)` },
+          data: { attemptId: flight.attemptId, retry, reason },
         })
+        // Item 3 (H-1 parity): this path has no settle handler to arm the
+        // retry-backoff timer, and ticks are event-driven — without the timer
+        // the tick's "too soon" skip never gets its follow-up tick and the run
+        // strands (the overnight StockSelector stall: reclaimed 00:05:37,
+        // silence until a human resumed it at 07:15).
+        if (retry && this.rt('retryBackoffBaseMs') > 0) {
+          const backoffMs = Math.min(
+            this.rt('retryBackoffBaseMs') * Math.pow(2, Math.max(0, task.attempts - 1)),
+            60000,
+          )
+          setTimeout(() => this.scheduleTick(), backoffMs + 100)
+        }
+      }
+      if (now - task.updatedAt > staleMs) {
+        reclaim(`stale: no progress for ${Math.round(staleMs / 1000)}s (watchdog)`)
         this.ctx.logger('swarm').warn('watchdog aborted stale task %s', key)
         continue
       }
@@ -489,17 +552,7 @@ export class SwarmService extends Service {
           this.nudgeCount.set(key, count)
           if (count >= 3) {
             // Escalation: reclaim the stalled child and requeue the task.
-            this.nudgeCount.delete(key)
-            this.inFlight.delete(key)
-            flight.controller.abort()
-            this.events.append('task/failed', {
-              runId: task.runId, taskId: task.id,
-              data: {
-                attemptId: flight.attemptId,
-                retry: task.attempts <= this.swarmConfig.maxRetries,
-                reason: `watchdog escalation: ${count} nudges over ${Math.round(silentMs / 60000)} min of silence — child reclaimed`,
-              },
-            })
+            reclaim(`watchdog escalation: ${count} nudges over ${Math.round(silentMs / 60000)} min of silence — child reclaimed`)
             this.ctx.logger('swarm').warn('watchdog escalated task %s after %d nudges', key, count)
             continue
           }
@@ -513,6 +566,42 @@ export class SwarmService extends Service {
           this.nudgeCount.delete(key)
         }
       }
+    }
+    // Item 9: keep a generated dependency-board snapshot beside the run for
+    // every running run (the coordinator's hand-maintained file is separate
+    // and never touched).
+    for (const run of this.view().runs.values()) {
+      if (run.status === 'running') this.writeDependencyBoard(run.id)
+    }
+  }
+
+  /**
+   * Item 9: auto-export one run's dependency board as markdown, written beside
+   * the run (`.dsh-swarm/dependency-board-<runId>.md`). A generated snapshot —
+   * clearly marked so it is never confused with a hand-maintained board.
+   */
+  private writeDependencyBoard(runId: string): void {
+    const state = this.view()
+    const run = state.runs.get(runId)
+    if (run === undefined || run.dispatch?.cwd === undefined) return
+    const tasks = run.taskIds
+      .map((id) => state.tasks.get(`${runId}/${id}`))
+      .filter((t): t is Task => t !== undefined)
+    const lines: string[] = []
+    lines.push(`# Dependency board — ${run.title}`, '')
+    lines.push(`Run: \`${run.id}\` · status: ${run.status} · auto-generated by the swarm service (every watchdog sweep) — do not edit by hand.`, '')
+    lines.push('| Task | Role | Status | Attempts | Depends on | Summary / note (head) |', '|---|---|---|---|---|---|')
+    for (const task of tasks) {
+      const deps = (task.blockedBy ?? []).join(', ')
+      const head = (task.summary ?? task.lastNote ?? '').replace(/\|/g, '\\|').split('\n')[0]?.slice(0, 120) ?? ''
+      lines.push(`| ${task.id} | ${task.role} | ${task.status} | ${task.attempts} | ${deps} | ${head} |`)
+    }
+    try {
+      const dir = join(run.dispatch.cwd, '.dsh-swarm')
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, `dependency-board-${runId}.md`), lines.join('\n') + '\n', 'utf8')
+    } catch (err) {
+      this.ctx.logger('swarm').warn('dependency board write failed for %s: %s', runId, String(err))
     }
   }
 
@@ -849,6 +938,10 @@ export class SwarmService extends Service {
       runId: task.runId, taskId: task.id,
       data: { ...(entry.attemptId !== undefined ? { attemptId: entry.attemptId } : {}), note },
     })
+    // Item 7: progress re-arms the child's no-progress window — a working child
+    // is never reclaimed for elapsed time.
+    const flight = this.inFlight.get(entry.taskKey)
+    if (flight !== undefined && flight.attemptId === entry.attemptId) flight.resetSpawnTimer?.()
     return 'ok'
   }
 
@@ -1558,8 +1651,16 @@ export class SwarmService extends Service {
     // below could previously only compare *status*, not *identity*.
     const attemptId = `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
     this.liveAttempts.set(key, attemptId)
-    const spawnTimeoutMs = this.rt('spawnTimeoutSeconds') * 1000
+    // Item 7: the ceiling is a SLIDING no-progress timer (re-armed by every
+    // heartbeat once the child has started) — a working child is never killed
+    // for elapsed time; a silent one is reclaimed after the window.
+    const spawnTimeoutMs = (role.spawnTimeoutSeconds ?? this.rt('spawnTimeoutSeconds')) * 1000
     this.inFlight.set(key, { controller, taskKey: key, attemptId })
+    // A relaunch starts a fresh silence clock: the dead attempt's nudge history
+    // must not reclaim the new one (it killed a healthy 7-minute-old retry that
+    // inherited "3 nudges over 61 min" from its predecessor).
+    this.nudgeCount.delete(key)
+    this.nudgedAt.delete(key)
 
     const startSpawn = (): void => {
       const deps = this.spawnDeps()
@@ -1571,13 +1672,18 @@ export class SwarmService extends Service {
       const spawnSignal = new AbortController()
       const onLaunchAbort = (): void => spawnSignal.abort()
       let spawnTimer: ReturnType<typeof setTimeout> | undefined
-      if (spawnTimeoutMs > 0) {
+      // Item 7: re-armable — every heartbeat re-arms it (sliding no-progress
+      // window via InFlight.resetSpawnTimer, wired at onStarted).
+      const armSpawnCeiling = (): void => {
+        if (spawnTimeoutMs <= 0) return
+        if (spawnTimer !== undefined) clearTimeout(spawnTimer)
         spawnTimer = setTimeout(() => {
-          this.ctx.logger('swarm').warn('task %s exceeded the %ds spawn ceiling — aborting child', key, Math.round(spawnTimeoutMs / 1000))
+          this.ctx.logger('swarm').warn('task %s exceeded the %ds no-progress window — aborting child', key, Math.round(spawnTimeoutMs / 1000))
           spawnSignal.abort()
         }, spawnTimeoutMs)
         spawnTimer.unref?.()
       }
+      armSpawnCeiling()
       controller.signal.addEventListener('abort', onLaunchAbort, { once: true })
       if (controller.signal.aborted) spawnSignal.abort()
       const clearSpawnTimeout = (): void => {
@@ -1636,6 +1742,11 @@ export class SwarmService extends Service {
           },
           onStarted: (childSessionId) => {
             this.trackChildSession(childSessionId, key, effort, attemptId)
+            // Item 7: wire the sliding re-arm so every heartbeat extends the
+            // child's no-progress window. The window keeps running from creation
+            // for a child that never heartbeats at all.
+            const flight = this.inFlight.get(key)
+            if (flight !== undefined) flight.resetSpawnTimer = (): void => armSpawnCeiling()
             this.events.append('task/agent-started', { runId, taskId: task.id, data: { sessionId: childSessionId } })
           },
           // J18: the child rejected the pinned reasoning effort (the fallback model
@@ -1885,8 +1996,39 @@ export class SwarmService extends Service {
       this.checkRunCompletion(runId)
       return
     }
-    const verdict = parseVerdict(outcome.summary ?? '')
-    const feedback = (outcome.summary ?? '').trim()
+    // Item 1: parse the COMPLETE final message. The prompt places the verdict
+    // line at the end, but `summary` is truncated at 2000 chars — parsing it
+    // silently failed every review thorough enough to exceed the cap (the W00
+    // reviewer ran 11 minutes and failed open exactly this way).
+    const fullText = outcome.finalText ?? outcome.summary ?? ''
+    let verdict = parseVerdict(fullText)
+    let feedback = fullText.trim()
+    // Item 8: one explicit re-ask before failing open — a reviewer that forgot
+    // the line gets its own assessment back and is asked for the exact verdict.
+    if (verdict === undefined && this.view().tasks.get(key)?.status === 'reviewing') {
+      const reaskController = new AbortController()
+      this.inFlight.set(key, { controller: reaskController, taskKey: key })
+      try {
+        const reask = await spawnTaskAgent(deps, {
+          parent, run, task, role: reviewerRole, candidates, signal: reaskController.signal,
+          prompt: buildReviewReaskPrompt(feedback),
+          onFallback: () => {},
+          onStarted: (childSessionId) => {
+            this.trackChildSession(childSessionId, key, reviewerRole.reasoningEffort)
+            this.events.append('task/agent-started', { runId, taskId, data: { sessionId: childSessionId } })
+          },
+        })
+        if (reask.ok && this.view().tasks.get(key)?.status === 'reviewing') {
+          const text = reask.finalText ?? reask.summary ?? ''
+          const retried = parseVerdict(text)
+          if (retried !== undefined) {
+            verdict = retried
+            feedback = text.trim()
+          }
+        }
+      } catch { /* fall through to fail-open */ }
+      this.inFlight.delete(key)
+    }
     if (verdict === 'reject') {
       const reviews = (this.view().tasks.get(key)?.reviews ?? 0) + 1
       const exhausted = reviews >= this.swarmConfig.reviewLoops

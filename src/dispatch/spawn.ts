@@ -130,6 +130,14 @@ export function buildReviewPrompt(run: Run, task: Task, reviewerRole: RoleConfig
           '',
         ]
       : []),
+    ...(task.evidence !== undefined || task.summary !== undefined
+      ? [
+          '## Where to start verifying',
+          `- The task agent's own report: \`${taskReportRelPath(task.id)}\` — read it, then verify its claims in the workspace rather than trusting it.`,
+          ...(task.evidence?.commands ?? []).length > 0 ? ['- Re-run the evidence commands above from the workspace root.'] : [],
+          '',
+        ]
+      : []),
     '## Your job',
     'Inspect the claimed work in the workspace. Check it actually fulfils the task brief and is sound.',
     task.reviewFeedback !== undefined ? `This task already went through ${task.reviews ?? 0} review round(s); the previous feedback was: ${task.reviewFeedback}` : '',
@@ -147,8 +155,26 @@ export function parseVerdict(output: string): 'approve' | 'reject' | undefined {
   return match === null ? undefined : (match[1].toLowerCase() as 'approve' | 'reject')
 }
 
+/**
+ * Follow-up for a reviewer that settled without a verdict line (item 8): give it
+ * its own assessment back and demand the exact line, nothing else.
+ */
+export function buildReviewReaskPrompt(assessment: string): string {
+  return [
+    'Your review above did not include the required verdict line, so it could not be recorded.',
+    'End this reply with EXACTLY one line and nothing after it:',
+    'VERDICT: APPROVE',
+    'or',
+    'VERDICT: REJECT',
+    '',
+    'Your previous assessment, for reference:',
+    assessment.length > 0 ? assessment : '(no assessment text)',
+  ].join('\n')
+}
+
 /** Extract a short text summary from the child's final assistant output. */
-export function summarizeOutput(output: unknown, maxChars = 2000): string {
+/** The child's complete final-message text, without any truncation. */
+export function outputText(output: unknown): string {
   if (!Array.isArray(output)) return ''
   const parts: string[] = []
   for (const block of output) {
@@ -157,7 +183,11 @@ export function summarizeOutput(output: unknown, maxChars = 2000): string {
       if (typeof text === 'string') parts.push(text)
     }
   }
-  const joined = parts.join('\n').trim()
+  return parts.join('\n').trim()
+}
+
+export function summarizeOutput(output: unknown, maxChars = 2000): string {
+  const joined = outputText(output)
   return joined.length > maxChars ? joined.slice(0, maxChars) + '…' : joined
 }
 
@@ -185,6 +215,8 @@ export interface SpawnOutcome {
   ok: boolean
   stopReason?: string
   summary?: string
+  /** Complete final-message text, untruncated (the summary is capped at 2000 chars). */
+  finalText?: string
   reason?: string
   provider?: string
   model?: string
@@ -311,6 +343,7 @@ export async function spawnTaskAgent(
           ok: true,
           stopReason: result.stopReason,
           summary: summarizeOutput(result.output),
+          finalText: outputText(result.output),
           provider: lastProvider,
           model: lastModel,
           childSessionId: run.id,
