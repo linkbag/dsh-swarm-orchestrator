@@ -1425,9 +1425,10 @@ export class SwarmService extends Service {
    *
    * Why the primary decides: the request goes to the primary first, and the chain is
    * rotated per attempt (A6), so a rotated chain legitimately re-enables the pin on a
-   * model that declares support. A FALLBACK that would refuse the pin is still
-   * covered — the child dies fast and A1's rung retry re-runs that model unpinned,
-   * with J18's explicit-rejection path behind it.
+   * model that declares support. A FALLBACK that refuses the pin is not rung-retried
+   * on itself — the rung retry re-runs the primary; a mid-chain refusal converges on
+   * the next task attempt, where A6 rotation makes that model primary and this strip
+   * applies.
    *
    * Why the candidate is NOT dropped: the pin is a preference, model diversity is
    * not. Dropping a candidate because of a pin loses a working model for the run.
@@ -2170,6 +2171,18 @@ export class SwarmService extends Service {
       this.checkRunCompletion(runId)
       return
     }
+    // J21 (review paths): resolve the reviewer's pin through the same preflight the
+    // dispatch site applies. The review spawns below used to pin `reasoningEffort`
+    // raw, bypassing the strip entirely — so a role with a pin whose reviewer ran on
+    // a pi-ai model declared without a reasoningEfforts map died the exact 41 ms
+    // death the preflight prevents, with no strip and no ladder to catch it. An
+    // empty/inherit primary (no provider/model resolved) cannot be judged, so the raw
+    // field stands — matching dispatch semantics, where an unmentioned model is never
+    // judged. No rung ladder here: the review path already degrades via the 0.6.9
+    // re-ask, and the strip removes the wasted child entirely.
+    const reviewerEffort = candidates[0] !== undefined && candidates[0].model.length > 0
+      ? this.preflightEffort(`review ${reviewerRoleId}`, candidates, reviewerRole.reasoningEffort).effort
+      : reviewerRole.reasoningEffort
     const controller = new AbortController()
     this.inFlight.set(key, { controller, taskKey: key })
     // task/review-started must land in the SAME synchronous block as the
@@ -2204,7 +2217,7 @@ export class SwarmService extends Service {
           })
         },
         onStarted: (childSessionId) => {
-          this.trackChildSession(childSessionId, key, reviewerRole.reasoningEffort)
+          this.trackChildSession(childSessionId, key, reviewerEffort)
           this.events.append('task/agent-started', { runId, taskId, data: { sessionId: childSessionId } })
         },
       })
@@ -2242,7 +2255,7 @@ export class SwarmService extends Service {
           prompt: buildReviewReaskPrompt(feedback),
           onFallback: () => {},
           onStarted: (childSessionId) => {
-            this.trackChildSession(childSessionId, key, reviewerRole.reasoningEffort)
+            this.trackChildSession(childSessionId, key, reviewerEffort)
             this.events.append('task/agent-started', { runId, taskId, data: { sessionId: childSessionId } })
           },
         })

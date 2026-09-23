@@ -2,6 +2,44 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.17
+
+**The reviewer effort pin now goes through the same preflight as task dispatch.**
+
+### Fixed
+
+- **Review children no longer receive a raw, unvalidated effort pin.** Both review
+  spawn sites (the initial review and the 0.6.9 re-ask) pinned
+  `reviewerRole.reasoningEffort` verbatim, bypassing the 0.6.15 strip entirely - a
+  role pinned to a level its reviewer model cannot accept would die the exact
+  41 ms death the preflight exists to prevent, with no protection at all. The pin
+  is now resolved through the same `preflightEffort` check, computed once after
+  candidate resolution and shared by both sites; an empty/inherit primary is
+  never judged (matching dispatch semantics), and a strip logs
+  `preflight (review <role>): ...`.
+- **A misleading comment in `preflightEffort` is corrected.** The 0.6.14 rung
+  retry re-runs the PRIMARY, not the failing candidate; a mid-chain pin refusal
+  converges on the next task attempt via A6 rotation plus this strip. Comments in
+  safety-critical paths must not overstate coverage.
+
+### Tests
+
+- 3 new: a reviewer pinned on a map-less pi-ai model gets the pin stripped and
+  the review still completes; a reviewer pinned to a DECLARED level keeps the pin
+  (guards against over-reach); the re-ask spawn site gets the same strip. Pins
+  are asserted with a spy at the `trackChildSession` call site - a post-hoc
+  `effortFor` poll asserts nothing, because `forgetChildSession` deletes the
+  entry the moment the review spawn resolves.
+- `tests/preflight-live.test.ts`: the live settings file drifted after 0.6.16
+  (the deployment default became `zai/glm-5.3` with `reasoningEffort: max`, and
+  glm-5.3 is simultaneously map-less), which made the test's blanket loops
+  contradict each other - it was failing on pristine HEAD. It now asserts the
+  parser's actual contract: the default model accepts exactly its declared level
+  and refuses every other; all other map-less models still refuse `max`. The
+  default pair is first-hand proof the carve-out is needed: the model is
+  map-less, yet the pair demonstrably runs.
+- Suite: **162 tests, 162 pass, 15/15 files.**
+
 ## 0.6.16
 
 **An evidence-only failure no longer re-does the work, and it finally says why.**

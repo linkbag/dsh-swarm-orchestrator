@@ -283,6 +283,8 @@ const contexts: Context[] = []
  * (`$DSH_HOME/settings.yaml`). It declares exactly the levels these tests pin: a
  * real deployment must declare `reasoningEfforts` for a pin to be legal at all,
  * because pi-ai refuses any explicit level on a hand-declared model that has no map.
+ * `glm-5.3-air` is deliberately map-less — the production mimo shape — so the
+ * review-path strip tests have an effort-incapable pi-ai model to pin against.
  */
 const DECLARING_SETTINGS = [
   'llm-pi-ai:',
@@ -296,6 +298,7 @@ const DECLARING_SETTINGS = [
   '        - id: glm-5.3-flash',
   '          reasoningEfforts:',
   '            max: max',
+  '        - id: glm-5.3-air',
   'llm-deepseek:',
   '  models:',
   '    - id: deepseek-flash',
@@ -893,6 +896,104 @@ describe('swarm service (integration, fake subagents)', () => {
     )
     expect(service.events.all().find((e) => e.kind === 'task/started' && e.taskId === 'u4')?.data?.effort).toBe('max')
     expect(fake.calls.length).toBe(1)
+  }, 20000)
+
+  // ── J21 (review paths): the reviewer's pin goes through the same strip ─────
+  // The review spawns pinned `reviewerRole.reasoningEffort` RAW — bypassing the
+  // preflight entirely — so a role with a pin whose reviewer ran on a map-less
+  // pi-ai model (the production mimo shape, fixture model glm-5.3-air) died the
+  // 41 ms death with no strip and no ladder to catch it. The spy records the pin
+  // at the exact call site the fix changes, so there is no timing window: the
+  // value is captured when the child is registered, not polled afterwards
+  // (`forgetChildSession` deletes it the moment the review spawn resolves).
+  function spyPins(service: SwarmService): Array<{ child: string; effort?: string }> {
+    const pins: Array<{ child: string; effort?: string }> = []
+    const anyService = service as unknown as {
+      trackChildSession: (id: string, taskKey: string, effort?: string, attemptId?: string) => void
+    }
+    const original = anyService.trackChildSession.bind(service)
+    anyService.trackChildSession = (id, taskKey, effort, attemptId) => {
+      pins.push({ child: id, effort })
+      original(id, taskKey, effort, attemptId)
+    }
+    return pins
+  }
+
+  it('J21: a reviewer pinned on a map-less pi-ai model gets the pin stripped, and the review still completes', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    const pins = spyPins(service)
+    const table = structuredClone(service.duty.get())
+    table.roles.reviewer = { ...table.roles.reviewer, provider: 'zai', model: 'glm-5.3-air', reasoningEffort: 'max' }
+    service.setDutyTable(table, 'test')
+
+    const result = service.dispatch({
+      title: 'reviewer strip',
+      spec: 's',
+      tasks: [{ id: 'r1', subject: 'R', description: 'd', role: 'builder', reviewBy: 'reviewer' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => service.snapshot().tasks.find((t) => t.id === 'r1')?.status === 'completed',
+      10000,
+      'task completed with a stripped reviewer pin',
+    )
+    // call 0 = builder (sess-1, unpinned), call 1 = reviewer (sess-2).
+    expect(fake.calls[1]?.agentOptions?.model).toBe('glm-5.3-air')
+    expect(pins.find((p) => p.child === 'sess-2')?.effort).toBeUndefined()
+    expect(service.snapshot().tasks.find((t) => t.id === 'r1')?.reviewed).toBe(true)
+  }, 20000)
+
+  it('J21: a reviewer pinned to a DECLARED level keeps the pin', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    const pins = spyPins(service)
+    const table = structuredClone(service.duty.get())
+    // glm-5.3 declares max and high in the fixture, so this pin is legal.
+    table.roles.reviewer = { ...table.roles.reviewer, provider: 'zai', model: 'glm-5.3', reasoningEffort: 'max' }
+    service.setDutyTable(table, 'test')
+
+    const result = service.dispatch({
+      title: 'reviewer keep',
+      spec: 's',
+      tasks: [{ id: 'r2', subject: 'R', description: 'd', role: 'builder', reviewBy: 'reviewer' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => service.snapshot().tasks.find((t) => t.id === 'r2')?.status === 'completed',
+      10000,
+      'task completed with the reviewer pin kept',
+    )
+    expect(fake.calls[1]?.agentOptions?.model).toBe('glm-5.3')
+    expect(pins.find((p) => p.child === 'sess-2')?.effort).toBe('max')
+  }, 20000)
+
+  it('J21: the reviewer re-ask spawn gets the same strip', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    const pins = spyPins(service)
+    const table = structuredClone(service.duty.get())
+    table.roles.reviewer = { ...table.roles.reviewer, provider: 'zai', model: 'glm-5.3-air', reasoningEffort: 'high' }
+    service.setDutyTable(table, 'test')
+    // The reviewer forgets the verdict line on the first pass; the 0.6.9 re-ask
+    // (the SECOND review spawn site) then supplies it.
+    fake.script = { 1: 'a long assessment with no verdict line at all', 2: 'VERDICT: APPROVE' }
+
+    const result = service.dispatch({
+      title: 'reviewer re-ask strip',
+      spec: 's',
+      tasks: [{ id: 'r3', subject: 'R', description: 'd', role: 'builder', reviewBy: 'reviewer' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => service.snapshot().tasks.find((t) => t.id === 'r3')?.status === 'completed',
+      10000,
+      'task completed after the re-ask',
+    )
+    expect(fake.calls.length).toBe(3) // builder + reviewer + re-ask
+    expect(pins.find((p) => p.child === 'sess-2')?.effort).toBeUndefined()
+    expect(pins.find((p) => p.child === 'sess-3')?.effort).toBeUndefined()
+    expect(service.snapshot().tasks.find((t) => t.id === 'r3')?.reviewed).toBe(true)
   }, 20000)
 
   it('swarm_report authenticates tracked child sessions only', async () => {

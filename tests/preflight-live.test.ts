@@ -34,9 +34,21 @@ describe('J21 preflight against the real deployment', () => {
     }
 
     // The corrected rule, held against the live file: a model hand-declared under
-    // llm-pi-ai with NO reasoningEfforts map supports only `off`, so EVERY explicit
+    // llm-pi-ai with NO reasoningEfforts map supports only `off`, so every explicit
     // level is refused at request time. These are the children that died in 41/94 ms.
+    // One carve-out, mirroring the parser: the deployment's DEFAULT pair above is
+    // proven-good first-hand for exactly its declared level — even when that model
+    // is otherwise map-less (the live default, zai/glm-5.3 + reasoningEffort: max,
+    // is exactly this case, and it is why this loop cannot be blanket). Every other
+    // level — including `max` when the default level is something else — is refused.
+    const defaultModel = defaultBlock?.[2]
+    const defaultLevel = defaultBlock?.[3]
     for (const model of [...support.declaredWithoutMap]) {
+      if (model === defaultModel && defaultLevel !== undefined) {
+        expect(checkEffortSupport(model, defaultLevel, support).incompatible).toBe(false)
+        if (defaultLevel !== 'max') expect(checkEffortSupport(model, 'max', support).incompatible).toBe(true)
+        continue
+      }
       expect(checkEffortSupport(model, 'max', support).incompatible).toBe(true)
     }
     // Live confirmation for the model behind the incident, when it is one of them.
