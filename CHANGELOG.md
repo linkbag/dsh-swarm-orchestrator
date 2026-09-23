@@ -2,6 +2,52 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.11
+
+Client-plugin hardening: the freeze fix from the withdrawn 0.6.9/0.6.10 line,
+applied on top of the 0.6.8 dispatcher. **No scheduler changes.**
+
+### Fixed
+
+- **The client plugin no longer hard-injects version-specific service faces.**
+  `inject` is now `['slots']` only. A hard inject blocks plugin activation until
+  every named service exists, so a host that renames or omits `connection`,
+  `remote`, `remote.llm`, `remote.session` or `locale` left the module
+  unactivated and stalled the whole client tree — observed as "web UI freezes,
+  no chat history, no plugin-market catalog, no swarm host connection". Those
+  faces are now wired through a dynamically scoped `ctx.inject([...], cb)` that
+  fires only when the host provides all of them; when one is missing the plugin
+  still activates and degrades (English labels, no live model catalog) instead
+  of blocking activation.
+- **Every raw service property read is guarded.** `ctx.remote` and `ctx.locale`
+  are read inside `try` blocks — an undeclared service access throws on cordis,
+  and an escaping throw from the catalog getter is how a degraded host becomes a
+  broken UI.
+
+### Reproduced on the failing host
+
+DSH 0.1.7-alpha.2 with a mixed install (`@deepseek-ai/dsh` 0.1.7-alpha.2 beside
+0.1.6-alpha.2 companion packages, plus a second, incomplete `npx`-installed DSH
+in the user root serving the port). The live client service catalog on that host
+exposes `layout, locale, sessions, slots, theme, timer, uiWorkspace, workspaces`
+— **no** `remote`, `remote.llm`, `remote.session` or `connection` — so the 0.6.8
+hard inject could never be satisfied, and enabling the plugin stalled the client
+tree while the host process stayed healthy (a second client could still reach it
+and disable the plugin).
+
+### Tests
+
+- `tests/client-hardening.test.ts` (4) — pins the soft `inject`, forbids
+  re-hardening any optional face, asserts the scoped wiring exists, and requires
+  every `ctx.<service>` property read to sit inside a `try` block.
+- `tests/boot-audit-live.test.ts` (1) — boots the host half against the real
+  production store (3.86 MB / 3,885 events) and asserts zero appended events, no
+  storm, no hang.
+- Suite: **140 tests, 139 pass**. The one failure is the pre-existing
+  `tests/preflight-live.test.ts` assertion that the deployment default is
+  `glm-5.3-flash`; it fails identically on the pristine 0.6.8 tree and is
+  unrelated to this patch.
+
 ## 0.6.8
 
 The Swarm interface now speaks your language.
