@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -1964,16 +1964,22 @@ describe('swarm service (integration, fake subagents)', () => {
     }, makeDispatcher('D:\\definitely-missing-workspace-xyz') as never)
     service.endorse(result.runId)
 
+    // A7: an evidence command that cannot even START — its workspace is gone — is an
+    // evidence-only failure of finished work, so it blocks for a human instead of
+    // spending the task's retry budget on a respawn that cannot help.
     await waitFor(() => {
       const t = service.snapshot().tasks.find((x) => x.id === 'gate2')
-      return t !== undefined && (t.status === 'failed' || t.status === 'retrying')
-    }, 8000, 'gate2 closed')
+      return t !== undefined && t.status === 'blocked'
+    }, 8000, 'gate2 blocked for a human')
 
-    const note = service.snapshot().tasks.find((x) => x.id === 'gate2')?.lastNote ?? ''
-    // The evidence checker should surface a meaningful reason (workspace ENOENT,
-    // command spawn failure, etc.) rather than a bare "failed".
-    expect(note.length).toBeGreaterThan(0)
-    expect(note).not.toBe('evidence contract failed')
+    const task = service.snapshot().tasks.find((x) => x.id === 'gate2')
+    const reason = task?.blockedReason ?? ''
+    // The verdict must name the real cause (the command never started) rather than a
+    // bare "evidence contract failed" — the point this test has always made.
+    expect(task?.humanReview).toBe(true)
+    expect(reason.length).toBeGreaterThan(0)
+    expect(reason).not.toBe('evidence contract failed')
+    expect(reason).toMatch(/could not be started/)
   }, 15000)
 
   // ── J9: boot readiness waits for the spawn provider ──────────────────────
@@ -2364,4 +2370,139 @@ describe('swarm service (integration, fake subagents)', () => {
     const note = service.snapshot().tasks.find((t) => t.id === 'd3')?.lastNote ?? ''
     expect(note).toMatch(/depth/i)
   }, 15000)
+})
+
+describe('A7: evidence-contract failure path', () => {
+  /** The raw event log — a verdict must be assertable from events.jsonl alone. */
+  const eventsOf = (dir: string): Array<{ kind: string; taskId?: string; data?: Record<string, unknown> }> =>
+    readFileSync(join(dir, 'events.jsonl'), 'utf8')
+      .split('\n')
+      .filter((line) => line.trim().length > 0)
+      .map((line) => JSON.parse(line) as { kind: string; taskId?: string; data?: Record<string, unknown> })
+
+  const taskOf = (service: SwarmService, runId: string) =>
+    service.snapshot().tasks.find((t) => t.runId === runId && t.id === 'a')!
+
+  /**
+   * How many times a command actually executed, read off a marker file it appends to.
+   * PowerShell 5.1 writes `>>` redirection as UTF-16LE, so the raw bytes interleave
+   * NULs and a line count is not an execution count; strip them and count the marker.
+   */
+  const markerCount = (path: string, marker: string): number =>
+    existsSync(path) ? (readFileSync(path, 'utf8').replace(/\0/g, '').match(new RegExp(marker, 'g')) ?? []).length : 0
+
+  /** One builder task whose child SUCCEEDS and whose evidence contract is `commands`. */
+  async function dispatchWithCommands(commands: string[], overrides: Record<string, unknown> = {}) {
+    const { ctx, service, fake, dir } = await bootSwarm(overrides)
+    contexts.push(ctx)
+    dirs.push(dir)
+    const dispatched = service.dispatch({
+      title: 'evidence hardening',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { commands } }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(dispatched.runId)
+    return { service, fake, dir, runId: dispatched.runId }
+  }
+
+  it('re-runs only the declared commands, once, and never respawns the finished child', async () => {
+    // The incident's shape: a green summary, then a non-zero exit from a teardown
+    // artefact. The command counts its own executions by appending a marker, so
+    // "exactly one recheck" is measured rather than inferred from timing.
+    const { service, fake, dir, runId } = await dispatchWithCommands(["echo '191 passed in 4.50s'; echo run >> runs.txt; exit 1"])
+
+    await waitFor(() => taskOf(service, runId).status === 'blocked', 20000, 'task blocks for a human after the recheck')
+
+    // The deliverable was already on disk and verified — the child must NOT be respawned.
+    expect(fake.calls.length).toBe(1)
+    // One run, one recheck. Never a loop.
+    expect(markerCount(join(dir, 'runs.txt'), 'run')).toBe(2)
+
+    const task = taskOf(service, runId)
+    expect(task.status).toBe('blocked')
+    expect(task.humanReview).toBe(true)
+    expect(task.blockedReason ?? '').toMatch(/evidence contract failed twice/)
+
+    // No whole-task retry: the old behaviour emitted task/failed with retry: true here.
+    const events = eventsOf(dir)
+    expect(events.filter((e) => e.kind === 'task/failed' && e.taskId === 'a')).toHaveLength(0)
+    expect(events.filter((e) => e.kind === 'task/blocked' && e.taskId === 'a').length).toBeGreaterThanOrEqual(1)
+    // The recheck itself is on the record, marked as such.
+    const recheckNotes = events.filter(
+      (e) => e.kind === 'task/heartbeat' && e.taskId === 'a'
+        && (e.data?.evidence as { recheck?: boolean } | undefined)?.recheck === true,
+    )
+    expect(recheckNotes).toHaveLength(1)
+  }, 30000)
+
+  it('records the exit code and an output tail, so the log explains the failure', async () => {
+    const { service, dir, runId } = await dispatchWithCommands(["echo '191 passed in 4.50s'; echo run >> runs.txt; exit 1"])
+    await waitFor(() => taskOf(service, runId).status === 'blocked', 20000, 'blocked')
+
+    const blocked = eventsOf(dir).filter((e) => e.kind === 'task/blocked' && e.taskId === 'a').pop()!
+    const reason = String(blocked.data?.reason ?? '')
+    expect(reason).toMatch(/exit code 1/)            // the verdict is never truncated away
+    expect(reason).toMatch(/191 passed in 4\.50s/)   // nor is the tail that explains it
+
+    const evidence = blocked.data?.evidence as
+      | { commands?: Array<Record<string, unknown>>; firstRun?: Array<Record<string, unknown>> }
+      | undefined
+    const recorded = evidence?.commands ?? []
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0].exitCode).toBe(1)
+    expect(recorded[0].timedOut).toBe(false)
+    expect(typeof recorded[0].elapsedMs).toBe('number')
+    expect(String(recorded[0].outputTail)).toMatch(/191 passed in 4\.50s/)
+    // The FIRST run's detail survives too, so a transient failure is still explained.
+    expect(evidence?.firstRun ?? []).toHaveLength(1)
+    expect((evidence?.firstRun ?? [])[0].exitCode).toBe(1)
+  }, 30000)
+
+  it('reports a hung command as TIMED OUT, distinct from a non-zero exit', async () => {
+    const { service, dir, runId } = await dispatchWithCommands(['sleep 30'], { evidenceTimeoutMs: 1200 })
+    await waitFor(() => taskOf(service, runId).status === 'blocked', 30000, 'blocked after two timeouts')
+
+    const blocked = eventsOf(dir).filter((e) => e.kind === 'task/blocked' && e.taskId === 'a').pop()!
+    const reason = String(blocked.data?.reason ?? '')
+    expect(reason).toMatch(/TIMED OUT/)
+    expect(reason).not.toMatch(/exit code/) // the whole point: the two are distinguishable
+
+    const recorded = (blocked.data?.evidence as { commands?: Array<Record<string, unknown>> } | undefined)?.commands ?? []
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0].timedOut).toBe(true)
+    expect(recorded[0]).not.toHaveProperty('exitCode')
+    expect(Number(recorded[0].elapsedMs)).toBeGreaterThanOrEqual(1000)
+  }, 60000)
+
+  it('leaves a genuine child failure on the existing retry path, with no evidence recheck', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    // The child never reports done, so the evidence contract is not consulted at all.
+    fake.failScript[0] = { stopReason: 'error', output: [] }
+    fake.failScript[1] = { stopReason: 'error', output: [] }
+    fake.failScript[2] = { stopReason: 'error', output: [] }
+    const dispatched = service.dispatch({
+      title: 'genuine failure',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { commands: ['echo x >> runs.txt; exit 1'] } }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(dispatched.runId)
+
+    await waitFor(() => taskOf(service, dispatched.runId).status === 'failed', 20000, 'task fails after its retries')
+
+    // 1 + maxRetries(2): the retry budget is untouched by this work.
+    expect(fake.calls.length).toBe(3)
+    const task = taskOf(service, dispatched.runId)
+    expect(task.status).toBe('failed')
+    expect(task.humanReview).not.toBe(true)
+
+    // The command never ran and no human gate was raised.
+    expect(existsSync(join(dir, 'runs.txt'))).toBe(false)
+    const events = eventsOf(dir)
+    expect(events.filter((e) => e.kind === 'task/blocked' && e.taskId === 'a')).toHaveLength(0)
+    expect(events.filter(
+      (e) => e.kind === 'task/heartbeat' && e.taskId === 'a' && e.data?.evidence !== undefined,
+    )).toHaveLength(0)
+  }, 30000)
 })

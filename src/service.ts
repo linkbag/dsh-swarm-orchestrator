@@ -69,24 +69,130 @@ export function sanitizeToolNames(
 }
 
 /**
- * Run one evidence command under the resolved interpreter.
+ * A7: what one evidence command actually did.
+ *
+ * The evidence gate is the last thing between finished work and a completed task,
+ * so its verdict has to be readable from `events.jsonl` alone. Before this, a
+ * failure recorded only `message.slice(0, 300)` — no exit code, no timeout state,
+ * no elapsed time — so "the suite printed a green summary and exited 1 from a
+ * documented teardown artefact" and "the suite genuinely failed" looked identical,
+ * and the dispatcher had to reproduce the suite by hand to tell them apart.
+ */
+interface EvidenceCommandOutcome {
+  readonly command: string
+  readonly ok: boolean
+  /** Process exit code when the command ran to completion; absent when it never exited. */
+  readonly exitCode?: number
+  /** Set when the command could not even be started (e.g. ENOENT: the workspace is gone). */
+  readonly spawnError?: string
+  /** True when the runner killed it at the ceiling instead of it exiting on its own. */
+  readonly timedOut: boolean
+  readonly elapsedMs: number
+  /** Bounded tail of the command's combined output. */
+  readonly outputTail: string
+}
+
+/** Output tail kept in the structured record: enough for a stack trace's last frames. */
+const EVIDENCE_TAIL_LINES = 18
+/** Output tail kept in the recorded reason; the structured record carries the longer one. */
+const EVIDENCE_REASON_TAIL_LINES = 6
+/** The command itself, bounded — the incident's command string ran to ~300 characters. */
+const EVIDENCE_COMMAND_CHARS = 160
+
+/** Last `lines` lines, then bounded to `chars` counted from the END (the informative end). */
+function boundedTail(text: string, lines: number, chars: number): string {
+  const kept = text.split(/\r?\n/).slice(-lines).join('\n').trim()
+  return kept.length > chars ? '…' + kept.slice(-chars) : kept
+}
+
+/**
+ * One reason string for a failed command. The verdict (exit code, or TIMED OUT) is
+ * never truncated away; only the output tail is.
+ */
+function describeEvidenceFailure(outcome: EvidenceCommandOutcome): string {
+  const command = outcome.command.length > EVIDENCE_COMMAND_CHARS
+    ? outcome.command.slice(0, EVIDENCE_COMMAND_CHARS) + '…'
+    : outcome.command
+  const verdict = outcome.timedOut
+    ? 'TIMED OUT — the runner killed it at the ceiling before it exited'
+    : outcome.spawnError !== undefined
+      ? `could not be started (${outcome.spawnError}) — the run workspace or the interpreter is missing`
+      : `exit code ${outcome.exitCode ?? 'unknown'}`
+  const tail = boundedTail(outcome.outputTail, EVIDENCE_REASON_TAIL_LINES, 600)
+  return `evidence command failed — ${verdict}, after ${(outcome.elapsedMs / 1000).toFixed(1)}s: ${command}`
+    + (tail.length > 0 ? `\n--- output tail ---\n${tail}` : '\n(no output)')
+}
+
+/** The bounded structured record for one outcome, for the event log. */
+function evidenceRecord(outcome: EvidenceCommandOutcome): Record<string, unknown> {
+  return {
+    command: outcome.command.length > 400 ? outcome.command.slice(0, 400) + '…' : outcome.command,
+    ...(outcome.exitCode !== undefined ? { exitCode: outcome.exitCode } : {}),
+    ...(outcome.spawnError !== undefined ? { spawnError: outcome.spawnError } : {}),
+    timedOut: outcome.timedOut,
+    elapsedMs: outcome.elapsedMs,
+    outputTail: outcome.outputTail,
+  }
+}
+
+/**
+ * Run one evidence command under the resolved interpreter and report what happened.
  *
  * `child_process.exec` builds `<shell> -c <command>`, and on Windows it rejects an
  * absolute interpreter path passed as `shell` with `spawn <path> ENOENT`. So the
  * shell is invoked as the *file* with an explicit `-Command`/`-c` argument, which
- * also removes a layer of quoting from the command string.
+ * also removes a layer of quoting from the command string. The declared command is
+ * passed through verbatim: a `cmd /c …` string is the child's own choice and runs
+ * under the resolved PowerShell exactly as written.
  */
-async function runEvidenceCommand(command: string, cwd: string): Promise<void> {
+async function runEvidenceCommand(command: string, cwd: string, timeoutMs: number): Promise<EvidenceCommandOutcome> {
   const shell = evidenceShell()
-  const options = { cwd, timeout: 120_000, windowsHide: true }
-  if (shell === undefined || shell.length === 0) {
-    await execAsync(command, options)
-    return
+  // A7: node's default `maxBuffer` is 1 MB, and a suite that prints per-test
+  // progress can exceed it — which node reports as a failure, turning a chatty
+  // green suite into a false gate failure. Only the buffer needs raising; the tail
+  // we keep is small.
+  const options = { cwd, timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }
+  const startedAt = Date.now()
+  try {
+    if (shell === undefined || shell.length === 0) {
+      await execAsync(command, options)
+    } else {
+      const args = process.platform === 'win32'
+        ? ['-NoProfile', '-NonInteractive', '-Command', command]
+        : ['-c', command]
+      await execFileAsync(shell, args, options)
+    }
+    return { command, ok: true, exitCode: 0, timedOut: false, elapsedMs: Date.now() - startedAt, outputTail: '' }
+  } catch (err) {
+    const failure = err as {
+      code?: number | string
+      killed?: boolean
+      signal?: string
+      stdout?: string | Buffer
+      stderr?: string | Buffer
+    }
+    const text = (value: string | Buffer | undefined): string =>
+      typeof value === 'string' ? value : value === undefined ? '' : value.toString('utf8')
+    // node marks a ceiling kill with `killed` plus a signal and leaves no numeric
+    // code; a command that ran and failed carries a numeric `code`. That is exactly
+    // the distinction the log used to lose.
+    const timedOut = failure.killed === true || failure.signal === 'SIGTERM' || failure.signal === 'SIGKILL'
+    const exitCode = typeof failure.code === 'number' ? failure.code : undefined
+    // A spawn-level failure (ENOENT: the cwd or the interpreter does not exist) carries
+    // a STRING code and no exit status at all. Recording that as "exit code unknown"
+    // would hide the actual cause — the one thing this record exists to prevent.
+    const spawnError = typeof failure.code === 'string' ? failure.code : undefined
+    const combined = [text(failure.stdout), text(failure.stderr)].filter((part) => part.length > 0).join('\n')
+    return {
+      command,
+      ok: false,
+      ...(exitCode !== undefined ? { exitCode } : {}),
+      ...(spawnError !== undefined ? { spawnError } : {}),
+      timedOut,
+      elapsedMs: Date.now() - startedAt,
+      outputTail: boundedTail(combined, EVIDENCE_TAIL_LINES, 1600),
+    }
   }
-  const args = process.platform === 'win32'
-    ? ['-NoProfile', '-NonInteractive', '-Command', command]
-    : ['-c', command]
-  await execFileAsync(shell, args, options)
 }
 
 /**
@@ -313,6 +419,14 @@ export class SwarmService extends Service {
   /** H-2 circuit breaker: runId → resume-after timestamp (retries paused while active). */
   private readonly circuitBreakerUntil = new Map<string, number>()
   private readonly sessionTasks = new Map<string, { taskKey: string; effort?: string; attemptId?: string }>()
+  /**
+   * A7: taskKey → the attemptId that already spent its one evidence-only recheck.
+   * An evidence-only failure re-runs just the declared commands, never the child; a
+   * second failure blocks the task for a human instead of retrying work whose result
+   * is already on disk. Bounded by the number of tasks — a new attempt carries a new
+   * attemptId, so it earns a fresh recheck.
+   */
+  private readonly evidenceRecheckedAttempt = new Map<string, string>()
   private tickScheduled = false
 
   constructor(ctx: Context, config: SwarmConfig) {
@@ -1333,9 +1447,21 @@ export class SwarmService extends Service {
     return { candidates, effort: undefined }
   }
 
-  /** J2/P5: machine-check the evidence contract. Returns file warnings (advisory) and command failures (hard). */
-  private async checkEvidence(task: Task): Promise<{ fileWarnings: string[]; commandFailures: string[] }> {
-    const result = { fileWarnings: [] as string[], commandFailures: [] as string[] }
+  /**
+   * J2/P5: machine-check the evidence contract. File checks are advisory (they reach
+   * the board as warnings); command failures are hard. Every command's structured
+   * outcome travels back with the verdict so the caller can record WHY (A7).
+   */
+  private async checkEvidence(task: Task): Promise<{
+    fileWarnings: string[]
+    commandFailures: string[]
+    commands: EvidenceCommandOutcome[]
+  }> {
+    const result = {
+      fileWarnings: [] as string[],
+      commandFailures: [] as string[],
+      commands: [] as EvidenceCommandOutcome[],
+    }
     const evidence = task.evidence
     if (evidence === undefined) return result
     const cwd = this.view().runs.get(task.runId)?.dispatch?.cwd ?? process.cwd()
@@ -1347,13 +1473,11 @@ export class SwarmService extends Service {
         result.fileWarnings.push(`required file "${file}" is missing or empty`)
       }
     }
+    const timeoutMs = this.swarmConfig.evidenceTimeoutMs
     for (const command of evidence.commands ?? []) {
-      try {
-        await runEvidenceCommand(command, cwd)
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        result.commandFailures.push(`evidence command failed: ${command} — ${message.slice(0, 300)}`)
-      }
+      const outcome = await runEvidenceCommand(command, cwd, timeoutMs)
+      result.commands.push(outcome)
+      if (!outcome.ok) result.commandFailures.push(describeEvidenceFailure(outcome))
     }
     return result
   }
@@ -1847,15 +1971,70 @@ export class SwarmService extends Service {
           if (task.evidence !== undefined) {
             const evidence = await this.checkEvidence(task)
             if (evidence.commandFailures.length > 0) {
-              this.events.append('task/failed', {
-                runId, taskId: task.id,
-                data: {
-                  attemptId,
-                  retry: fresh.attempts <= this.swarmConfig.maxRetries,
-                  reason: `evidence contract failed — ${evidence.commandFailures[0]}`,
-                },
-              })
-              return
+              // A7: the child reported DONE — its deliverable is on disk — and the only
+              // failing check is a declared command. Respawning the child to redo that
+              // work is pure waste, and looping on it burned a real run: c5-revalidate's
+              // suite printed `191 passed in 4.50s` and then exited 1 from a documented
+              // pytest-asyncio teardown artefact, so the task retried until a human
+              // force-completed it. Re-run just the commands ONCE for this attempt; a
+              // second failure goes to a human instead of back through the child.
+              const failing = evidence.commands.filter((command) => !command.ok)
+              const firstRun = failing.slice(0, 10).map(evidenceRecord)
+              if (this.evidenceRecheckedAttempt.get(key) !== attemptId) {
+                this.evidenceRecheckedAttempt.set(key, attemptId)
+                this.events.append('task/heartbeat', {
+                  runId, taskId: task.id,
+                  data: {
+                    note: `⚠ evidence command failed — rechecking the contract once, without respawning the child: `
+                      + evidence.commandFailures[0].slice(0, 300),
+                    evidence: { recheck: true, commands: firstRun },
+                  },
+                })
+                const recheck = await this.checkEvidence(task)
+                if (recheck.commandFailures.length === 0) {
+                  this.events.append('task/heartbeat', {
+                    runId, taskId: task.id,
+                    data: { note: '✓ evidence commands passed on recheck — the first run failed transiently; the finished work stands' },
+                  })
+                  this.evidenceRecheckedAttempt.delete(key)
+                  // fall through: the task completes below
+                } else {
+                  const reFailing = recheck.commands.filter((command) => !command.ok).slice(0, 10).map(evidenceRecord)
+                  this.events.append('task/blocked', {
+                    runId, taskId: task.id,
+                    data: {
+                      // J7's human flag, reused: `task/blocked` with `human: true` sets
+                      // humanReview, so the board shows this as waiting on a person.
+                      human: true,
+                      reason: 'evidence contract failed twice — the child reported the work done and its '
+                        + `declared command${recheck.commandFailures.length === 1 ? '' : 's'} keep failing, so automatic retrying stops here. `
+                        + `A human decides: accept the work (swarm_complete / dashboard), fix the command, or requeue (swarm_retry). `
+                        + recheck.commandFailures[0],
+                      evidence: { commands: reFailing, firstRun },
+                    },
+                  })
+                  this.ctx.logger('swarm').warn(
+                    'task %s blocked for a human: the child reported done but its evidence commands keep failing',
+                    key,
+                  )
+                  this.evidenceRecheckedAttempt.delete(key)
+                  this.scheduleTick()
+                  return
+                }
+              } else {
+                // Defensive: an attempt that already spent its recheck must never loop.
+                this.events.append('task/blocked', {
+                  runId, taskId: task.id,
+                  data: {
+                    human: true,
+                    reason: `evidence contract failed — ${evidence.commandFailures[0]}`,
+                    evidence: { commands: firstRun },
+                  },
+                })
+                this.evidenceRecheckedAttempt.delete(key)
+                this.scheduleTick()
+                return
+              }
             }
             if (evidence.fileWarnings.length > 0) {
               this.events.append('task/heartbeat', {

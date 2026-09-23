@@ -2,7 +2,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-export const PLUGIN_VERSION = '0.6.15'
+export const PLUGIN_VERSION = '0.6.16'
 
 function defaultStorageDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -30,6 +30,8 @@ export interface SwarmConfig {
   spawnTimeoutSeconds: number
   bootGraceSeconds: number
   maxSubagentDepth: number
+  /** A7: hard ceiling for ONE evidence-contract command (ms). */
+  evidenceTimeoutMs: number
 }
 
 export const Config = Schema.object({
@@ -50,6 +52,12 @@ export const Config = Schema.object({
   ),
   maxRetries: Schema.number().default(2).min(0).max(5).description(
     'Failure retries per task before the task blocks for human intervention.',
+  ),
+  evidenceTimeoutMs: Schema.number().default(120000).min(1000).max(600000).description(
+    'A7: hard ceiling for ONE evidence-contract command, in milliseconds (default 120000). '
+    + 'A command killed at this ceiling is recorded as TIMED OUT with no exit code — '
+    + 'distinct from a command that ran and exited non-zero. Raise it for suites that '
+    + 'legitimately run long, or lower it so a hung command fails fast in tests.',
   ),
   reviewLoops: Schema.number().default(3).min(0).max(5).description(
     'Maximum reviewer fix loops per task before review gives up and blocks.',

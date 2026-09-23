@@ -239,6 +239,10 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       case 'task/blocked':
         task.status = 'blocked'
         task.blockedReason = str('reason')
+        // A7: reuse the review gate's `human: true` flag (J7). A task blocked because
+        // only a person can decide — the work is done but its evidence command keeps
+        // failing — must be visible as waiting on a human, not as a silent block.
+        if (d.human === true) task.humanReview = true
         break
       case 'task/unblocked':
         if (task.status === 'blocked') {

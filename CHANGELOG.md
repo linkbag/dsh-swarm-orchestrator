@@ -2,6 +2,65 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.16
+
+**An evidence-only failure no longer re-does the work, and it finally says why.**
+
+### Fixed
+
+- **A failed evidence command no longer respawns the child.** The gate treated an
+  evidence-contract failure like any other failure: `retry = attempts <= maxRetries`
+  respawned the task agent to redo work that was already on disk and already
+  reported done. Production evidence (`run-mudxdhwt-16yt`, seq 3998-4006): the
+  integrator reported `done: c5-revalidate complete. F10 real daily-path parity
+  (13/13 tests both repos) + 6 real integration defects found and fixed`, and the
+  only failing check was one command's exit code - so the dispatcher respawned the
+  integrator, and looped in `retrying` until a human forced the task closed.
+  Now a failure whose only problem is the evidence runs **one command-only
+  recheck** (no child), and if that also fails the task goes to a **human gate**:
+  `blocked` with `humanReview`, resolved with `swarm_retry` or `swarm_complete`.
+- **The failure now explains itself.** `runEvidenceCommand` kept only
+  `err.message.slice(0, 300)`, so the exit code, the timeout state, stdout, stderr
+  and the elapsed time were all discarded - a hung command and a failing command
+  were literally indistinguishable in `events.jsonl`. It now returns a structured
+  outcome (exit code, spawn error, `timedOut`, elapsed ms, bounded output tail)
+  and the reason carries the verdict plus a tail. Verdicts are never truncated;
+  only tails are.
+- **Timeouts are distinct from non-zero exits**, in both the record and the reason.
+- **A command that cannot even start is named.** `ENOENT` arrives as a string
+  `code` with no exit status, which used to be recorded as the useless "exit code
+  unknown"; it now reports `could not be started (ENOENT) - the run workspace or
+  the interpreter is missing`.
+- **`evidenceTimeoutMs`** (default `120000`, range 1 s-10 min) replaces the
+  hard-coded 120 s ceiling, so a genuinely long suite can be accommodated instead
+  of always failing the gate.
+
+### Not changed
+
+The contract itself is not weakened: file checks stay advisory, command failures
+stay hard, `exit 0` is still required, and a task whose child did **not** report
+done keeps the previous retry path exactly. The fix routes and records
+intelligently rather than accepting a failing command as success.
+
+Note for operators: a blocked task settles the *run* as `failed` - that is the
+existing run-settlement semantics and it is deliberate, because the run now needs
+a human decision instead of silently looping. `swarm_retry` revives it (appending
+`run/resumed`); `swarm_complete` accepts the finished work despite the artefact.
+
+### Tests
+
+- 4 new A7 tests: exactly one command-only recheck with the child spawned exactly
+  once (counted via a marker file the command appends to, not inferred), followed
+  by `blocked` + `humanReview`; the record carrying the exit code and output tail;
+  a hung command reported `TIMED OUT` with no exit code; a genuine child failure
+  keeping the untouched retry path with the evidence command never run.
+- `J3: a nonexistent run workspace is reported as such, not as a failed gate` -
+  expectation updated: an evidence command that cannot start is an evidence-only
+  failure of finished work, so it now blocks for a human instead of burning the
+  retry budget on a respawn that cannot help. The test's intent (name the real
+  cause) is preserved and strengthened.
+- Suite: **159 tests, 159 pass, 15/15 files.**
+
 ## 0.6.15
 
 **The effort pin is now validated against what the adapter will actually accept.**
