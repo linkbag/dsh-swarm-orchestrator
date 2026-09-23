@@ -15,22 +15,16 @@ describe('J21 preflight against the real deployment', () => {
     console.log('supported:', [...support.supported])
     console.log('declaredWithoutMap:', [...support.declaredWithoutMap].slice(0, 12))
 
-    // The deployment's default model with a declared reasoningEffort is the one
-    // known-supported pair — whatever it currently is (it was zai/glm-5.3-flash,
-    // now deepseek-official/deepseek-flash; the test derives it from the file so
-    // changing the default model does not break this test).
-    const defaultBlock = settings.match(
-      /agent-default-model:\s*\n\s*provider:\s*(\S+)\s*\n\s*model:\s*(\S+)\s*\n\s*reasoningEffort:\s*(\S+)/,
-    )
-    if (defaultBlock !== null) {
-      expect(support.supported.has(defaultBlock[2])).toBe(true)
-      expect(checkEffortSupport(defaultBlock[2], defaultBlock[3], support).incompatible).toBe(false)
-    }
-
-    // The 0.1.6 format declares no per-model reasoningEfforts maps, so nothing
-    // else is judged incompatible — J18's drop-effort retry is the safety net.
-    expect(checkEffortSupport('glm-5.3', 'max', support).incompatible).toBe(false)
+    // The deployment default runs glm-5.3-flash WITH effort max — known-good.
+    expect(support.supported.has('glm-5.3-flash')).toBe(true)
     expect(checkEffortSupport('glm-5.3-flash', 'max', support).incompatible).toBe(false)
+
+    // 0.1.6 declares no per-model maps: glm-5.3 can no longer be judged, so the
+    // preflight must NOT flag it (J18's drop-effort retry remains the safety net).
+    expect(checkEffortSupport('glm-5.3', 'max', support).incompatible).toBe(false)
+
+    // DeepSeek models declare no maps and are not judged.
+    expect(checkEffortSupport('deepseek-flash', 'max', support).incompatible).toBe(false)
     expect(checkEffortSupport('deepseek-v4-flash', 'high', support).incompatible).toBe(false)
   })
 })
