@@ -1299,42 +1299,38 @@ export class SwarmService extends Service {
   }
 
   /**
-   * J21 preflight: drop effort pins that the deployment's settings declare
-   * unsupported for a candidate's model, and surface why.
+   * J21 preflight: strip an effort pin the attempt's PRIMARY model cannot accept,
+   * and surface why. The candidate chain itself is never filtered.
    *
-   * The pin is normally applied by the agent/request waterfall at request time, so
-   * an unsupported pair was only discovered when the child's first request died with
-   * UNSUPPORTED_REASONING_EFFORT — six tasks in one run. Removing a declared-
-   * incompatible candidate's pin BEFORE the spawn avoids that wasted child entirely.
-   * Candidates with unknown models are left untouched: absence of a declaration is
-   * not proof of unsupportability (deepseek models declare no maps and accept efforts).
+   * The pin is applied by the agent/request waterfall at request time, so an
+   * unaccepted pair was only discovered when the child's first request died with
+   * UNSUPPORTED_REASONING_EFFORT — 41 ms after `task/agent-started` in the incident
+   * that motivated this, and again at 94 ms with a different level, which is what
+   * proved the value was never the problem. Stripping the pin BEFORE the spawn
+   * avoids that wasted child, and the wasted retry, entirely.
+   *
+   * Why the primary decides: the request goes to the primary first, and the chain is
+   * rotated per attempt (A6), so a rotated chain legitimately re-enables the pin on a
+   * model that declares support. A FALLBACK that would refuse the pin is still
+   * covered — the child dies fast and A1's rung retry re-runs that model unpinned,
+   * with J18's explicit-rejection path behind it.
+   *
+   * Why the candidate is NOT dropped: the pin is a preference, model diversity is
+   * not. Dropping a candidate because of a pin loses a working model for the run.
    */
   private preflightEffort(
     roleId: string,
     candidates: Array<{ provider: string; model: string }>,
     effort: string | undefined,
-  ): Array<{ provider: string; model: string }> {
-    if (effort === undefined || candidates.length === 0) return candidates
+  ): { candidates: Array<{ provider: string; model: string }>; effort: string | undefined } {
+    if (effort === undefined || candidates.length === 0) return { candidates, effort }
     const support = this.effortSupport()
-    if (support === undefined) return candidates
-    const warnings: string[] = []
-    const filtered: Array<{ provider: string; model: string }> = []
-    for (const c of candidates) {
-      const check = checkEffortSupport(c.model, effort, support)
-      if (!check.incompatible) {
-        filtered.push(c)
-        continue
-      }
-      warnings.push(`${roleId}: ${c.provider}/${c.model} does not declare reasoningEfforts in settings.yaml — effort "${effort}" dropped for this candidate`)
-    }
-    for (const w of warnings) this.ctx.logger('swarm').warn('preflight: %s', w)
-    if (filtered.length === 0 && warnings.length > 0) {
-      // Every candidate rejected the pin: run the original chain WITHOUT the effort
-      // preference rather than refusing to run — the effort is a preference.
-      this.ctx.logger('swarm').warn('preflight: every candidate for role %s rejects effort %s — running without an effort pin', roleId, effort)
-      return candidates.map((c) => ({ ...c }))
-    }
-    return filtered
+    if (support === undefined) return { candidates, effort }
+    const primary = candidates[0]
+    const check = checkEffortSupport(primary.model, effort, support)
+    if (!check.incompatible) return { candidates, effort }
+    this.ctx.logger('swarm').warn('preflight (%s): %s', roleId, check.warning ?? `effort "${effort}" is not accepted by ${primary.provider}/${primary.model}`)
+    return { candidates, effort: undefined }
   }
 
   /** J2/P5: machine-check the evidence contract. Returns file warnings (advisory) and command failures (hard). */
@@ -1666,10 +1662,15 @@ export class SwarmService extends Service {
     // failure can retry the SAME model at the next rung before the task rotates
     // models — and without consuming the task's retry budget.
     const rungs = this.effortRungs(role, task.attempts + 1)
-    const effort = rungs[0]
-    // J21: drop declared-incompatible effort pins BEFORE spawning, so the failure
-    // mode that killed 6 tasks in one run never wastes a child.
-    candidates = this.preflightEffort(task.role, candidates, effort)
+    // J21: strip an effort pin the primary model cannot accept BEFORE spawning, so
+    // the failure mode that killed a child 41 ms in never wastes one. The chain is
+    // returned unchanged — a pin is a preference, a candidate is a capability.
+    const preflight = this.preflightEffort(task.role, candidates, rungs[0])
+    candidates = preflight.candidates
+    const effort = preflight.effort
+    // A1: the rungs follow the EFFECTIVE pin. A stripped attempt carries none: every
+    // rung would be refused by the same model for the same reason.
+    const ladder = effort === undefined ? [] : rungs.slice(1)
     const controller = new AbortController()
     const key = taskKeyOf(task)
     // J19: fence this attempt. The id is published with `task/started` and every
@@ -1763,7 +1764,7 @@ export class SwarmService extends Service {
           // death, or the provider's explicit rejection), so effort varies faster
           // than the model chain and the internal retry never consumes the task's
           // retry budget or advances A6's rotation.
-          effortRungs: rungs.slice(1),
+          effortRungs: ladder,
           onFallback: (failed, next) => {
             this.events.append('task/model-fallback', {
               runId, taskId: task.id,

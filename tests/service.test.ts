@@ -242,6 +242,12 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, what: string
 
 async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx: Context; service: SwarmService; fake: FakeSubagents; dir: string }> {
   const dir = mkdtempSync(join(tmpdir(), 'swarm-service-'))
+  // J21: the effort preflight reads `$DSH_HOME/settings.yaml`. Point it at a fixture
+  // deployment for every boot, so these tests neither depend on (nor are fooled by)
+  // the developer's real settings — and so the pinning tests run against a deployment
+  // that actually DECLARES the levels they pin. One fixture per boot, registered in
+  // `dirs`, so the afterEach cleanup can never leave a later test reading a deleted file.
+  process.env.DSH_HOME = effortSettingsHome ?? makeSettingsHome(DECLARING_SETTINGS)
   const ctx = new Context()
   const fake = new FakeSubagents()
   ctx.reflect.provide('subagents', fake as never)
@@ -269,9 +275,64 @@ async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx
   return { ctx, service, fake, dir }
 }
 
+const dirs: string[] = []
+const contexts: Context[] = []
+
+/**
+ * The settings.yaml fixture a booted service reads for its J21 effort preflight
+ * (`$DSH_HOME/settings.yaml`). It declares exactly the levels these tests pin: a
+ * real deployment must declare `reasoningEfforts` for a pin to be legal at all,
+ * because pi-ai refuses any explicit level on a hand-declared model that has no map.
+ */
+const DECLARING_SETTINGS = [
+  'llm-pi-ai:',
+  '  providers:',
+  '    zai:',
+  '      models:',
+  '        - id: glm-5.3',
+  '          reasoningEfforts:',
+  '            max: max',
+  '            high: high',
+  '        - id: glm-5.3-flash',
+  '          reasoningEfforts:',
+  '            max: max',
+  'llm-deepseek:',
+  '  models:',
+  '    - id: deepseek-flash',
+].join('\n')
+
+/** The production shape: hand-declared pi-ai models with NO reasoningEfforts map. */
+const UNDECLARED_SETTINGS = [
+  'llm-pi-ai:',
+  '  providers:',
+  '    zai:',
+  '      models:',
+  '        - id: glm-5.3',
+  '        - id: glm-5.3-flash',
+].join('\n')
+
+/** A deployment that declares one level only — the `max` pin must be stripped. */
+const HIGH_ONLY_SETTINGS = [
+  'llm-pi-ai:',
+  '  providers:',
+  '    zai:',
+  '      models:',
+  '        - id: glm-5.3',
+  '          reasoningEfforts:',
+  '            high: high',
+].join('\n')
+
+/** The fixture the NEXT booted service reads; `undefined` = the declaring default. */
+let effortSettingsHome: string | undefined
+
+function makeSettingsHome(settingsYaml: string): string {
+  const home = mkdtempSync(join(tmpdir(), 'swarm-settings-'))
+  writeFileSync(join(home, 'settings.yaml'), settingsYaml)
+  dirs.push(home)
+  return home
+}
+
 describe('swarm service (integration, fake subagents)', () => {
-  const dirs: string[] = []
-  const contexts: Context[] = []
 
   afterEach(() => {
     for (const ctx of contexts.splice(0)) ctx.registry.delete(swarmPlugin)
@@ -697,6 +758,142 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(support.declaredWithoutMap.size).toBe(0)
     expect(checkEffortSupport('anything', 'max', support).incompatible).toBe(false)
   })
+
+  it('J21: the parser records which levels a map declares, and only those', async () => {
+    const { parseEffortSupport, checkEffortSupport } = await import('../src/preflight.js')
+    const settings = [
+      'llm-pi-ai:',
+      '  providers:',
+      '    zai:',
+      '      models:',
+      '        - id: glm-5.3',
+      '          reasoningEfforts:',
+      '            low: low',
+      '            high: high',
+      '          contextWindow: 1000000',
+      '        - id: glm-5.3-flash',
+    ].join('\n')
+    const support = parseEffortSupport(settings)
+    // The level keys belong to the declaring model, and the block ends at the next
+    // sibling field — `contextWindow` is not a reasoning level.
+    expect([...(support.declaredLevels.get('glm-5.3') ?? [])].sort()).toEqual(['high', 'low'])
+    expect(checkEffortSupport('glm-5.3', 'high', support).incompatible).toBe(false)
+    const denied = checkEffortSupport('glm-5.3', 'max', support)
+    expect(denied.incompatible).toBe(true)
+    // The warning names the levels the model does declare, so the fix is obvious.
+    expect(denied.warning).toMatch(/high, low/)
+    // A model in the same file with no map is refused at every explicit level.
+    expect(checkEffortSupport('glm-5.3-flash', 'max', support).incompatible).toBe(true)
+  })
+
+  it('J21: an undeclared pi-ai model gets the pin stripped, and keeps its place in the chain', async () => {
+    // The production shape (xiaomi/mimo-v2.6-pro, 2026-09-23): hand-declared under
+    // llm-pi-ai with no reasoningEfforts map. The old parser judged such a file not at
+    // all, so the pin went out and the child died 41 ms after agent-started.
+    effortSettingsHome = makeSettingsHome(UNDECLARED_SETTINGS)
+    try {
+      const { service, fake, dir } = await bootEffortLadder()
+      const result = service.dispatch({
+        title: 'undeclared effort',
+        spec: 's',
+        tasks: [{ id: 'u1', subject: 'U', description: 'd', role: 'builder' }],
+      }, makeDispatcher(dir) as never)
+      service.endorse(result.runId)
+
+      await waitFor(
+        () => service.snapshot().tasks.find((t) => t.id === 'u1')?.status === 'completed',
+        10000,
+        'task completed without a pin',
+      )
+      // No pin anywhere: not on the durable event, not on the board.
+      expect(service.events.all().find((e) => e.kind === 'task/started' && e.taskId === 'u1')?.data?.effort).toBeUndefined()
+      expect(service.snapshot().tasks.find((t) => t.id === 'u1')?.agent?.effort).toBeUndefined()
+      // The MODEL was not dropped with the pin: the attempt ran on the role's model,
+      // once, with no rung retry (every rung would be refused by the same model).
+      expect(fake.calls.length).toBe(1)
+      expect(fake.calls[0].agentOptions?.model).toBe('glm-5.3')
+    } finally {
+      effortSettingsHome = undefined
+    }
+  }, 20000)
+
+  it('J21: a model declaring only "high" has a "max" pin stripped', async () => {
+    effortSettingsHome = makeSettingsHome(HIGH_ONLY_SETTINGS)
+    try {
+      const { service, fake, dir } = await bootEffortLadder()
+      const result = service.dispatch({
+        title: 'undeclared level',
+        spec: 's',
+        tasks: [{ id: 'u2', subject: 'U', description: 'd', role: 'builder' }],
+      }, makeDispatcher(dir) as never)
+      service.endorse(result.runId)
+
+      await waitFor(
+        () => service.snapshot().tasks.find((t) => t.id === 'u2')?.status === 'completed',
+        10000,
+        'task completed without the max pin',
+      )
+      expect(service.events.all().find((e) => e.kind === 'task/started' && e.taskId === 'u2')?.data?.effort).toBeUndefined()
+      expect(fake.calls.length).toBe(1)
+      expect(fake.calls[0].agentOptions?.model).toBe('glm-5.3')
+    } finally {
+      effortSettingsHome = undefined
+    }
+  }, 20000)
+
+  it('J21: a declared level is pinned exactly as configured', async () => {
+    effortSettingsHome = makeSettingsHome(HIGH_ONLY_SETTINGS)
+    try {
+      const { service, fake, dir } = await bootRunnable()
+      const table = structuredClone(service.duty.get())
+      table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3', reasoningEffort: 'high' }
+      service.setDutyTable(table, 'test')
+
+      const result = service.dispatch({
+        title: 'declared level',
+        spec: 's',
+        tasks: [{ id: 'u3', subject: 'U', description: 'd', role: 'builder' }],
+      }, makeDispatcher(dir) as never)
+      service.endorse(result.runId)
+
+      await waitFor(
+        () => service.snapshot().tasks.find((t) => t.id === 'u3')?.status === 'completed',
+        10000,
+        'task completed with its declared pin',
+      )
+      // The fix must not over-reach: a level the model declares still goes out.
+      expect(service.events.all().find((e) => e.kind === 'task/started' && e.taskId === 'u3')?.data?.effort).toBe('high')
+      expect(fake.calls.length).toBe(1)
+    } finally {
+      effortSettingsHome = undefined
+    }
+  }, 20000)
+
+  it('J21: a model outside the validating roots keeps its pin (deepseek adapter)', async () => {
+    // This is why the same pin survived on deepseek-flash while every pi-ai child
+    // died: `llm-deepseek` declares no maps and accepts efforts, so nothing is judged.
+    const { service, fake, dir } = await bootRunnable()
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = {
+      ...table.roles.builder, provider: 'deepseek-official', model: 'deepseek-flash', reasoningEffort: 'max',
+    }
+    service.setDutyTable(table, 'test')
+
+    const result = service.dispatch({
+      title: 'unjudged model',
+      spec: 's',
+      tasks: [{ id: 'u4', subject: 'U', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => service.snapshot().tasks.find((t) => t.id === 'u4')?.status === 'completed',
+      10000,
+      'task completed with its pin intact',
+    )
+    expect(service.events.all().find((e) => e.kind === 'task/started' && e.taskId === 'u4')?.data?.effort).toBe('max')
+    expect(fake.calls.length).toBe(1)
+  }, 20000)
 
   it('swarm_report authenticates tracked child sessions only', async () => {
     const { service, fake } = await bootRunnable()

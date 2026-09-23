@@ -2,6 +2,66 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.15
+
+**The effort pin is now validated against what the adapter will actually accept.**
+
+### Fixed
+
+- **A pin a pi-ai model cannot accept is stripped before spawning, not sent.**
+  `dsh-llm-pi-ai` resolves a model's reasoning support from its declared
+  `reasoningEfforts` map: a hand-declared model with no map is reported as
+  supporting only `off`, and any explicit level then throws
+  `LlmError(..., 'UNSUPPORTED_REASONING_EFFORT')` at request time. The J21
+  preflight used to *decline to judge* exactly that shape —
+  `if (!sawAnyEffortsMap) declaredWithoutMap.clear()` — so the impossible request
+  went out anyway and the child died in tens of milliseconds.
+- **The preflight no longer drops candidates.** It strips the pin for the attempt
+  and keeps the whole model chain, because the pin is a preference: a value the
+  model refuses is never useful, and spending model diversity to protect it was
+  the wrong trade. The verdict is evaluated against the attempt's primary
+  candidate, so a rotated chain can legitimately re-enable the pin on a model
+  that declares support.
+- **Declared levels are parsed and honored.** `reasoningEfforts` maps are read
+  level by level, so a model that declares only `high` no longer accepts a `max`
+  pin, while a declared level is pinned exactly as configured.
+
+### Evidence
+
+Live incident: `xiaomi/mimo-v2.6-pro` — hand-declared in `settings.yaml` with no
+`reasoningEfforts` — died 41 ms after `task/agent-started` with `max` pinned, and
+94 ms with `high`. The *presence* of the field was the rejection, not its value.
+`deepseek-official/deepseek-flash` survived the same pin because it is the
+`llm-deepseek` adapter, which does accept an effort. Against the real settings
+file the corrected preflight now reports
+`declaredWithoutMap: [..., 'mimo-v2.6-pro']` and judges an explicit level
+incompatible for it, so no child is wasted on the impossible request.
+
+The effort ladder (A1) and the 0.6.14 same-model fast-fail rung retry are
+unchanged and remain the runtime safety net for a pin that is refused despite a
+declaration.
+
+### Repo hygiene
+
+`src/config.ts` was omitted from the 0.6.14 commit, so that commit's
+`PLUGIN_VERSION` stayed `0.6.13` while `package.json` said `0.6.14`. The built end
+published artifact was correct (it came from the working tree); the commit is now
+consistent at 0.6.15.
+
+### Tests
+
+- 5 new preflight tests: the parser records a map's declared levels and only
+  those; an undeclared pi-ai model gets the pin stripped while keeping its place
+  in the chain; a model declaring only `high` has a `max` pin stripped; a declared
+  level is pinned exactly as configured; a model outside the validating roots
+  (deepseek) keeps its pin.
+- `tests/preflight-live.test.ts` — expectations corrected to the adapter's real
+  rule, now asserting directly against the live `settings.yaml`.
+- `tests/service.test.ts` — the harness boots against a fixture `settings.yaml`
+  in a temp `DSH_HOME`, so the A1/J18 tests exercise a deployment where the pin is
+  legal instead of silently depending on a file outside the repo.
+- Suite: **155 tests, 155 pass, 15/15 files.**
+
 ## 0.6.14
 
 **Effort varies faster than the model — and the effort ladder can no longer dead-end.**
