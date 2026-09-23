@@ -246,6 +246,19 @@ export interface SpawnDeps {
 }
 
 /**
+ * A1: a failure this fast that produced no output at all is a request-level
+ * rejection — an unsupported pin, an auth/route problem, a model refusing the
+ * request — rather than an attempt that ran and genuinely failed.
+ *
+ * Production evidence (seq 3913-3915): the child died 42 ms after
+ * `task/agent-started` with stopReason `error` and no diagnostic, so the failure
+ * arrived as the generic reason "child stopped: error". That string never matches
+ * the J18 unsupported-effort signature (`UNSUPPORTED_REASONING_EFFORT`), so the
+ * dispatcher rotated models instead of dropping the pin.
+ */
+export const FAST_FAILURE_MS = 10_000
+
+/**
  * Run one task agent through the spawn provider with the role's model
  * candidate chain: primary first, silent fallback on model unavailability.
  */
@@ -274,6 +287,15 @@ export async function spawnTaskAgent(
     onStarted?: (childSessionId: string) => void
     /** J18: clear the per-request effort pin for a child before an effort-less retry. */
     onDropEffort?: (childSessionId: string) => void
+    /**
+     * A1: the ladder rungs to try on the SAME model before the task rotates
+     * models — the entries after this attempt's pinned primary, ending at
+     * `undefined` (no pin). Owned by the service; the retry here is bounded by
+     * its length and never touches the task's retry budget or the model chain.
+     */
+    effortRungs?: Array<string | undefined>
+    /** A1: re-pin a retry child to the next rung (the service re-registers that child). */
+    onEffortRung?: (childSessionId: string, effort: string) => void
   },
 ): Promise<SpawnOutcome> {
   const prompt = opts.prompt ?? buildTaskPrompt(opts.run, opts.task, opts.role, { priorNotes: opts.priorNotes, evidence: opts.evidence, workspace: opts.workspace })
@@ -281,10 +303,18 @@ export async function spawnTaskAgent(
   let lastReason = 'no model candidates'
   let lastProvider: string | undefined
   let lastModel: string | undefined
+  /** A1: set by the last pass — a failed child that died fast with no output (see FAST_FAILURE_MS). */
+  let lastFailureWasFast = false
 
   /**
-   * J18: run the candidate chain. `withEffort` controls whether the service's
-   * per-request reasoning-effort pin applies to the child.
+   * J18: run one pass over the candidate chain at a single effort rung.
+   *
+   * `rung` is the reasoning-effort pin for this pass; `undefined` clears the pin
+   * (the J18 degrade). `keepPin` leaves the service's own pin for this attempt in
+   * place — the first pass, where the service registered the primary rung through
+   * `onStarted` before this run existed. `only` restricts the pass to a single
+   * candidate, which the effort retry uses to re-run the SAME model instead of
+   * walking the chain.
    *
    * The effort is pinned through the `agent/request` waterfall, so it is applied
    * to whichever model actually serves the request — including a FALLBACK whose
@@ -294,8 +324,11 @@ export async function spawnTaskAgent(
    * child's stopReason, not as a `start()` throw, so the candidate loop below
    * never advanced and the whole run failed.
    */
-  const runChain = async (withEffort: boolean): Promise<SpawnOutcome> => {
-    for (const candidate of chain) {
+  const runPass = async (rung: string | undefined, only?: { provider: string; model: string }, keepPin = false): Promise<SpawnOutcome> => {
+    for (const candidate of only === undefined ? chain : [only]) {
+      // Reset per candidate: the flag describes THIS pass's failure, and a
+      // start() throw (model unavailable) must never inherit a fast-failure read.
+      lastFailureWasFast = false
       const agentOptions = candidate.provider.length > 0 && candidate.model.length > 0
         ? { provider: candidate.provider, model: candidate.model, ...(opts.role.maxTokens !== undefined ? { maxTokens: opts.role.maxTokens } : {}) }
         : opts.role.maxTokens !== undefined
@@ -325,7 +358,9 @@ export async function spawnTaskAgent(
       } catch (err) {
         lastReason = String(err instanceof Error ? err.message : err)
         if (isModelUnavailableError(err)) {
-          const next = chain[chain.indexOf(candidate) + 1]
+          // The chain walk belongs to a full pass only: a single-candidate pass
+          // (the effort retry) must never advance the A6 rotation.
+          const next = only === undefined ? chain[chain.indexOf(candidate) + 1] : undefined
           opts.onFallback?.(candidate, next)
           if (next !== undefined) continue
           return { ok: false, reason: `all model candidates unavailable (last: ${lastReason})` }
@@ -335,8 +370,18 @@ export async function spawnTaskAgent(
 
       lastProvider = candidate.provider.length > 0 ? candidate.provider : undefined
       lastModel = candidate.model.length > 0 ? candidate.model : undefined
+      // The child exists from here: this is the clock the fast-failure heuristic
+      // (and only that) measures against.
+      const startedAt = Date.now()
       opts.onStarted?.(run.id)
-      if (!withEffort) opts.onDropEffort?.(run.id)
+      if (keepPin) {
+        // The first pass: the service pinned the primary rung in onStarted, so
+        // there is nothing to change here (and `undefined` must NOT mean "drop").
+      } else if (rung === undefined) {
+        opts.onDropEffort?.(run.id)
+      } else {
+        opts.onEffortRung?.(run.id, rung)
+      }
       const result = await run.result
       if (result.stopReason === 'completed') {
         return {
@@ -349,26 +394,51 @@ export async function spawnTaskAgent(
           childSessionId: run.id,
         }
       }
-    return {
-      ok: false,
-      stopReason: result.stopReason,
-      reason: result.diagnostic ?? `child stopped: ${result.stopReason}`,
-      provider: lastProvider,
-      model: lastModel,
-      childSessionId: run.id,
-    }
+      // A1: the request-level-rejection read — failed, said nothing, died fast.
+      lastFailureWasFast = outputText(result.output).length === 0 && Date.now() - startedAt < FAST_FAILURE_MS
+      return {
+        ok: false,
+        stopReason: result.stopReason,
+        reason: result.diagnostic ?? `child stopped: ${result.stopReason}`,
+        provider: lastProvider,
+        model: lastModel,
+        childSessionId: run.id,
+      }
     }
     return { ok: false, reason: lastReason, provider: lastProvider, model: lastModel }
   }
 
-  const first = await runChain(true)
+  const first = await runPass(undefined, undefined, true)
+  const firstWasFast = lastFailureWasFast
   // J18: if the model rejected the pinned reasoning effort, retry the same chain
   // once with the effort pin removed. Degrading beats failing the task, and the
   // candidate chain is preserved so this does not mask real outages.
   if (!first.ok && isUnsupportedEffortError(first.reason)) {
     lastReason = first.reason ?? lastReason
-    const retry = await runChain(false)
+    const retry = await runPass(undefined)
     if (retry.ok || !isUnsupportedEffortError(retry.reason)) return retry
+  }
+  // A1: effort varies fastest — before the model chain. When the first pass
+  // failed in a way that smells like the PIN rather than the model (the provider
+  // said so explicitly, or the child died fast without producing anything), walk
+  // the remaining rungs on the SAME model, lowest pin last, ending at no pin.
+  //
+  // This is internal to the attempt: it starts children, but it never consumes
+  // the task's retry budget, never changes the task's attempt number, and never
+  // advances the A6 rotation — the caller sees one attempt either way. The walk
+  // is bounded by the rung count, and it stops at the first failure that is no
+  // longer effort-suspect (that is a genuine model failure, which is the model
+  // chain's business).
+  const rungQueue = opts.effortRungs ?? []
+  if (!first.ok && rungQueue.length > 0 && chain.length > 0 && (isUnsupportedEffortError(first.reason) || firstWasFast)) {
+    let last: SpawnOutcome = first
+    for (const rung of rungQueue) {
+      last = await runPass(rung, chain[0])
+      if (last.ok) return last
+      lastReason = last.reason ?? lastReason
+      if (!(isUnsupportedEffortError(last.reason) || lastFailureWasFast)) return last
+    }
+    return last
   }
   return first
 }

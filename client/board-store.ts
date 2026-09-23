@@ -26,7 +26,7 @@ export interface BoardTask {
   reviewBy?: string
   status: string
   attempts: number
-  agent?: { label: string; provider?: string; model?: string }
+  agent?: { label: string; provider?: string; model?: string; effort?: string }
   blockedReason?: string
   lastNote?: string
   lastNoteAt?: number

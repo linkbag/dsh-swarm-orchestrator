@@ -106,7 +106,7 @@ export interface Task extends TaskSpec {
    * had already failed.
    */
   attemptStartedAt?: number
-  agent?: { label: string; provider?: string; model?: string }
+  agent?: { label: string; provider?: string; model?: string; effort?: string }
   blockedReason?: string
   lastNote?: string
   summary?: string

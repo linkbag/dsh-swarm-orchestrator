@@ -1246,12 +1246,35 @@ export class SwarmService extends Service {
     }
   }
 
-  /** A1: the effort this attempt uses — primary first, then the ladder, then inherit. */
-  private resolveEffort(role: RoleConfig, attemptNumber: number): string | undefined {
-    const chain = [role.reasoningEffort, ...(role.effortFallbacks ?? [])]
+  /**
+   * A1: the effort ladder for this attempt, head first — the pin the attempt
+   * uses, then the rungs a retry of the SAME model may try before the task
+   * rotates models, ending at `undefined` (no pin).
+   *
+   * The ladder must never be a dead end. It used to be the configured entries
+   * only, with the index clamped to the last one, so a role with the primary
+   * unset and `effortFallbacks: ['max']` collapsed to `['max']` and pinned `max`
+   * on EVERY attempt and EVERY model — the opposite of a fallback. Production
+   * evidence (seq 3913-3915): attempt 1 pinned `max` on `xiaomi/mimo-v2.6-pro`,
+   * the child died 42 ms after `task/agent-started` with stopReason `error` and
+   * no diagnostic, and the generic reason "child stopped: error" never matched
+   * the J18 unsupported-effort signature, so the dispatcher rotated models
+   * instead of dropping the pin. `undefined` is therefore always available as the
+   * final rung: an exhausted ladder degrades to the provider default rather than
+   * re-pinning a value the model has already refused.
+   */
+  private effortRungs(role: RoleConfig, attemptNumber: number): Array<string | undefined> {
+    const configured = [role.reasoningEffort, ...(role.effortFallbacks ?? [])]
       .filter((e): e is string => typeof e === 'string' && e.length > 0)
-    if (chain.length === 0) return undefined
-    return chain[Math.min(Math.max(0, attemptNumber - 1), chain.length - 1)]
+    const start = Math.min(Math.max(0, attemptNumber - 1), configured.length)
+    const rungs: Array<string | undefined> = []
+    for (const rung of configured.slice(start)) {
+      // Consecutive duplicates would burn a child on an identical request.
+      if (rungs.length > 0 && rungs[rungs.length - 1] === rung) continue
+      rungs.push(rung)
+    }
+    if (rungs.length === 0 || rungs[rungs.length - 1] !== undefined) rungs.push(undefined)
+    return rungs
   }
 
   /**
@@ -1638,9 +1661,14 @@ export class SwarmService extends Service {
       const offset = task.attempts % candidates.length
       candidates = [...candidates.slice(offset), ...candidates.slice(0, offset)]
     }
+    // A1: the effort ladder for this attempt. Its head is the pin this attempt
+    // uses; the remaining rungs travel to the spawn call so an effort-suspect
+    // failure can retry the SAME model at the next rung before the task rotates
+    // models — and without consuming the task's retry budget.
+    const rungs = this.effortRungs(role, task.attempts + 1)
+    const effort = rungs[0]
     // J21: drop declared-incompatible effort pins BEFORE spawning, so the failure
     // mode that killed 6 tasks in one run never wastes a child.
-    const effort = this.resolveEffort(role, task.attempts + 1)
     candidates = this.preflightEffort(task.role, candidates, effort)
     const controller = new AbortController()
     const key = taskKeyOf(task)
@@ -1730,6 +1758,12 @@ export class SwarmService extends Service {
           ...(roleFilter !== undefined ? { toolFilter: roleFilter } : {}),
           ...(priorNotes !== undefined && priorNotes.length > 0 ? { priorNotes } : {}),
           ...(task.evidence !== undefined ? { evidence: task.evidence } : {}),
+          // A1: the rungs after this attempt's pin. The spawn layer retries them
+          // on the SAME model when a failure is effort-suspect (a fast, output-less
+          // death, or the provider's explicit rejection), so effort varies faster
+          // than the model chain and the internal retry never consumes the task's
+          // retry budget or advances A6's rotation.
+          effortRungs: rungs.slice(1),
           onFallback: (failed, next) => {
             this.events.append('task/model-fallback', {
               runId, taskId: task.id,
@@ -1757,6 +1791,16 @@ export class SwarmService extends Service {
             this.ctx.logger('swarm').warn(
               'task %s: model rejected reasoning effort %s — retrying without an effort pin',
               task.id, String(effort),
+            )
+          },
+          // A1: the ladder moved to the next rung. Re-register the child so its
+          // next request goes out at the new effort instead of the refused one —
+          // the same bookkeeping onDropEffort does, with a value rather than none.
+          onEffortRung: (childSessionId, rung) => {
+            this.trackChildSession(childSessionId, key, rung, attemptId)
+            this.ctx.logger('swarm').warn(
+              'task %s: effort %s failed on this model — retrying the same model at effort %s',
+              task.id, String(effort), rung,
             )
           },
         })
@@ -1908,6 +1952,10 @@ export class SwarmService extends Service {
         label: `swarm:${task.id}`,
         provider: candidates[0]?.provider,
         model: candidates[0]?.model,
+        // A1: record the pinned effort. Without it the 42 ms death above was
+        // diagnosable only from the provider's own logs — the board showed the
+        // route but not the pin that the route refused.
+        ...(effort !== undefined ? { effort } : {}),
       },
     })
     if (delayMs > 0) setTimeout(startSpawn, delayMs)

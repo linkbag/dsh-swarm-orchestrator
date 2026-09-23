@@ -1,11 +1,11 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import * as swarmPlugin from '../src/index.js'
 import { SwarmService, sanitizeToolNames } from '../src/service.js'
-import { isUnsupportedEffortError } from '../src/dispatch/spawn.js'
+import { FAST_FAILURE_MS, isUnsupportedEffortError } from '../src/dispatch/spawn.js'
 
 interface StartCall {
   label?: string
@@ -53,6 +53,13 @@ class FakeSubagents {
    * `zai/glm-5.3` does — while an unpinned child succeeds.
    */
   effortRestricted = false
+  /**
+   * A1: scripted FAILURE outcome by start-call index — the child settles with this
+   * stopReason/output/diagnostic instead of completing. Lets a test model the two
+   * failure shapes the effort ladder judges: a fast, output-less death (a
+   * request-level rejection) and a death that produced work first.
+   */
+  failScript: Record<number, { stopReason?: string; output?: Array<{ type: string; text: string }>; diagnostic?: string }> = {}
   service?: SwarmService
   /** How many children failed because an effort was pinned. */
   effortErrorCount = 0
@@ -85,6 +92,14 @@ class FakeSubagents {
     const id = `sess-${this.n}`
     const text = this.script[index] ?? `finished ${call.label ?? 'task'}\nVERDICT: APPROVE`
     const output = [{ type: 'text', text }]
+    const scripted = this.failScript[index]
+    const settleWith = scripted === undefined
+      ? { stopReason: 'completed', output }
+      : {
+          stopReason: scripted.stopReason ?? 'error',
+          output: scripted.output ?? [],
+          ...(scripted.diagnostic !== undefined ? { diagnostic: scripted.diagnostic } : {}),
+        }
     if (this.effortRestricted && this.effortErrorCount < 1) {
       // The provider rejects a request while an effort pin is in force. The service
       // registers a child's pin AFTER start() returns, so the fake cannot read it
@@ -104,9 +119,11 @@ class FakeSubagents {
       }
     }
     if (this.holdAll) {
-      let resolveResult!: (value: { stopReason: string; output: Array<{ type: string; text: string }> }) => void
-      const result = new Promise<{ stopReason: string; output: Array<{ type: string; text: string }> }>((resolve) => { resolveResult = resolve })
-      this.held.push(() => { resolveResult({ stopReason: 'completed', output }) })
+      // A1: a held child settles with its scripted failure when one exists, so a
+      // test can advance the clock and then let it die without producing output.
+      let resolveResult!: (value: typeof settleWith) => void
+      const result = new Promise<typeof settleWith>((resolve) => { resolveResult = resolve })
+      this.held.push(() => { resolveResult(settleWith) })
       const signal = (request as unknown as { signal?: AbortSignal }).signal
       this.signals.push(signal)
       if (this.abortAware) {
@@ -125,7 +142,7 @@ class FakeSubagents {
     }
     return {
       id,
-      result: Promise.resolve({ stopReason: 'completed', output }),
+      result: Promise.resolve(settleWith),
       dispose: async () => {},
     }
   }
@@ -199,6 +216,18 @@ function makeDispatcher(cwd = 'D:\\work'): unknown {
         name === 'agentPresets' ? { composedPreset: () => 'standard' } : undefined,
     },
   }
+}
+
+/**
+ * A1: `effortRungs` is pure (role + attempt number) and private, so the ladder's
+ * SHAPE is asserted directly off the prototype — the rung order IS the contract,
+ * and inferring it from spawn counts would not pin it.
+ */
+function rungsFor(role: { reasoningEffort?: string; effortFallbacks?: string[] }, attemptNumber: number): Array<string | undefined> {
+  const probe = SwarmService.prototype as unknown as {
+    effortRungs(role: unknown, attemptNumber: number): Array<string | undefined>
+  }
+  return probe.effortRungs(role, attemptNumber)
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs: number, what: string, dump?: () => string): Promise<void> {
@@ -495,6 +524,143 @@ describe('swarm service (integration, fake subagents)', () => {
   }, 20000)
 
   // ── J21: preflight effort validation ─────────────────────────────────────
+  // ── A1: the effort ladder — effort varies fastest, before the model chain ──
+  it('A1: the ladder always ends at an unpinned rung', () => {
+    // The production shape that started this: primary unset with a single
+    // fallback rung used to collapse to ['max'], pinning max on EVERY attempt and
+    // EVERY model — a ladder that could never descend.
+    expect(rungsFor({ effortFallbacks: ['max'] }, 1)).toEqual(['max', undefined])
+    expect(rungsFor({ effortFallbacks: ['max'] }, 2)).toEqual([undefined])
+    expect(rungsFor({}, 1)).toEqual([undefined])
+    expect(rungsFor({ reasoningEffort: 'max' }, 1)).toEqual(['max', undefined])
+    expect(rungsFor({ reasoningEffort: 'max', effortFallbacks: ['high'] }, 2)).toEqual(['high', undefined])
+    expect(rungsFor({ reasoningEffort: 'max', effortFallbacks: ['high'] }, 3)).toEqual([undefined])
+    // Consecutive duplicates would spend a whole child on an identical request.
+    expect(rungsFor({ reasoningEffort: 'max', effortFallbacks: ['max'] }, 1)).toEqual(['max', undefined])
+  })
+
+  it('A1: a fast output-less failure retries the SAME model without the pin', async () => {
+    const { service, fake, dir } = await bootEffortLadder()
+    fake.holdAll = true
+    // The production death: stopReason error, no diagnostic, no output, 42 ms.
+    fake.failScript[0] = { stopReason: 'error', output: [] }
+
+    const result = service.dispatch({
+      title: 'effort ladder',
+      spec: 's',
+      tasks: [{ id: 'l1', subject: 'L', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.effortFor('sess-1') === 'max', 5000, 'first child pinned at max')
+    fake.release()
+
+    await waitFor(() => fake.calls.length === 2, 5000, 'the ladder retried without rotating models')
+    // Same route as the first child, and the retry carries no pin.
+    expect(fake.calls[1].agentOptions).toEqual(fake.calls[0].agentOptions)
+    expect(service.effortFor('sess-2')).toBeUndefined()
+
+    fake.release()
+    await waitFor(
+      () => service.snapshot().tasks.find((t) => t.id === 'l1')?.status === 'completed',
+      10000,
+      'task completed on the unpinned rung',
+      () => 'calls=' + fake.calls.length + ' tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, t.agent])),
+    )
+    expect(fake.calls.length).toBe(2)
+  }, 20000)
+
+  it('A1: a failure that produced output is not effort-suspect (no rung burned)', async () => {
+    const { service, fake, dir } = await bootEffortLadder({ maxRetries: 0 })
+    // The child ran, said something, then died: a real task failure, not a
+    // request-level rejection, so the pin is not what failed.
+    fake.failScript[0] = {
+      stopReason: 'error',
+      output: [{ type: 'text', text: 'partial work before dying' }],
+      diagnostic: 'child stopped: error',
+    }
+
+    const result = service.dispatch({
+      title: 'no rung on a real failure',
+      spec: 's',
+      tasks: [{ id: 'l2', subject: 'L', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().tasks.find((t) => t.id === 'l2')?.status === 'failed', 10000, 'task failed normally')
+    expect(fake.calls.length).toBe(1)
+  }, 20000)
+
+  it('A1: a slow output-less failure is not effort-suspect either (time arm)', async () => {
+    const { service, fake, dir } = await bootEffortLadder({ maxRetries: 0 })
+    fake.holdAll = true
+    fake.failScript[0] = { stopReason: 'error', output: [] }
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const result = service.dispatch({
+        title: 'slow failure',
+        spec: 's',
+        tasks: [{ id: 'l3', subject: 'L', description: 'd', role: 'builder' }],
+      }, makeDispatcher(dir) as never)
+      service.endorse(result.runId)
+
+      await waitFor(() => fake.calls.length === 1, 5000, 'child started')
+      // The child was alive well past the fast-failure window before it died.
+      vi.setSystemTime(new Date(Date.now() + FAST_FAILURE_MS + 1000))
+      fake.release()
+
+      await waitFor(() => service.snapshot().tasks.find((t) => t.id === 'l3')?.status === 'failed', 10000, 'task failed without a rung retry')
+      expect(fake.calls.length).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  }, 20000)
+
+  it('A1: the rung retry consumes no task retry budget and no A6 rotation', async () => {
+    // maxRetries 2, so a genuine failure WOULD be retried: this proves the
+    // internal retry is invisible to the task's own accounting.
+    const { service, fake, dir } = await bootEffortLadder({ maxRetries: 2 })
+    fake.holdAll = true
+    fake.failScript[0] = { stopReason: 'error', output: [] }
+
+    const result = service.dispatch({
+      title: 'retry budget',
+      spec: 's',
+      tasks: [{ id: 'l4', subject: 'L', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.effortFor('sess-1') === 'max', 5000, 'first child pinned')
+    fake.release()
+    await waitFor(() => fake.calls.length === 2, 5000, 'rung retry started')
+    // Mid-flight, between the two children: still one attempt, one task/started.
+    expect(service.snapshot().tasks.find((t) => t.id === 'l4')?.attempts).toBe(1)
+    expect(service.events.all().filter((e) => e.kind === 'task/started' && e.taskId === 'l4').length).toBe(1)
+
+    fake.release()
+    await waitFor(() => service.snapshot().tasks.find((t) => t.id === 'l4')?.status === 'completed', 10000, 'task completed')
+    expect(fake.calls.length).toBe(2)
+    expect(service.snapshot().tasks.find((t) => t.id === 'l4')?.attempts).toBe(1)
+    expect(service.events.all().filter((e) => e.kind === 'task/started' && e.taskId === 'l4').length).toBe(1)
+  }, 20000)
+
+  it('A1: the pinned effort is recorded on task/started and survives projection', async () => {
+    const { service, fake, dir } = await bootEffortLadder()
+    const result = service.dispatch({
+      title: 'effort on the board',
+      spec: 's',
+      tasks: [{ id: 'l5', subject: 'L', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => service.snapshot().tasks.find((t) => t.id === 'l5')?.status === 'completed', 10000, 'task completed')
+    // The pin is on the event (the durable record) AND on the projected task (the
+    // board) — this is what made the 42 ms death diagnosable only from provider logs.
+    expect(service.events.all().find((e) => e.kind === 'task/started' && e.taskId === 'l5')?.data?.effort).toBe('max')
+    expect(service.snapshot().tasks.find((t) => t.id === 'l5')?.agent?.effort).toBe('max')
+    expect(fake.calls.length).toBe(1)
+  }, 20000)
+
   it('J21: checkEffortSupport flags a declared model without an efforts map', async () => {
     const { parseEffortSupport, checkEffortSupport } = await import('../src/preflight.js')
     const settings = [
@@ -1374,6 +1540,23 @@ describe('swarm service (integration, fake subagents)', () => {
     table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3' }
     service.setDutyTable(table, 'test')
     return { service, fake, dir }
+  }
+
+  /**
+   * A1: the builder role in the production ladder shape — the primary effort
+   * UNSET with `effortFallbacks: ['max']`, which is what collapsed to a permanent
+   * `max` pin on every model (seq 3913-3915).
+   */
+  async function bootEffortLadder(overrides: Record<string, unknown> = {}): Promise<{ service: SwarmService; fake: FakeSubagents; dir: string }> {
+    const booted = await bootRunnable(overrides)
+    const table = structuredClone(booted.service.duty.get())
+    const builder: Record<string, unknown> = {
+      ...table.roles.builder, provider: 'zai', model: 'glm-5.3', effortFallbacks: ['max'],
+    }
+    delete builder.reasoningEffort
+    table.roles.builder = builder as never
+    booted.service.setDutyTable(table, 'test')
+    return booted
   }
 
   // ── J6: orphan recovery must not re-fail tasks of a terminal run ──────────

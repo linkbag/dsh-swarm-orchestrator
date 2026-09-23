@@ -2,6 +2,65 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.14
+
+**Effort varies faster than the model — and the effort ladder can no longer dead-end.**
+
+### Fixed
+
+- **The ladder can no longer collapse to a single clamped pin.** The chain was
+  `[reasoningEffort, ...effortFallbacks]` filtered of empties, with the attempt
+  index clamped to the LAST entry — so a role whose primary was unset and whose
+  `effortFallbacks` was `['max']` pinned `max` on *every* attempt and *every*
+  model, the opposite of a fallback. The ladder now starts at this attempt's rung,
+  keeps every following rung, and **always ends at no pin**, so an exhausted ladder
+  degrades to the provider default instead of re-pinning a value the model has
+  already refused.
+- **A refused pin no longer costs the whole attempt.** On a first-pass failure that
+  is effort-suspect — the provider rejecting the effort explicitly, or a child that
+  died fast having produced no output at all — the spawn layer retries the **same
+  model** at the next rung (`max` → `high` → … → no pin) *before* the task rotates
+  models. The retry is internal: it consumes no retry budget, does not change the
+  task's attempt number, and does not advance the A6 model rotation. It is bounded
+  by the rung count and stops at the first failure that is no longer effort-suspect.
+- **The pinned effort is recorded.** `task/started` now carries `effort` and the
+  board shows it, so this class of failure is diagnosable from the event log rather
+  than inferred from a timing signature.
+
+### Why
+
+Production incident (2026-09-23, seq 3913-3915): attempt 1 pinned `max` on
+`xiaomi/mimo-v2.6-pro` and the child died **42 ms** after `task/agent-started` with
+stopReason `error` and no diagnostic. The generic reason `"child stopped: error"`
+never matched the J18 unsupported-effort signature, so the dispatcher rotated to
+`deepseek-official/deepseek-flash` (which accepted the same `max` five seconds
+later) instead of varying the pin. The model itself runs unpinned as the
+deployment default, so the pin was the suspect — not the model.
+
+Note for operators: with the primary effort unset, `effortFallbacks: ['max']` still
+means `max` is the *first* rung tried. List the conservative effort first, or leave
+the ladder empty, if you want the unpinned request attempted first.
+
+### Fast-failure heuristic
+
+`FAST_FAILURE_MS = 10_000`: a failure that produced no output at all within 10 s of
+the child starting is treated as a request-level rejection. An attempt that ran and
+genuinely failed keeps the previous behaviour — the model chain remains the model
+chain's business. The J18 full-chain degrade on an explicit unsupported-effort
+error is unchanged.
+
+### Tests
+
+- `tests/service.test.ts` — 6 new A1 tests: ladder construction (`[]`, `['max']`,
+  attempt-indexed `['max','high']`), the same-model rung retry after a fast
+  output-less failure, no rung burned when the failure produced output or was slow,
+  no retry-budget or rotation consumption, and the effort surviving projection.
+- Suite: **150 tests, 150 pass, 15/15 files.**
+- `tests/boot-audit-live.test.ts` — the all-terminal premise is now explicit: the
+  production store has since gained an in-flight run whose recovery legitimately
+  appends one `task/failed` event. The zero-append assertion still governs the
+  terminal case it was written for.
+
 ## 0.6.13
 
 **Scheduler correctness restored: everything from 0.6.9, on top of 0.6.11 and 0.6.12.**

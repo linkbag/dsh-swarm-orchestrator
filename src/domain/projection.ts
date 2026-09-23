@@ -182,6 +182,10 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
           label: str('label') ?? task.agent?.label ?? `swarm:${taskId}`,
           provider: str('provider') ?? task.agent?.provider,
           model: str('model') ?? task.agent?.model,
+          // A1: the effort this attempt pinned, so a fast child death is
+          // diagnosable from the board. Absent on an attempt that pinned nothing,
+          // which also clears any previous attempt's value (JSON drops undefined).
+          effort: str('effort'),
         }
         task.blockedReason = undefined
         break
@@ -201,6 +205,9 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
           label: task.agent?.label ?? `swarm:${taskId}`,
           provider: str('provider'),
           model: str('model'),
+          // The fallback is a new child of the same attempt: the effort pin it
+          // was spawned with is unchanged, so the board keeps showing it.
+          effort: task.agent?.effort,
         }
         const runStats = state.runs.get(runId)?.stats
         if (runStats !== undefined) runStats.fallbacks += 1
