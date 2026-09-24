@@ -2,6 +2,31 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.19
+
+**The status pill is a run tracker again; human-waiting attention comes from the notification.**
+
+### Changed
+
+- **The bottom-right pill no longer counts tasks.** 0.6.18 made the badge report
+  "N tasks waiting for your review" ahead of run activity. In practice the count
+  aggregated *history* - every blocked task ever - so it grew without bound (the
+  reported state: "26 tasks waiting for your review") and could never clear once
+  the individual gates were resolved. The pill is back to tracking RUNS: live
+  activity if there is any, otherwise the newest run's outcome.
+- **Human-waiting attention is unchanged and lives in the notification.** The
+  aggregated, episode-deduplicated ping to the dispatching session (0.6.18) is the
+  signal for review gates, blocked tasks and evidence stalls: it names each waiting
+  task, the recorded reason and the resolution options, and the dispatcher can
+  raise a multiple-choice prompt. A run awaiting endorsement still styles the pill
+  as alert, because that is a RUN state waiting on a person.
+
+### Tests
+
+- The four task-count badge tests are removed with the branch they pinned; the
+  signature no longer accepts tasks, so the compiler enforces the separation.
+- Suite: **169 tests, 169 pass, 15/15 files.**
+
 ## 0.6.18
 
 **Fail-visible hardening: doomed configs rejected at save time, and human-waiting states impossible to miss.**

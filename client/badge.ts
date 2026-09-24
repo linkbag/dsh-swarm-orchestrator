@@ -18,16 +18,6 @@ export interface BadgeRun {
   createdAt?: number
 }
 
-/**
- * B1: the task facts the attention rule needs. `humanReview` is sticky in the
- * projection (it records "has ever waited"), so it only counts as waiting while
- * the task still sits in `reviewing` — a resolved gate must not cry wolf forever.
- */
-export interface BadgeTaskState {
-  status: string
-  humanReview?: boolean
-}
-
 export interface BadgeView {
   /** Empty string means "hide the badge". */
   text: string
@@ -41,7 +31,6 @@ export interface BadgeLabels {
   paused?: string
   awaiting?: string
   last?: string
-  review?: string
   status?: (status: string) => string
 }
 
@@ -50,12 +39,11 @@ const EN_DEFAULTS: Required<Omit<BadgeLabels, 'status'>> = {
   paused: '🐝 {n} swarm run{plural} paused',
   awaiting: '🐝 {n} swarm run{plural} awaiting endorsement',
   last: '🐝 last swarm run: {status}',
-  review: '🐝 {n} task{plural} waiting for your review',
 }
 
 const ATTENTION = new Set(['failed', 'aborted'])
 
-export function badgeView(runs: readonly BadgeRun[] | undefined, labels?: BadgeLabels, tasks?: readonly BadgeTaskState[]): BadgeView {
+export function badgeView(runs: readonly BadgeRun[] | undefined, labels?: BadgeLabels): BadgeView {
   if (!Array.isArray(runs) || runs.length === 0) return { text: '', alert: false }
 
   const templates = { ...EN_DEFAULTS, ...labels }
@@ -67,17 +55,11 @@ export function badgeView(runs: readonly BadgeRun[] | undefined, labels?: BadgeL
   }
   const plural = (n: number): string => (n === 1 ? '' : 's')
 
-  // B1: a human decision outranks everything. While anything waits on a person
-  // the swarm is not progressing — however many other tasks are still running —
-  // so this is the one state that must be impossible to miss (the incident: a
-  // run sat blocked for a human with the badge calmly reading "1 run active").
-  // Waiting = a blocked task, or a task parked in a human review gate. The
-  // sticky `humanReview` flag alone does NOT count: it stays set after the
-  // verdict, and permanently red would be its own false alarm. A malformed
-  // tasks payload degrades to "no tasks", exactly like the runs guard above.
-  const taskList = Array.isArray(tasks) ? tasks : []
-  const waiting = taskList.filter((t) => t.status === 'blocked' || (t.humanReview === true && t.status === 'reviewing')).length
-  if (waiting > 0) return { text: say(templates.review, { n: waiting, plural: plural(waiting) }), alert: true }
+  // The pill is a RUN tracker: it reports what the swarm is doing — live activity,
+  // otherwise the newest run's outcome. It deliberately does NOT count tasks
+  // waiting on a person: that number aggregates history (every blocked task ever),
+  // so it could never clear, and human-waiting attention is delivered where it can
+  // be acted on (the aggregated notification to the dispatching session).
 
   // In-flight work outranks past outcomes: that is what the user cares about live.
   const running = runs.filter((r) => r.status === 'running' || r.status === 'planning').length
@@ -87,9 +69,8 @@ export function badgeView(runs: readonly BadgeRun[] | undefined, labels?: BadgeL
   const paused = runs.filter((r) => r.status === 'paused').length
   if (paused > 0) return { text: say(templates.paused, { n: paused, plural: plural(paused) }), alert: true }
 
-  // Neither running nor finished: it is waiting on a human, and that IS
-  // attention — nothing will move until someone endorses (B1: this branch used
-  // to render non-alert, which hid exactly the state the user must act on).
+  // Neither running nor finished: the run cannot start until someone endorses,
+  // which is a genuine RUN state waiting on a human — the pill's business.
   const awaiting = runs.filter((r) => r.status === 'awaiting-endorsement').length
   if (awaiting > 0) {
     return { text: say(templates.awaiting, { n: awaiting, plural: plural(awaiting) }), alert: true }
