@@ -2368,7 +2368,11 @@ describe('swarm service (integration, fake subagents)', () => {
 
     const table = structuredClone(service.duty.get())
     table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3', toolFilter: { deny: ['modlens'] } }
-    service.setDutyTable(table, 'test')
+    // Saved through the STORE, not setDutyTable: the dashboard path now rejects
+    // an unknown name at save time (B-config), and this test pins the DISPATCH
+    // behavior for the tables that still reach storage by other routes — a
+    // hand-edited duty-table.json is exactly how the production typo persisted.
+    service.duty.save(table)
 
     // The bad name is sanitised away rather than passed through to restrict().
     expect(service.toolFilterFor('builder')).toBeUndefined()
@@ -2402,7 +2406,8 @@ describe('swarm service (integration, fake subagents)', () => {
       ...table.roles.builder, provider: 'zai', model: 'glm-5.3',
       toolFilter: { deny: ['modlens_read_image', 'typo'] },
     }
-    service.setDutyTable(table, 'test')
+    // Store save, not the dashboard path — see the misconfiguration test above.
+    service.duty.save(table)
 
     const result = service.dispatch({
       title: 'valid name survives',
@@ -2605,5 +2610,180 @@ describe('A7: evidence-contract failure path', () => {
     expect(events.filter(
       (e) => e.kind === 'task/heartbeat' && e.taskId === 'a' && e.data?.evidence !== undefined,
     )).toHaveLength(0)
+  }, 30000)
+})
+
+describe('B-config: duty-table toolFilter guard (fail-open)', () => {
+  /** The current table with the builder role's toolFilter replaced. */
+  const tableWithFilter = (service: SwarmService, filter: { deny?: string[]; allow?: string[] }): unknown => {
+    const table = structuredClone(service.duty.get())
+    table.roles.builder = { ...table.roles.builder, toolFilter: filter }
+    return table
+  }
+
+  it('rejects a save naming a tool this host does not expose — naming the tool, the role, and known names', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    // The host exposes exactly these; "modlens" is the production typo (the real
+    // tool is modlens_read_image — 27 task-attempts died across 3 runs on it).
+    ctx.reflect.provide('tools', { restrictableNames: new Set(['bash', 'read', 'write', 'modlens_read_image']) } as never)
+
+    expect(() => service.setDutyTable(tableWithFilter(service, { deny: ['modlens'] }) as never, 'test'))
+      .toThrow(/modlens/)
+    expect(() => service.setDutyTable(tableWithFilter(service, { deny: ['modlens'] }) as never, 'test'))
+      .toThrow(/builder/)
+    expect(() => service.setDutyTable(tableWithFilter(service, { deny: ['modlens'] }) as never, 'test'))
+      .toThrow(/bash/)
+    // The allow list is validated exactly the same way.
+    expect(() => service.setDutyTable(tableWithFilter(service, { allow: ['nope'] }) as never, 'test'))
+      .toThrow(/nope/)
+  })
+
+  it('accepts a save whose filter names only tools the host exposes', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    ctx.reflect.provide('tools', { restrictableNames: new Set(['bash', 'read', 'write']) } as never)
+
+    const saved = service.setDutyTable(tableWithFilter(service, { deny: ['bash'], allow: ['read'] }) as never, 'test')
+    expect((saved.roles.builder as { toolFilter?: { deny?: string[] } }).toolFilter?.deny).toEqual(['bash'])
+    // And the save really landed (not silently swallowed).
+    expect((service.duty.get().roles.builder as { toolFilter?: { deny?: string[] } }).toolFilter?.deny).toEqual(['bash'])
+  })
+
+  it('fails OPEN: an unknown name is accepted when the host tool list is unavailable', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    // No `tools` service provided at all — the read fails, the guard must not
+    // invent a rejection the host cannot back up.
+    const saved = service.setDutyTable(tableWithFilter(service, { deny: ['modlens'] }) as never, 'test')
+    expect((saved.roles.builder as { toolFilter?: { deny?: string[] } }).toolFilter?.deny).toEqual(['modlens'])
+  })
+})
+
+describe('B2: human-attention notification to the dispatching session', () => {
+  /** Boot with a live dispatching session whose inbox records every followup's text. */
+  async function bootWithInbox(overrides: Record<string, unknown> = {}) {
+    const { ctx, service, fake, dir } = await bootSwarm(overrides)
+    contexts.push(ctx)
+    dirs.push(dir)
+    // Decoded to the message TEXT (not the stringified envelope) so assertions
+    // read what the dispatching agent actually sees.
+    const followupTexts: string[] = []
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+    const originalGet = agents.get.bind(agents)
+    ;(agents as unknown as { get: (id: string) => unknown }).get = (id: string): unknown => {
+      // makeDispatcher()'s session id is 'parent-1'.
+      if (id === 'parent-1') {
+        return {
+          followup: (message: unknown): void => {
+            const text = (message as { content?: Array<{ type: string; text?: string }> })?.content?.[0]?.text
+            followupTexts.push(typeof text === 'string' ? text : JSON.stringify(message))
+          },
+        }
+      }
+      return originalGet(id)
+    }
+    return { service, fake, dir, followupTexts }
+  }
+
+  /** Only the attention pings — the completion/failed pushes ride the same inbox. */
+  const attention = (calls: string[]): string[] => calls.filter((c) => c.includes('[swarm attention]'))
+
+  const taskOfRun = (service: SwarmService, runId: string, id: string) =>
+    service.snapshot().tasks.find((t) => t.runId === runId && t.id === id)!
+
+  it('pings once with the task, the reason, and every resolution option', async () => {
+    const { service, dir, followupTexts } = await bootWithInbox()
+    const dispatched = service.dispatch({
+      title: 'attention demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { commands: ["echo '191 passed in 4.50s'; exit 1"] } }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(dispatched.runId)
+
+    await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'task blocks')
+    await waitFor(() => attention(followupTexts).length === 1, 8000, 'attention ping arrives after the coalescing window')
+
+    const ping = attention(followupTexts)[0]
+    expect(ping).toContain('[swarm attention]')
+    expect(ping).toContain('1 item')                       // singular for one item
+    expect(ping).toContain('task "a"')                     // the task is named
+    expect(ping).toContain(dispatched.runId)               // and its run
+    expect(ping).toContain('191 passed in 4.50s')          // the recorded reason explains itself
+    expect(ping).toContain('swarm_review')
+    expect(ping).toContain('swarm_retry')
+    expect(ping).toContain('swarm_complete')
+    expect(ping).toContain('multiple-choice')              // the agent may prompt the user
+  }, 30000)
+
+  it('aggregates: tasks blocking in one burst produce ONE ping listing all of them', async () => {
+    const { service, dir, followupTexts } = await bootWithInbox()
+    const dispatched = service.dispatch({
+      title: 'burst demo',
+      spec: 's',
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { commands: ['exit 1'] } },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder', evidence: { commands: ['exit 1'] } },
+      ],
+    }, makeDispatcher(dir) as never)
+    service.endorse(dispatched.runId)
+
+    await waitFor(() => {
+      const tasks = service.snapshot().tasks.filter((t) => t.runId === dispatched.runId)
+      return tasks.length === 2 && tasks.every((t) => t.status === 'blocked')
+    }, 20000, 'both tasks block')
+    await waitFor(() => attention(followupTexts).length === 1, 8000, 'exactly one aggregated ping')
+
+    const ping = attention(followupTexts)[0]
+    expect(ping).toContain('2 items')
+    expect(ping).toContain('task "a"')
+    expect(ping).toContain('task "b"')
+    // The production incident had eight — one ping, not eight.
+    expect(attention(followupTexts).length).toBe(1)
+  }, 30000)
+
+  it('re-pings only when the set changes: a re-block after resolution pings, an unchanged set stays silent', async () => {
+    const { service, dir, followupTexts } = await bootWithInbox()
+    const dispatched = service.dispatch({
+      title: 'dedupe demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { commands: ['exit 1'] } }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(dispatched.runId)
+
+    await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'first block')
+    await waitFor(() => attention(followupTexts).length === 1, 8000, 'first ping')
+
+    // Resolve by requeueing: the task unblocks, re-runs, its evidence still
+    // fails, the fresh attempt's recheck fails, and it blocks again — a NEW
+    // wait, so it must ping again.
+    service.retryTask(dispatched.runId, 'a')
+    await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'blocks again after retry')
+    await waitFor(() => attention(followupTexts).length === 2, 8000, 'second ping after re-block')
+
+    // An unchanged set must stay silent: force a flush with nothing new waiting.
+    ;(SwarmService.prototype as unknown as { flushHumanWaiting: (runId: string) => void })
+      .flushHumanWaiting.call(service, dispatched.runId)
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    expect(attention(followupTexts).length).toBe(2)
+  }, 40000)
+
+  it('stays silent when notifyDispatchSession is false', async () => {
+    const { service, dir, followupTexts } = await bootWithInbox({ notifyDispatchSession: false })
+    const dispatched = service.dispatch({
+      title: 'silent demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { commands: ['exit 1'] } }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(dispatched.runId)
+
+    await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'blocked but silent')
+    // Well past the coalescing window.
+    await new Promise((resolve) => setTimeout(resolve, 2500))
+    expect(attention(followupTexts).length).toBe(0)
   }, 30000)
 })

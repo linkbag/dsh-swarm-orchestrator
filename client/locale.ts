@@ -229,6 +229,7 @@ const en: Record<string, string> = {
   'badge.paused': '{n} swarm run{plural} paused',
   'badge.awaiting': '{n} swarm run{plural} awaiting endorsement',
   'badge.last': 'last swarm run: {status}',
+  'badge.review': '{n} task{plural} waiting for your review',
 }
 
 const zh: Record<string, string> = {
@@ -432,6 +433,7 @@ const zh: Record<string, string> = {
   'badge.paused': '🐝 {n} 个 swarm 运行已暂停',
   'badge.awaiting': '🐝 {n} 个 swarm 运行等待放行',
   'badge.last': '🐝 上次 swarm 运行：{status}',
+  'badge.review': '🐝 {n} 个任务等待你的评审',
 }
 
 /** English dictionary — the completion reference and the fallback content. */

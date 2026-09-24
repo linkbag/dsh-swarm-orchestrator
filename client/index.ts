@@ -13,7 +13,7 @@ import { SwarmHeaderButton } from './SwarmHeaderButton'
 import { SwarmDispatchCard } from './ToolDispatchCard'
 import { badgeView, type BadgeLabels } from './badge'
 import { setFacesGetter, type LegacyApiLike, type RemoteLike } from './catalog'
-import { boardStore } from './board-store'
+import { boardStore, type Board } from './board-store'
 import { initLocale, setLocaleService, t, type LocaleLike } from './locale'
 import css from './swarm.css'
 
@@ -142,7 +142,11 @@ export function apply(ctx: ClientContext): (() => void) | void {
     // browser's ~6 connections per origin for no additional information.
     const store = boardStore()
     const release = store.retain()
-    const render = (runs: Array<{ status: string; createdAt?: number }> | undefined): void => {
+    // B1: render from the whole board snapshot — runs AND tasks. The attention
+    // rule (anything blocked, or parked in a human review gate, or a run waiting
+    // on endorsement) needs the task statuses, and they arrive on the same
+    // shared stream, so this adds no request of any kind.
+    const render = (board: Board | null | undefined): void => {
       const statusWord = (status: string): string => {
         const translated = t(`status.${status}`)
         return translated === `status.${status}` ? status : translated
@@ -152,17 +156,18 @@ export function apply(ctx: ClientContext): (() => void) | void {
         paused: t('badge.paused'),
         awaiting: t('badge.awaiting'),
         last: t('badge.last'),
+        review: t('badge.review'),
         status: statusWord,
       }
-      const view = badgeView(runs, labels)
+      const view = badgeView(board?.runs, labels, board?.tasks)
       badge.textContent = view.text
       badge.className = view.alert ? 'dsh-swarm-badge alert' : 'dsh-swarm-badge'
       badge.style.display = view.text.length === 0 ? 'none' : 'block'
     }
-    const unsubscribe = store.subscribe((board) => { if (board !== null) render(board.runs) })
+    const unsubscribe = store.subscribe((board) => { if (board !== null) render(board) })
     // A language switch must re-label the badge too — re-render from the
     // snapshot already in hand, without touching the network.
-    const offLocale = locale?.subscribe?.(() => { render(store.get()?.runs) })
+    const offLocale = locale?.subscribe?.(() => { render(store.get()) })
     // Teardown: released when the plugin's style element is removed (apply disposer).
     const observer = new MutationObserver(() => {
       if (document.head.querySelector('style[data-dsh-swarm-orchestrator]') === null) {

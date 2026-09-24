@@ -145,6 +145,14 @@ function evidenceRecord(outcome: EvidenceCommandOutcome): Record<string, unknown
  * passed through verbatim: a `cmd /c …` string is the child's own choice and runs
  * under the resolved PowerShell exactly as written.
  */
+/**
+ * B2: the coalescing window for human-attention pings. Long enough that a
+ * burst of blocks (production: eight at once) lands in one aggregated message,
+ * short enough that the ping feels immediate. Not a heuristic about anything —
+ * only about how close together two pings may be.
+ */
+const HUMAN_WAIT_NOTIFY_COALESCE_MS = 1500
+
 async function runEvidenceCommand(command: string, cwd: string, timeoutMs: number): Promise<EvidenceCommandOutcome> {
   const shell = evidenceShell()
   // A7: node's default `maxBuffer` is 1 MB, and a suite that prints per-test
@@ -435,6 +443,19 @@ export class SwarmService extends Service {
     this.startedAt = Date.now()
     mkdirSync(config.storageDir, { recursive: true })
     this.events = new EventStore(join(config.storageDir, 'events.jsonl'))
+    // B2: record when each task's CURRENT wait episode began (the seq of the
+    // task/blocked or task/review-started event that started it). A ping is
+    // keyed to the episode it covered, so any NEW block event is by definition
+    // a fresh wait — no need to enumerate every resolution path (swarm_retry
+    // resolves with task/failed(retry), swarm_review with task/reviewed,
+    // swarm_complete with task/completed; listing them already missed one).
+    this.events.subscribe((event) => {
+      if (event.kind === 'task/blocked' || event.kind === 'task/review-started') {
+        if (event.runId !== undefined && event.taskId !== undefined && typeof event.seq === 'number') {
+          this.humanWaitEpisode.set(`${event.runId}/${event.taskId}`, event.seq)
+        }
+      }
+    })
     this.duty = new DutyTableStore(join(config.storageDir, 'duty-table.json'))
     this.runtime = new RuntimeStore(join(config.storageDir, 'runtime.json'))
     // H-4/J9 boot readiness: delay orphan recovery until the subagents spawn
@@ -1066,6 +1087,36 @@ export class SwarmService extends Service {
       if (role.id !== id) throw new Error(`role ${id} has mismatched id ${String(role.id)}`)
       if (!Array.isArray(role.fallbacks)) throw new Error(`role ${id} needs a fallbacks array`)
     }
+    // B-config: a toolFilter naming a tool this host does not expose is a typo,
+    // and until now it was only discovered at dispatch — where J15 silently
+    // DROPS the unknown name with a log warning, so the filter quietly stops
+    // doing what its author intended. Production shape: a filter naming
+    // "modlens" (the tool is `modlens_read_image`) — 27 task-attempts died
+    // across 3 runs before J15 made it a warning. The dashboard save path can
+    // do better: reject the typo at the moment it is made, naming it. Fail-open
+    // by design — when the host's tool list cannot be read (or is empty), the
+    // save is accepted unchanged; the runtime J15 warning stays the last line
+    // of defense and dispatch behavior is untouched.
+    const knownTools = this.restrictableToolNames()
+    if (knownTools !== undefined && knownTools.size > 0) {
+      const unknown: string[] = []
+      for (const [id, role] of Object.entries(next.roles)) {
+        for (const list of ['deny', 'allow'] as const) {
+          for (const name of role.toolFilter?.[list] ?? []) {
+            if (!knownTools.has(name)) unknown.push(`"${name}" (role "${id}", ${list} list)`)
+          }
+        }
+      }
+      if (unknown.length > 0) {
+        const sample = [...knownTools].slice(0, 8).join(', ')
+        throw new Error(
+          `duty table rejected: toolFilter names ${unknown.length === 1 ? 'an unknown tool' : 'unknown tools'} `
+          + `${unknown.join(', ')}. This host exposes ${knownTools.size} restrictable tools `
+          + `(e.g. ${sample}). At dispatch an unknown name is silently dropped, so this filter `
+          + 'would not do what it says — fix the name or remove it from the filter.',
+        )
+      }
+    }
     const saved = this.duty.save({ ...next, override: next.override })
     this.events.append('duty/updated', { data: { actor } })
     return saved
@@ -1119,6 +1170,85 @@ export class SwarmService extends Service {
       live.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
     } catch (err) {
       this.ctx.logger('swarm').warn('completion push for run %s failed (contained): %s', runId, String(err))
+    }
+  }
+
+  /** B2: the wait episode each task is currently in — the seq of the event that started it. */
+  private readonly humanWaitEpisode = new Map<string, number>()
+  /** B2: the episode each waiting item was already pinged for, as `runId/taskId` -> episode seq. */
+  private readonly humanWaitPinged = new Map<string, number>()
+  /** B2: coalescing timer — one aggregated ping per burst of blocks, not one per task. */
+  private humanWaitTimer: ReturnType<typeof setTimeout> | undefined
+
+  /**
+   * B2: something just started waiting on a human (a task blocked with
+   * `human: true`, or a task parked in a `reviewGate: 'human'` verdict). Arm a
+   * short coalescing window so a burst produces ONE aggregated ping — the
+   * production incident had eight tasks block at once, and eight pings would be
+   * their own alarm fatigue. Items joining inside the window are picked up when
+   * it fires; a later join arms a fresh window. The run id captured here is the
+   * first trigger's — the ping still lists every waiting item across runs, it
+   * just rides that run's dispatching session.
+   *
+   * A run merely awaiting endorsement does NOT ping: the creation-time tool
+   * result already tells the dispatching agent "awaiting human endorsement on
+   * the Swarm dashboard", so a second channel would be noise, not signal.
+   */
+  private scheduleHumanWaitingNotify(runId: string): void {
+    if (this.swarmConfig.notifyDispatchSession !== true) return
+    if (this.humanWaitTimer !== undefined) return
+    this.humanWaitTimer = setTimeout(() => {
+      this.humanWaitTimer = undefined
+      this.flushHumanWaiting(runId)
+    }, HUMAN_WAIT_NOTIFY_COALESCE_MS)
+    this.humanWaitTimer.unref?.()
+  }
+
+  /**
+   * B2: send one aggregated attention ping listing EVERYTHING currently waiting
+   * on a human. An item counts as fresh when its wait EPISODE (the block or
+   * review-start event that began it) is not the one already pinged — so a task
+   * that resolves and blocks again pings again, while re-flushing an unchanged
+   * set stays silent. `humanReview` is sticky in the projection (it marks "has
+   * ever waited"), so a review-gated task counts as waiting only while it is
+   * still `reviewing`, and a blocked task counts while it is still `blocked`.
+   * Failures are contained exactly like the completion push.
+   */
+  private flushHumanWaiting(triggerRunId: string): void {
+    if (this.swarmConfig.notifyDispatchSession !== true) return
+    try {
+      const state = this.view()
+      const waiting = [...state.tasks.values()].filter(
+        (task) => task.status === 'blocked' || (task.humanReview === true && task.status === 'reviewing'),
+      )
+      const episodeOf = (key: string): number => this.humanWaitEpisode.get(key) ?? -1
+      const fresh = waiting.filter((task) => this.humanWaitPinged.get(`${task.runId}/${task.id}`) !== episodeOf(`${task.runId}/${task.id}`))
+      if (fresh.length === 0) return
+      for (const task of waiting) {
+        const key = `${task.runId}/${task.id}`
+        this.humanWaitPinged.set(key, episodeOf(key))
+      }
+
+      const sessionId = state.runs.get(triggerRunId)?.dispatch?.sessionId
+      if (sessionId === undefined) return
+      const agents = this.ctx.get('agents') as AgentsLike | undefined
+      const live = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
+      if (live === undefined || typeof live.followup !== 'function') return
+      // The reason is long; keep its head for context and its tail for the
+      // recorded detail (exit code, output tail) — the middle is preamble.
+      const brief = (s: string): string => (s.length <= 260 ? s : `${s.slice(0, 90)} … ${s.slice(-160)}`)
+      const lines = waiting.map((task) => task.status === 'blocked'
+        ? `- run ${task.runId} task "${task.id}": ${brief(String(task.blockedReason ?? 'blocked — a human decides'))}`
+        : `- run ${task.runId} task "${task.id}": awaiting your review verdict (reviewGate: human)`)
+      const n = waiting.length
+      const text = `[swarm attention] ${n} item${n === 1 ? '' : 's'} waiting on a human decision:\n${lines.join('\n')}\n`
+        + 'Resolution: swarm_review (approve/reject — human review gates), swarm_retry (requeue a blocked task), '
+        + 'swarm_complete (accept finished work despite the evidence artefact), or the dashboard buttons. '
+        + 'You may surface this decision to the user as a multiple-choice prompt. '
+        + 'Do not start new work unless the user asks — the live board is on the Swarm tab.'
+      live.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
+    } catch (err) {
+      this.ctx.logger('swarm').warn('human-wait push failed (contained): %s', String(err))
     }
   }
 
@@ -2018,6 +2148,7 @@ export class SwarmService extends Service {
                     'task %s blocked for a human: the child reported done but its evidence commands keep failing',
                     key,
                   )
+                  this.scheduleHumanWaitingNotify(runId)
                   this.evidenceRecheckedAttempt.delete(key)
                   this.scheduleTick()
                   return
@@ -2032,6 +2163,7 @@ export class SwarmService extends Service {
                     evidence: { commands: firstRun },
                   },
                 })
+                this.scheduleHumanWaitingNotify(runId)
                 this.evidenceRecheckedAttempt.delete(key)
                 this.scheduleTick()
                 return
@@ -2052,6 +2184,7 @@ export class SwarmService extends Service {
             if (task.reviewGate === 'human') {
               // J7: park the task for a human verdict on the dashboard.
               this.events.append('task/review-started', { runId, taskId: task.id, data: { reviewer: task.reviewBy, human: true } })
+              this.scheduleHumanWaitingNotify(runId)
               this.scheduleTick()
             } else {
               void this.runReview(runId, task.id, task.reviewBy)

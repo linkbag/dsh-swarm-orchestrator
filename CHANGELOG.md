@@ -2,6 +2,44 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.18
+
+**Fail-visible hardening: doomed configs rejected at save time, and human-waiting states impossible to miss.**
+
+### Added
+
+- **The Roster rejects tool filters naming unknown tools.** A toolFilter allow/deny
+  entry the host does not know used to surface only at spawn time -
+  `tools.restrict() names unknown global tool "modlens"` killed 27 task-attempts
+  across 3 runs, instantly and terminally. `setDutyTable` now validates every
+  role's filter names against the host's restrictable tool list and rejects the
+  save naming the unknown tool and role. Fails OPEN when the host list cannot be
+  read; dispatch-time behavior is unchanged - the runtime error remains the last
+  line of defense for hand-edited tables.
+- **The global badge goes red for anything waiting on a human.** A blocked or
+  human-review task - or a run awaiting endorsement - now outranks "active" in
+  the badge, with an explicit "waiting for your review" line. Same shared SSE
+  connection; no new fetches, polls, or streams.
+- **One aggregated ping to the dispatching session when a human is needed.**
+  Reuses the run-completion notification channel: lists every waiting task with
+  its reason and the resolution options (swarm_review / swarm_retry /
+  swarm_complete), and notes the dispatcher may surface the decision to the user
+  as a multiple-choice prompt. Coalesced (eight tasks blocking at once is one
+  ping) and deduplicated by wait episode; respects notifyDispatchSession.
+
+### Design
+
+No new runtime heuristics and no output parsing - everything here is fail
+visible: loud config-time errors and attention signals. Nothing can mask a real
+failure.
+
+### Tests
+
+- 11 new (4 badge, 3 guard, 4 notification). Three expectations deliberately
+  changed: the badge treats awaiting-endorsement as alert; two J15 tests now
+  install their duty table through the store path the guard protects.
+- Suite: **173 tests, 173 pass, 15/15 files.**
+
 ## 0.6.17
 
 **The reviewer effort pin now goes through the same preflight as task dispatch.**

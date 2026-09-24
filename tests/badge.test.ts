@@ -74,10 +74,50 @@ describe('global swarm badge label', () => {
     expect(view.alert).toBe(false)
   })
 
-  it('reports a run waiting on a human instead of claiming the swarm is idle', () => {
+  it('reports a run waiting on a human as ALERT — nothing moves until someone endorses (B1)', () => {
+    // This used to render non-alert, hiding exactly the state the user must act
+    // on: the whole swarm idle, waiting on one click.
     const view = badgeView([{ status: 'awaiting-endorsement', createdAt: 42 }])
     expect(view.text).toBe('🐝 1 swarm run awaiting endorsement')
+    expect(view.alert).toBe(true)
+  })
+
+  it('goes alert when any task is blocked, and outranks active runs (B1)', () => {
+    // The incident shape: a run still 'running' while one of its tasks sits
+    // blocked for a human — the badge used to calmly read "1 run active".
+    const view = badgeView([{ status: 'running', createdAt: 5 }], undefined, [
+      { status: 'blocked' },
+      { status: 'running' },
+    ])
+    expect(view.text).toBe('🐝 1 task waiting for your review')
+    expect(view.alert).toBe(true)
+  })
+
+  it('counts a task parked in a human review gate, and pluralizes (B1)', () => {
+    const view = badgeView([{ status: 'running' }], undefined, [
+      { status: 'reviewing', humanReview: true },
+      { status: 'blocked' },
+    ])
+    expect(view.text).toBe('🐝 2 tasks waiting for your review')
+    expect(view.alert).toBe(true)
+  })
+
+  it('does not cry wolf after the wait is over: the sticky humanReview flag alone does not count (B1)', () => {
+    // `humanReview` stays set in the projection after the verdict arrives — it
+    // records "has ever waited". Only a task still IN the gate (reviewing) or
+    // still blocked is waiting; otherwise the badge would be permanently red,
+    // which is its own false alarm.
+    const view = badgeView([{ status: 'completed', createdAt: 9 }], undefined, [
+      { status: 'completed', humanReview: true },
+      { status: 'pending', humanReview: true },
+    ])
+    expect(view.text).toBe('🐝 last swarm run: completed')
     expect(view.alert).toBe(false)
+  })
+
+  it('ignores a malformed tasks payload the way it ignores a malformed runs payload (B1)', () => {
+    expect(badgeView([{ status: 'running' }], undefined, null as never).text).toBe('🐝 1 swarm run active')
+    expect(badgeView([{ status: 'running' }], undefined, {} as never).text).toBe('🐝 1 swarm run active')
   })
 
   it('hides the badge when there are no runs or no usable payload', () => {
