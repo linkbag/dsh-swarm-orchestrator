@@ -150,6 +150,19 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       run.pauseReason = undefined
     } else if (kind === 'run/aborted') {
       run.status = 'aborted'
+    } else if (kind === 'run/renamed') {
+      // A8: display-only, and deliberately unrestricted by status — the run you
+      // are finished with is exactly the one you want to relabel. An unknown
+      // runId was already tolerated by the guard above.
+      const title = str('title')
+      if (title !== undefined && title.length > 0) run.title = title
+    } else if (kind === 'run/board-state') {
+      // A8: a VIEW property only. Status, tasks, stats and the report are
+      // untouched, so hiding a run can never affect scheduling, recovery or
+      // history. An unknown runId was already tolerated by the guard above, and
+      // an unrecognised state is ignored rather than corrupting the flag.
+      const state = str('state')
+      if (state === 'visible' || state === 'removed' || state === 'purged') run.boardState = state
     }
   }
 

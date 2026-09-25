@@ -14,7 +14,12 @@ export interface BoardRun {
   pauseReason?: string
   dispatch?: { cwd?: string; presetId?: string }
   stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number }
+  /** A8: how the board presents this run; absent means `visible`. */
+  boardState?: BoardRunState
 }
+
+/** A8: the three board presentations a run can have. Nothing is ever deleted. */
+export type BoardRunState = 'visible' | 'removed' | 'purged'
 
 export interface BoardTask {
   runId: string
@@ -89,6 +94,21 @@ export interface Board {
   override?: { enabled: boolean; note?: string; setBy?: string; at: number }
   runtime?: BoardRuntime
   at: number
+  /**
+   * A8: the recycle bin, newest first — present only when non-empty. The server
+   * excludes removed runs from `runs`/`tasks` and purged runs from BOTH lists, so
+   * this is the single place the restore UI reads from; the client never filters
+   * runs itself, which keeps one source of truth.
+   */
+  removedRuns?: BoardRemovedRun[]
+}
+
+/** A8: the lightweight shape of a removed run, as the snapshot carries it. */
+export interface BoardRemovedRun {
+  id: string
+  title: string
+  status: string
+  createdAt: number
 }
 
 export interface BoardActionBody {
@@ -97,6 +117,10 @@ export interface BoardActionBody {
   runId?: string
   taskId?: string
   table?: unknown
+  /** A8: rename-run. */
+  title?: string
+  /** A8: set-run-board-state — the three board presentations. */
+  state?: BoardRunState
 }
 
 type Listener = (board: Board | null, error: string | null) => void

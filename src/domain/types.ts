@@ -168,7 +168,20 @@ export interface Run {
   pauseReason?: string
   /** Live counters folded from task events. */
   stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number; reviewsUnavailable: number }
+  /**
+   * A8 board state: how the board presents this run. Absent means `visible`
+   * (legacy runs included, so nothing needs migrating). `removed` is the
+   * recoverable recycle bin — the restore list reads exactly these; `purged` is
+   * hidden from the board AND the removed list. Neither deletes anything: no
+   * files, no storage, no events, no session data. One append-only
+   * `run/board-state` event sets it either way, and it is a pure VIEW flag —
+   * status, tasks, report, timing and scheduling never read it.
+   */
+  boardState?: RunBoardState
 }
+
+/** A8: how the board presents a run. Absent means `visible`. */
+export type RunBoardState = 'visible' | 'removed' | 'purged'
 
 /** One append-only event record (JSONL line). */
 export interface SwarmEventRecord {
@@ -190,6 +203,8 @@ export type SwarmEventKind =
   | 'run/paused'
   | 'run/resumed'
   | 'run/aborted'
+  | 'run/renamed'
+  | 'run/board-state'
   | 'task/started'
   | 'task/agent-started'
   | 'task/heartbeat'

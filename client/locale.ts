@@ -78,6 +78,19 @@ const en: Record<string, string> = {
   'run.failedBanner': '✖ Run failed — see the Failed/Blocked column. Fix the cause, then Resume to requeue failed tasks (completed tasks are kept).',
   'run.report': 'Run report — {count} tasks in {seconds}s · {fallbacks} fallback{plural} · {retries} · {passed}/{total} reviews passed',
   'run.reviewExhausted': 'review loop exhausted',
+  // A8: soft run management on the board. "Remove" only hides — nothing is deleted.
+  'run.menu': 'Run actions',
+  'run.rename': 'Rename',
+  'run.remove': 'Remove from board',
+  'run.confirmRemove': 'Confirm remove',
+  'run.removeHint': 'Hides it from the board — nothing is deleted, and you can restore it any time',
+  'run.renamePlaceholder': 'Run title',
+  'run.restore': 'Restore',
+  'run.removedCount': 'removed ({count})',
+  // A8: permanent means hidden from the board AND the removed list — still no delete.
+  'run.purge': 'Delete permanently',
+  'run.confirmPurge': 'Confirm permanent delete',
+  'run.purgeHint': 'Only hides it from the board and the removed list — files and history are kept',
 
   'col.queued': 'Queued',
   'col.running': 'Running',
@@ -281,6 +294,19 @@ const zh: Record<string, string> = {
   'run.failedBanner': '✖ 运行失败——见“失败 / 阻塞”列。修复原因后点“恢复”重新排队失败任务（已完成任务保留）。',
   'run.report': '运行报告 — {count} 个任务，用时 {seconds} 秒 · 回退 {fallbacks} 次 · 重试 {retries} 次 · 评审通过 {passed}/{total}',
   'run.reviewExhausted': '评审循环已用尽',
+  // A8：看板上的软性运行管理。“移除”只是隐藏，不会删除任何内容。
+  'run.menu': '运行操作',
+  'run.rename': '重命名',
+  'run.remove': '从看板中移除',
+  'run.confirmRemove': '确认移除',
+  'run.removeHint': '仅从看板隐藏——不会删除任何内容，可随时恢复',
+  'run.renamePlaceholder': '运行标题',
+  'run.restore': '恢复',
+  'run.removedCount': '已移除（{count}）',
+  // A8：永久 = 从看板与“已移除”列表一并隐藏，仍然不删除任何内容。
+  'run.purge': '永久删除',
+  'run.confirmPurge': '确认永久删除',
+  'run.purgeHint': '仅从看板与已移除列表隐藏——文件与历史仍保留',
 
   'col.queued': '排队',
   'col.running': '运行中',

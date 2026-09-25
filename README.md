@@ -62,7 +62,7 @@ This plugin takes the coordination seriously so you don't have to:
 - **Work outlives its agent.** Every task agent writes a small completion report as its final action. If the host restarts and kills an agent between finishing the work and being recorded, the dispatcher adopts the on-disk report instead of throwing the finished work away and re-running the task. A task can also never sit `dispatching` forever: `spawnTimeoutSeconds` arms a sliding no-progress window — it runs from creation, then every heartbeat re-arms it, so a working child is never killed for elapsed time while a child that never starts or goes silent is reclaimed (per-role override in the Roster).
 - **The right effort for the right model.** Before a child is spawned, the pinned reasoning effort is validated against the deployment's declared model capabilities: a model that cannot accept the level has the pin stripped, and the candidate chain is never filtered — the `UNSUPPORTED_REASONING_EFFORT` crash that killed 6 tasks in one run cannot happen. If a pin still reaches a model that refuses it, the child dies fast with no output, and the dispatcher retries the *same* model at the next rung of the effort ladder (`max` → `high` → … → no pin) before any model rotation — without spending the task's retry budget. Reviewer pins are validated the same way.
 
-> ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** with the default cap of 5 total agents. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` to 3 in the Runtime settings.
+> ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** unless your host has headroom for more - the global cap defaults to 100 in-process agents, which suits a large machine. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` in the Runtime settings.
 
 ### Reliability notes (v0.5.8 – v0.6.17)
 
@@ -202,8 +202,8 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
   require: dsh-swarm-orchestrator
   config:
     storageDir: !!js dshHomePath("storages/swarm")   # event log + duty table
-    maxConcurrent: 5            # simultaneous task agents per run
-    maxTotalConcurrentAgents: 8 # global cap across ALL runs (they share the budget)
+    maxConcurrent: 50           # simultaneous task agents per run
+    maxTotalConcurrentAgents: 100 # global cap across ALL runs (they share the budget)
     adaptiveConcurrency: true   # shrink on provider pain, recover on success
     spawnStaggerMs: 750         # pace launches within a wave
     nudgeAfterMinutes: 20       # board marker for long-silent tasks (0 = off)
@@ -228,8 +228,8 @@ All concurrency, hardening, and watchdog parameters are **tunable from the dashb
 
 | Parameter | Default | What it controls |
 |---|---|---|
-| Max concurrent agents | 5 | Simultaneously running task agents **per run** |
-| Global agent cap | 8 | Max agents across **all** runs — concurrent runs share this budget (3+2, not 5+5). Prevents heap-exhaustion crashes when running multiple swarms in parallel |
+| Max concurrent agents | 50 | Simultaneously running task agents **per run** |
+| Global agent cap | 100 | Max agents across **all** runs — concurrent runs share this budget (60+40, not 100+100). These agents run in-process and share the host Node heap: the high default suits a large machine, so lower it on a constrained one |
 | Spawn stagger (ms) | 750 | Delay between launches in one wave — softens simultaneous provider load |
 | Retry backoff base (ms) | 5000 | Failed tasks wait base × 2^attempt before retrying (5s → 10s → 20s) — prevents synchronized retry cascades when a provider outage kills all tasks at once |
 | Circuit breaker threshold | 3 | Failures within 30 seconds before pausing all retries (0 = off) — detects provider-wide outages |
@@ -240,7 +240,7 @@ All concurrency, hardening, and watchdog parameters are **tunable from the dashb
 
 Changes are **applied immediately** (no restart) and **persisted to `runtime.json`** in the swarm storage directory, overriding the profile's `cordis.patch.yml` values. They survive host restarts.
 
-> 💡 If you run multiple swarms from different workspaces in parallel, keep the global agent cap at 5 (default) and max 2 concurrent runs. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower the global cap to 3.
+> 💡 If you run multiple swarms from different workspaces in parallel, watch the global agent cap (default 100 in-process agents) and keep to max 2 concurrent runs. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower the global cap in the Runtime settings.
 
 ## Under the hood
 

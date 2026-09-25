@@ -154,6 +154,24 @@ export function registerSwarmRoutes(ctx: Context, service: SwarmService): (() =>
               sendJson(res, 200, { ok: true, action, runtime: saved })
               return
             }
+            // A8: board-only run management. Both are soft — one append-only event
+            // each, no storage or session touch — and both work on terminal runs.
+            // `set-run-board-state` carries all three states: `removed` is the
+            // recoverable recycle bin, `purged` hides the run from both lists.
+            case 'rename-run': {
+              if (runId === undefined) throw new Error('runId required')
+              const title = typeof body.title === 'string' ? body.title : ''
+              const saved = service.renameRun(runId, title)
+              sendJson(res, 200, { ok: true, action, runId, title: saved })
+              return
+            }
+            case 'set-run-board-state': {
+              if (runId === undefined) throw new Error('runId required')
+              const state = typeof body.state === 'string' ? body.state : ''
+              service.setRunBoardState(runId, state)
+              sendJson(res, 200, { ok: true, action, runId, state })
+              return
+            }
             default:
               sendJson(res, 400, { error: `unknown action ${JSON.stringify(action)}` })
               return

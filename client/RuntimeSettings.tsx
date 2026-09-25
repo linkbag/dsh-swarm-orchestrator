@@ -6,8 +6,8 @@ import { boardStore, type Board, type BoardRuntime } from './board-store'
 import { useT } from './locale'
 
 const FIELDS: Array<{ key: keyof BoardRuntime; labelKey: string; hintKey: string; min: number; max: number; step: number }> = [
-  { key: 'maxConcurrent', labelKey: 'rt.maxConcurrent.label', hintKey: 'rt.maxConcurrent.hint', min: 1, max: 32, step: 1 },
-  { key: 'maxTotalConcurrentAgents', labelKey: 'rt.maxTotalConcurrentAgents.label', hintKey: 'rt.maxTotalConcurrentAgents.hint', min: 1, max: 16, step: 1 },
+  { key: 'maxConcurrent', labelKey: 'rt.maxConcurrent.label', hintKey: 'rt.maxConcurrent.hint', min: 1, max: 64, step: 1 },
+  { key: 'maxTotalConcurrentAgents', labelKey: 'rt.maxTotalConcurrentAgents.label', hintKey: 'rt.maxTotalConcurrentAgents.hint', min: 1, max: 128, step: 1 },
   { key: 'spawnStaggerMs', labelKey: 'rt.spawnStaggerMs.label', hintKey: 'rt.spawnStaggerMs.hint', min: 0, max: 60000, step: 250 },
   { key: 'retryBackoffBaseMs', labelKey: 'rt.retryBackoffBaseMs.label', hintKey: 'rt.retryBackoffBaseMs.hint', min: 0, max: 120000, step: 1000 },
   { key: 'circuitBreakerThreshold', labelKey: 'rt.circuitBreakerThreshold.label', hintKey: 'rt.circuitBreakerThreshold.hint', min: 0, max: 10, step: 1 },

@@ -2,7 +2,7 @@ import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-export const PLUGIN_VERSION = '0.6.18'
+export const PLUGIN_VERSION = '0.6.20'
 
 function defaultStorageDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -38,14 +38,15 @@ export const Config = Schema.object({
   storageDir: Schema.string().default(defaultStorageDir()).description(
     'Directory for the swarm event log and duty table ($DSH_HOME/storages/swarm by default).',
   ),
-  maxConcurrent: Schema.number().default(5).min(1).max(32).description(
-    'Maximum simultaneously running task agents.',
+  maxConcurrent: Schema.number().default(50).min(1).max(64).description(
+    'Maximum simultaneously running task agents PER RUN (default 50).',
   ),
-  maxTotalConcurrentAgents: Schema.number().default(8).min(1).max(32).description(
-    'Global cap on concurrently running swarm agents across ALL runs (default 8). '
+  maxTotalConcurrentAgents: Schema.number().default(100).min(1).max(128).description(
+    'Global cap on concurrently running swarm agents across ALL runs (default 100). '
     + 'Swarm agents run IN-PROCESS on the DSH host, sharing its Node.js heap — '
-    + 'too many concurrent agents can exhaust memory and crash the host. '
-    + 'Two parallel runs SHARE this budget (e.g. cap=5 means 3+2 or 4+1, not 5+5).',
+    + 'the default is sized for a large host: LOWER IT on a constrained machine, '
+    + 'because too many concurrent agents can exhaust memory and crash the host. '
+    + 'Two parallel runs SHARE this budget (e.g. cap=100 means 60+40, not 100+100).',
   ),
   staleTimeoutSeconds: Schema.number().default(14400).min(60).description(
     'Heartbeat timeout in seconds before a running task with no progress is reclaimed.',

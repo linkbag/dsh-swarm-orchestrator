@@ -57,12 +57,12 @@
 - **失败是状态，不是谜语。** provider 超时、配额耗尽、证据缺失——每一类都会被识别、直白地报告，并各有各的处理：带续作提示的重试、整体暂停后一键恢复、反复失败后自动换模型。
 - **只看你所在的战场。** 每个聊天的 Swarm 标签页默认只显示该工作区的运行；一个常驻开关随时切到"全部运行"。
 - **一个目标一次运行，先审后建。** 向已有活跃运行的工作区再派发会收到警告（或按配置直接拦截）；默认情况下，架构师代理会先把派发方的计划审阅精炼成 PLAN.md，建造者才开始动工。
-- **内存安全的并发。** 蜂群代理运行在 DSH 宿主进程内，共享其 Node.js 堆内存。全局代理上限（`maxTotalConcurrentAgents`，默认 8）确保来自不同工作区的并发运行共享代理预算（3+2 而非 5+5）——防止过多代理同时运行导致堆内存耗尽、宿主崩溃。
+- **内存安全的并发。** 蜂群代理运行在 DSH 宿主进程内，共享其 Node.js 堆内存。全局代理上限（`maxTotalConcurrentAgents`，默认 100）确保来自不同工作区的并发运行共享代理预算（60+40 而非 100+100）——防止过多代理同时运行导致堆内存耗尽、宿主崩溃。
 - **成果比代理活得久。** 每个任务代理在最后一步写一份完成报告。如果宿主重启、代理在"干完活"与"被记录"之间被杀掉，调度器会采纳磁盘上的报告，而不是把已完成的成果丢掉重跑。任务也不会永远卡在 `dispatching`：`spawnTimeoutSeconds` 起的是一个滑动无进展窗口——从创建起计时，之后每次心跳都重新计时，干活的子代理绝不会因为耗时被杀，从未启动或陷入静默的才会被回收（名册里可按角色覆盖）。
 - **每个代理都在看板上。** 任务代理不能自己再派生子代理（`maxSubagentDepth`，默认 1）。没有这道限制时，代理可以派生调度器既看不见、也无法计量的助手——不计入全局上限、不受看门狗跟踪、不出现在看板上，却同样占用宿主的堆内存。实测：某个任务在后台派生了 12 个这样的隐藏助手，而看板上始终只显示一个任务。
 - **正确的模型配正确的思考等级。** 派发前会对照部署声明的模型能力校验锁定的思考等级：模型不支持的档位会被直接撤回，且候选链绝不因此过滤——曾一次杀死 6 个任务的 `UNSUPPORTED_REASONING_EFFORT` 崩溃不会再发生。若某个等级仍被模型拒绝（子代理瞬间死亡、零输出），调度器会按思考等级阶梯在**同一模型**上降档重试（`max` → `high` → …… → 不锁定），然后才轮换模型——不消耗任务的重试预算。评审代理的等级锁定同样先过校验。
 
-> ⚠️ **从不同工作区并行运行多个 swarm**：受支持且在全局上限内是安全的。但请注意，每个蜂群代理都是宿主上的一个进程内会话。我们建议**最多 2 个并发运行**，全局代理上限保持默认的 5。如果遇到 `ERR_CONNECTION_REFUSED`（宿主崩溃），请在 Runtime 设置中将 `maxTotalConcurrentAgents` 降到 3。
+> ⚠️ **从不同工作区并行运行多个 swarm**：受支持且在全局上限内是安全的。但请注意，每个蜂群代理都是宿主上的一个进程内会话。我们建议**最多 2 个并发运行**（除非宿主余量充足）；全局代理上限默认为 100 个进程内代理，适合配置较高的机器。如果遇到 `ERR_CONNECTION_REFUSED`（宿主崩溃），请在 Runtime 设置中调低 `maxTotalConcurrentAgents`。
 
 ### 可靠性说明（v0.5.8 – v0.6.19）
 
@@ -203,8 +203,8 @@ dsh plugin --profile web add dsh-swarm-orchestrator
   require: dsh-swarm-orchestrator
   config:
     storageDir: !!js dshHomePath("storages/swarm")   # 事件日志 + 分工表
-    maxConcurrent: 5            # 同时运行的任务代理数（每次运行）
-    maxTotalConcurrentAgents: 8 # 所有运行的总代理数上限（共享预算）
+    maxConcurrent: 50           # 同时运行的任务代理数（每次运行）
+    maxTotalConcurrentAgents: 100 # 所有运行的总代理数上限（共享预算）
     adaptiveConcurrency: true   # provider 吃紧时收缩，恢复后回升
     spawnStaggerMs: 750         # 同一波派发的启动间隔
     nudgeAfterMinutes: 20       # 长时间静默的任务在看板上打点（0 = 关闭）
@@ -229,8 +229,8 @@ dsh plugin --profile web add dsh-swarm-orchestrator
 
 | 参数 | 默认值 | 控制什么 |
 |---|---|---|
-| Max concurrent agents | 5 | **单个运行**内同时运行的任务代理数 |
-| Global agent cap | 8 | **所有运行**加起来的总代理上限——并发运行共享此预算（3+2 而非 5+5）。防止并行运行多个 swarm 时堆内存耗尽导致宿主崩溃 |
+| Max concurrent agents | 50 | **单个运行**内同时运行的任务代理数 |
+| Global agent cap | 100 | **所有运行**加起来的总代理上限——并发运行共享此预算（60+40 而非 100+100）。防止并行运行多个 swarm 时堆内存耗尽导致宿主崩溃 |
 | Spawn stagger (ms) | 750 | 同一波内启动间隔——减轻 provider 瞬时压力 |
 | Retry backoff base (ms) | 5000 | 失败任务按 base × 2^n 递增等待后重试（5s → 10s → 20s）——防止 provider 全局故障时所有任务同时重试的级联风暴 |
 | Circuit breaker threshold | 3 | 30 秒内多少次失败后暂停所有重试（0 = 关闭）——识别 provider 级故障 |
@@ -241,7 +241,7 @@ dsh plugin --profile web add dsh-swarm-orchestrator
 
 修改**立即生效**（无需重启）并**持久化到 `runtime.json`**（在 swarm 存储目录中），覆盖 profile `cordis.patch.yml` 中的同名值，重启后仍然有效。
 
-> 💡 如果从不同工作区并行运行多个 swarm，建议全局代理上限保持默认 5、最多 2 个并发运行。如果遇到 `ERR_CONNECTION_REFUSED`（宿主崩溃），请将全局上限降到 3。
+> 💡 如果从不同工作区并行运行多个 swarm，建议留意全局代理上限（默认为 100 个进程内代理）并保持最多 2 个并发运行。如果遇到 `ERR_CONNECTION_REFUSED`（宿主崩溃），请在 Runtime 设置中调低全局上限。
 
 ## 实现方式
 

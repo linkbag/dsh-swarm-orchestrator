@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { boardStore, type Board, type BoardTask } from './board-store'
+import { boardStore, type Board, type BoardRun, type BoardRunState, type BoardTask } from './board-store'
 import { DutyTableEditor } from './DutyTableEditor'
 import { FlowChart } from './FlowChart'
 import { RuntimeSettings } from './RuntimeSettings'
@@ -44,6 +44,18 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
   const [view, setView] = useState<'board' | 'flow' | 'roster'>('board')
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+
+  // A8: soft run management — a ⋯ menu per row (also on right-click), inline
+  // rename, a two-step Remove from board, and a stronger two-step Delete
+  // permanently. Every one of them travels the existing board action path as a
+  // single append-only event, so no new request or connection is involved.
+  const [menuRunId, setMenuRunId] = useState<string | null>(null)
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null)
+  // A separate confirm for the permanent action: arming Remove must never arm it.
+  const [confirmPurgeId, setConfirmPurgeId] = useState<string | null>(null)
+  const [renamingRunId, setRenamingRunId] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [showRemoved, setShowRemoved] = useState(false)
 
   // Workspace scoping (v0.4.0): default to this chat's workspace; "All" is one click away.
   const [scope, setScope] = useState<'workspace' | 'all'>(() =>
@@ -110,7 +122,7 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
     [board, run],
   )
 
-  const runAction = useCallback(async (body: { action: string; runId?: string; taskId?: string; verdict?: string }) => {
+  const runAction = useCallback(async (body: { action: string; runId?: string; taskId?: string; verdict?: string; title?: string; state?: BoardRunState }) => {
     setBusy(true)
     setActionError(null)
     try {
@@ -121,6 +133,46 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
       setBusy(false)
     }
   }, [])
+
+  // A8: close the row menu on any outside click. The menu itself stops
+  // propagation, so its own items — including the two-step confirms — never
+  // close it before they act.
+  useEffect(() => {
+    if (menuRunId === null) return
+    const close = (): void => { setMenuRunId(null); setConfirmRemoveId(null); setConfirmPurgeId(null) }
+    document.addEventListener('click', close)
+    return () => { document.removeEventListener('click', close) }
+  }, [menuRunId])
+
+  const startRename = useCallback((target: BoardRun) => {
+    setMenuRunId(null)
+    setConfirmRemoveId(null)
+    setConfirmPurgeId(null)
+    setRenamingRunId(target.id)
+    setRenameValue(target.title)
+  }, [])
+
+  const commitRename = useCallback(() => {
+    const id = renamingRunId
+    setRenamingRunId(null)
+    if (id === null) return
+    const title = renameValue.trim()
+    // An emptied field is a cancel rather than a failed request (the host rejects
+    // a blank title too, so there is nothing to send).
+    if (title.length === 0) return
+    void runAction({ action: 'rename-run', runId: id, title })
+  }, [renamingRunId, renameValue, runAction])
+
+  // One path for all three board states: `removed` (recoverable recycle bin),
+  // `visible` (restore) and `purged` (hidden from the board and the removed list).
+  // The host records a single append-only event, and deletes nothing on disk
+  // either way — the run stays in its view and in the log.
+  const setBoardState = useCallback((runId: string, state: BoardRunState) => {
+    setMenuRunId(null)
+    setConfirmRemoveId(null)
+    setConfirmPurgeId(null)
+    void runAction({ action: 'set-run-board-state', runId, state })
+  }, [runAction])
 
   return (
     <div className="dsh-swarm-tab">
@@ -177,17 +229,122 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
       ) : (
         <div className="dsh-swarm-body">
           <aside className="dsh-swarm-runs">
-            {runs.map((r) => (
-              <button
-                key={r.id}
-                className={run !== null && r.id === run.id ? 'dsh-swarm-run active' : 'dsh-swarm-run'}
-                onClick={() => { setSelectedRunId(r.id); setSelectedTask(null) }}
-              >
+            {(board?.removedRuns?.length ?? 0) > 0 && (
+              <div className="dsh-swarm-removed-head">
+                <button className="dsh-swarm-removed-toggle" onClick={() => { setShowRemoved(!showRemoved) }}>
+                  {t('run.removedCount', { count: board?.removedRuns?.length ?? 0 })}
+                </button>
+              </div>
+            )}
+            {showRemoved && (board?.removedRuns ?? []).map((r) => (
+              <div key={r.id} className="dsh-swarm-run removed">
                 <span className="dsh-swarm-run-dot" style={{ background: statusColor(r.status) }} />
                 <span className="dsh-swarm-run-title">{r.title}</span>
                 <span className="dsh-swarm-run-meta">{statusT(r.status)} · {timeAgo(r.createdAt, t)}</span>
-              </button>
+                <span className="dsh-swarm-run-removed-actions">
+                  <button className="dsh-swarm-btn ghost dsh-swarm-run-restore" onClick={() => { setBoardState(r.id, 'visible') }}>
+                    {t('run.restore')}
+                  </button>
+                  <button
+                    className={confirmPurgeId === r.id ? 'dsh-swarm-btn ghost dsh-swarm-run-purge confirm' : 'dsh-swarm-btn ghost dsh-swarm-run-purge'}
+                    title={t('run.purgeHint')}
+                    onClick={() => {
+                      // Same two-step as the menu, and the same stronger wording:
+                      // permanent is never one stray click from a recoverable list.
+                      if (confirmPurgeId !== r.id) { setConfirmPurgeId(r.id); return }
+                      setBoardState(r.id, 'purged')
+                    }}
+                  >{confirmPurgeId === r.id ? t('run.confirmPurge') : t('run.purge')}</button>
+                </span>
+              </div>
             ))}
+            {runs.map((r) => {
+              const selected = run !== null && r.id === run.id
+              const open = menuRunId === r.id
+              return (
+                <div
+                  key={r.id}
+                  role="button"
+                  tabIndex={0}
+                  className={selected ? 'dsh-swarm-run active' : 'dsh-swarm-run'}
+                  onClick={() => { setSelectedRunId(r.id); setSelectedTask(null) }}
+                  onKeyDown={(event) => {
+                    // Only the row itself: keys typed in the ⋯ button or the rename
+                    // input must not also select the run through bubbling.
+                    if (event.target !== event.currentTarget) return
+                    if (event.key !== 'Enter' && event.key !== ' ') return
+                    event.preventDefault()
+                    setSelectedRunId(r.id)
+                    setSelectedTask(null)
+                  }}
+                  onContextMenu={(event) => {
+                    event.preventDefault()
+                    setMenuRunId(r.id)
+                    setConfirmRemoveId(null)
+                    setConfirmPurgeId(null)
+                  }}
+                >
+                  <span className="dsh-swarm-run-dot" style={{ background: statusColor(r.status) }} />
+                  {renamingRunId === r.id ? (
+                    <input
+                      className="dsh-swarm-run-rename"
+                      value={renameValue}
+                      autoFocus
+                      placeholder={t('run.renamePlaceholder')}
+                      onClick={(event) => { event.stopPropagation() }}
+                      onChange={(event) => { setRenameValue(event.target.value) }}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter') { event.preventDefault(); commitRename() } else if (event.key === 'Escape') { event.preventDefault(); setRenamingRunId(null) }
+                      }}
+                      onBlur={() => { setRenamingRunId(null) }}
+                    />
+                  ) : (
+                    <span className="dsh-swarm-run-title">{r.title}</span>
+                  )}
+                  <span className="dsh-swarm-run-meta">{statusT(r.status)} · {timeAgo(r.createdAt, t)}</span>
+                  {renamingRunId !== r.id && (
+                    <button
+                      className="dsh-swarm-run-menu-btn"
+                      title={t('run.menu')}
+                      aria-label={t('run.menu')}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        setMenuRunId(open ? null : r.id)
+                        setConfirmRemoveId(null)
+                        setConfirmPurgeId(null)
+                      }}
+                    >⋯</button>
+                  )}
+                  {open && (
+                    <div className="dsh-swarm-run-menu" onClick={(event) => { event.stopPropagation() }}>
+                      <button className="dsh-swarm-run-menu-item" onClick={() => { startRename(r) }}>{t('run.rename')}</button>
+                      <button
+                        className="dsh-swarm-run-menu-item danger"
+                        title={t('run.removeHint')}
+                        onClick={() => {
+                          // Two-step confirm inside the menu: one stray click must
+                          // not clear a run off the board. Arming this must never
+                          // arm the permanent action below.
+                          if (confirmRemoveId !== r.id) { setConfirmRemoveId(r.id); setConfirmPurgeId(null); return }
+                          setBoardState(r.id, 'removed')
+                        }}
+                      >{confirmRemoveId === r.id ? t('run.confirmRemove') : t('run.remove')}</button>
+                      <button
+                        className={confirmPurgeId === r.id ? 'dsh-swarm-run-menu-item danger strong confirm' : 'dsh-swarm-run-menu-item danger strong'}
+                        onClick={() => {
+                          // A materially stronger confirm than Remove: its own state
+                          // (never armed by Remove), and its second step spells out
+                          // "permanent delete" in full.
+                          if (confirmPurgeId !== r.id) { setConfirmPurgeId(r.id); setConfirmRemoveId(null); return }
+                          setBoardState(r.id, 'purged')
+                        }}
+                      >{confirmPurgeId === r.id ? t('run.confirmPurge') : t('run.purge')}</button>
+                      <p className="dsh-swarm-run-menu-hint">{t('run.purgeHint')}</p>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
           </aside>
 
           {run !== null && (

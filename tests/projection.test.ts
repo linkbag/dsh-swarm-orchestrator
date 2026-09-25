@@ -161,6 +161,80 @@ describe('dag validation', () => {
     expect(good.valid).toBe(true)
   })
 
+  // A8: rename + soft-remove. Both are append-only events over a run that may
+  // already be terminal — the whole point is managing runs you are done with.
+  it('run/renamed relabels a terminal run and tolerates an unknown runId (A8)', () => {
+    const state = fold([
+      { seq: 1, at: 1, kind: 'run/created', runId: 'r', data: { title: 'before', spec: 's', tasks: [] } },
+      { seq: 2, at: 2, kind: 'run/completed', runId: 'r', data: {} },
+      { seq: 3, at: 3, kind: 'run/renamed', runId: 'r', data: { title: 'after' } },
+      { seq: 4, at: 4, kind: 'run/renamed', runId: 'ghost', data: { title: 'nope' } },
+      { seq: 5, at: 5, kind: 'run/renamed', runId: 'r', data: {} },
+    ], newState())
+    expect(state.runs.get('r')?.title).toBe('after')
+    // A rename must not resurrect or disturb the run's status.
+    expect(state.runs.get('r')?.status).toBe('completed')
+    // An unknown runId is tolerated (no throw, no phantom run), and an empty
+    // title in the event is ignored rather than blanking the label.
+    expect(state.runs.has('ghost')).toBe(false)
+  })
+
+  it('run/board-state is a view flag only, across all three states (A8)', () => {
+    const history = [
+      { seq: 1, at: 1, kind: 'run/created', runId: 'r', data: { title: 't', spec: 's', tasks: [{ id: 'a', subject: 'A', description: '', role: 'builder' }] } },
+      { seq: 2, at: 2, kind: 'run/endorsed', runId: 'r' },
+      { seq: 3, at: 3, kind: 'task/started', runId: 'r', taskId: 'a', data: { label: 'swarm:a' } },
+      { seq: 4, at: 4, kind: 'task/completed', runId: 'r', taskId: 'a', data: { summary: 'done' } },
+      { seq: 5, at: 5, kind: 'run/completed', runId: 'r', data: {} },
+    ]
+
+    // visible -> removed: the recycle bin, with status and work untouched.
+    const removed = fold([
+      ...history,
+      { seq: 6, at: 6, kind: 'run/board-state', runId: 'r', data: { state: 'removed' } },
+    ], newState())
+    expect(removed.runs.get('r')?.boardState).toBe('removed')
+    expect(removed.runs.get('r')?.status).toBe('completed')
+    expect(removed.tasks.get('r/a')?.status).toBe('completed')
+    expect(removed.tasks.get('r/a')?.summary).toBe('done')
+
+    // removed -> visible: restore is just another state, never a rewrite.
+    const restored = fold([
+      ...history,
+      { seq: 6, at: 6, kind: 'run/board-state', runId: 'r', data: { state: 'removed' } },
+      { seq: 7, at: 7, kind: 'run/board-state', runId: 'r', data: { state: 'visible' } },
+    ], newState())
+    expect(restored.runs.get('r')?.boardState).toBe('visible')
+    expect(restored.runs.get('r')?.status).toBe('completed')
+    expect(restored.tasks.get('r/a')?.summary).toBe('done')
+
+    // removed -> purged and visible -> purged: hidden, never deleted.
+    const purgedFromBin = fold([
+      ...history,
+      { seq: 6, at: 6, kind: 'run/board-state', runId: 'r', data: { state: 'removed' } },
+      { seq: 7, at: 7, kind: 'run/board-state', runId: 'r', data: { state: 'purged' } },
+    ], newState())
+    expect(purgedFromBin.runs.get('r')?.boardState).toBe('purged')
+    const purgedDirect = fold([
+      ...history,
+      { seq: 6, at: 6, kind: 'run/board-state', runId: 'r', data: { state: 'purged' } },
+    ], newState())
+    expect(purgedDirect.runs.get('r')?.boardState).toBe('purged')
+    expect(purgedDirect.runs.get('r')?.status).toBe('completed')
+    expect(purgedDirect.tasks.get('r/a')?.summary).toBe('done')
+
+    // An unrecognised state is ignored rather than corrupting the flag, and an
+    // unknown runId is tolerated (no throw, no phantom run).
+    const junk = fold([
+      ...history,
+      { seq: 6, at: 6, kind: 'run/board-state', runId: 'r', data: { state: 'nonsense' } },
+      { seq: 7, at: 7, kind: 'run/board-state', runId: 'ghost', data: { state: 'purged' } },
+      { seq: 8, at: 8, kind: 'run/board-state', runId: 'r', data: {} },
+    ], newState())
+    expect(junk.runs.get('r')?.boardState).toBeUndefined()
+    expect(junk.runs.has('ghost')).toBe(false)
+  })
+
   // J5 legality: adversarial replays must not produce illegal states.
   describe('event-log legality', () => {
     const base = [
@@ -211,6 +285,20 @@ describe('dag validation', () => {
       const resumed = fold([{ seq: 9, at: 9, kind: 'run/resumed', runId: 'r' }], state)
       expect(resumed.runs.get('r')?.status).toBe('running')
       expect(resumed.runs.get('r')?.pauseReason).toBeUndefined()
+    })
+
+    it('a board-state event cannot create a phantom run, and a bad state cannot stick (A8)', () => {
+      const state = fold([
+        ...base,
+        { seq: 4, at: 4, kind: 'run/board-state', runId: 'ghost', data: { state: 'purged' } },
+        { seq: 5, at: 5, kind: 'run/board-state', runId: 'r', data: { state: 'removed' } },
+        { seq: 6, at: 6, kind: 'run/board-state', runId: 'r', data: { state: 'not-a-state' } },
+      ], newState())
+      // No run is ever created by a state event, the valid state applies, and the
+      // invalid one leaves the last valid state plus the run's status untouched.
+      expect(state.runs.has('ghost')).toBe(false)
+      expect(state.runs.get('r')?.boardState).toBe('removed')
+      expect(state.runs.get('r')?.status).toBe('running')
     })
 
     it('heartbeats timestamp notes for stale-note ageing', () => {

@@ -384,6 +384,11 @@ function captureDispatchContext(parent: Agent | undefined): Partial<RunDispatchC
   return captured
 }
 
+/** A8: the longest run title the board accepts (a display label, not a document). */
+const MAX_RUN_TITLE = 120
+/** A8: how many removed runs a snapshot carries back for Restore (newest first). */
+const MAX_REMOVED_RUNS = 50
+
 /**
  * The host-side swarm service: duty table + JSONL event store + dispatcher.
  * State is folded from the event log on every change; the dispatcher launches
@@ -981,6 +986,37 @@ export class SwarmService extends Service {
   }
 
   /**
+   * A8: relabel a run on the board. One append-only event; nothing else is
+   * touched, and it deliberately works on a terminal run — the run you are done
+   * with is exactly the one you want to rename.
+   */
+  renameRun(runId: string, title: string): string {
+    if (this.view().runs.get(runId) === undefined) throw new Error(`unknown run ${runId}`)
+    const next = title.trim()
+    if (next.length === 0) throw new Error('title required')
+    if (next.length > MAX_RUN_TITLE) throw new Error(`title too long (max ${MAX_RUN_TITLE} characters)`)
+    this.events.append('run/renamed', { runId, data: { title: next } })
+    return next
+  }
+
+  /**
+   * A8: set how the board presents a run. `removed` is the recoverable recycle
+   * bin (what the restore list reads); `purged` hides the run from the board AND
+   * that list. Nothing is deleted either way — no files, no storage, no
+   * event-log entries, no session data — and the run stays in `view()`, so
+   * scheduling, recovery and history are untouched. Deliberately unrestricted by
+   * run status, so a stuck or noisy run can be cleared out of the way without
+   * aborting it.
+   */
+  setRunBoardState(runId: string, state: string): void {
+    if (state !== 'visible' && state !== 'removed' && state !== 'purged') {
+      throw new Error(`state must be visible, removed or purged (got ${JSON.stringify(state)})`)
+    }
+    if (this.view().runs.get(runId) === undefined) throw new Error(`unknown run ${runId}`)
+    this.events.append('run/board-state', { runId, data: { state } })
+  }
+
+  /**
    * J10 durable handoff: adopt a completed task report that survived a child death.
    *
    * A host restart can kill a child between finishing its work and the dispatcher
@@ -1280,6 +1316,26 @@ export class SwarmService extends Service {
         }
       }
     }
+    // A8: the board state is a VIEW concern. Hide removed AND purged runs, and
+    // their tasks with them, so nothing is orphaned in the task columns; this
+    // single filter is what the board, the badge and `swarm_status` all read, so
+    // none of them can disagree. The unfiltered state stays reachable through
+    // view(), which is where every scheduling decision reads it from — so hiding
+    // a run can never affect dispatch, recovery or its history.
+    const visibleRuns = new Map(
+      [...effective.runs].filter(([, r]) => r.boardState !== 'removed' && r.boardState !== 'purged'),
+    )
+    const visible = {
+      runs: visibleRuns,
+      tasks: new Map([...effective.tasks].filter(([, task]) => visibleRuns.has(task.runId))),
+    }
+    // The recycle bin: `removed` only. A `purged` run is deliberately absent from
+    // this list too — out of sight everywhere, yet still in the log and in view().
+    const removedRuns = [...effective.runs.values()]
+      .filter((r) => r.boardState === 'removed')
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, MAX_REMOVED_RUNS)
+      .map((r) => ({ id: r.id, title: r.title, status: r.status, createdAt: r.createdAt }))
     const effectiveRuntime = {
       maxConcurrent: this.rt('maxConcurrent'),
       maxTotalConcurrentAgents: this.rt('maxTotalConcurrentAgents'),
@@ -1291,7 +1347,7 @@ export class SwarmService extends Service {
       staleTimeoutSeconds: this.rt('staleTimeoutSeconds'),
       spawnTimeoutSeconds: this.rt('spawnTimeoutSeconds'),
     }
-    return buildBoardSnapshot(effective, this.duty.get(), this.events.seq, PLUGIN_VERSION, { cwd: scopeCwd, unresolvable: scopeUnresolvable }, effectiveRuntime)
+    return buildBoardSnapshot(visible, this.duty.get(), this.events.seq, PLUGIN_VERSION, { cwd: scopeCwd, unresolvable: scopeUnresolvable }, effectiveRuntime, removedRuns)
   }
 
   statusText(runId?: string): string {

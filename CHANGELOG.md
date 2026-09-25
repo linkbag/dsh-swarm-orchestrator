@@ -2,6 +2,39 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.20
+
+**Run curation in the board, and higher concurrency defaults.**
+
+### Added
+
+- **Rename, remove and permanently remove runs from the board.** Each run row in
+  the sidebar has a `...` menu (right-click opens it too): **Rename** edits the
+  title inline; **Remove from board** moves the run to a small "removed (N)" list
+  where it can be **Restored**; **Delete permanently** hides it from the Swarm UI
+  entirely - neither list shows it again. All three are VIEW STATE ONLY: no file,
+  event, storage or session data is ever deleted, removal works on a running run
+  without touching its status, and the log stays append-only (`run/board-state`).
+  The board, the badge and `swarm_status` all read the same filtered snapshot, so
+  they cannot disagree about what exists.
+
+### Changed
+
+- **Defaults raised: `maxConcurrent` 5 -> 50 per run, `maxTotalConcurrentAgents`
+  8 -> 100 globally.** Swarm agents are in-process on the DSH host and share its
+  Node heap, so the higher global default suits a large machine - lower it in the
+  Runtime settings on a constrained one. Note for existing deployments: a profile
+  that pins `maxConcurrent` in `cordis.patch.yml` keeps that value, while the
+  global cap (usually unpinned) moves to the new default on the next restart.
+- **The dashboard's Global agent cap input was capped at 16** - below even the old
+  schema ceiling of 32, so larger values could not be entered from the UI at all.
+  It now matches the schema (128, with `maxConcurrent` at 64).
+
+### Tests
+
+- Suite: **178 tests, 178 pass, 15/15 files** (config default pins updated; the
+  run-curation work adds A8 coverage).
+
 ## 0.6.19
 
 **The status pill is a run tracker again; human-waiting attention comes from the notification.**

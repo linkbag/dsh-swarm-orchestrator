@@ -52,9 +52,10 @@
   gap: 4px;
 }
 .dsh-swarm-run {
+  position: relative;
   display: grid;
-  grid-template-columns: auto 1fr;
-  grid-template-areas: "dot title" "dot meta";
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "dot title menu" "dot meta menu";
   column-gap: 8px;
   align-items: center;
   text-align: left;
@@ -71,6 +72,97 @@
 .dsh-swarm-run-dot { width: 9px; height: 9px; border-radius: 50%; grid-area: dot; }
 .dsh-swarm-run-title { grid-area: title; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsh-swarm-run-meta { grid-area: meta; font-size: 11px; opacity: 0.65; }
+
+/* ── A8 soft run management: ⋯ menu, inline rename, removed list ───────── */
+/* The ⋯ stays out of the way until the row is hovered, focused or selected. */
+.dsh-swarm-run-menu-btn {
+  grid-area: menu;
+  background: transparent;
+  border: 0;
+  padding: 2px 4px;
+  border-radius: 6px;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+.dsh-swarm-run:hover .dsh-swarm-run-menu-btn,
+.dsh-swarm-run:focus-within .dsh-swarm-run-menu-btn,
+.dsh-swarm-run.active .dsh-swarm-run-menu-btn { opacity: 0.7; }
+.dsh-swarm-run-menu-btn:hover { opacity: 1; background: rgba(125, 125, 125, 0.18); }
+.dsh-swarm-run-menu {
+  position: absolute;
+  top: 100%;
+  right: 6px;
+  z-index: 5;
+  min-width: 160px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(125, 125, 125, 0.35);
+  border-radius: 8px;
+  background: var(--dsh-swarm-menu-bg, rgb(32, 33, 36));
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+}
+.dsh-swarm-run-menu-item {
+  text-align: left;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.dsh-swarm-run-menu-item:hover { background: rgba(125, 125, 125, 0.18); }
+.dsh-swarm-run-menu-item.danger { color: var(--dsh-swarm-warn, rgb(219, 88, 96)); }
+/* Remove vs Delete permanently: the permanent item reads heavier even before it is
+   armed, and its armed step fills with the warning colour. */
+.dsh-swarm-run-menu-item.strong { font-weight: 600; }
+.dsh-swarm-run-menu-item.strong.confirm {
+  background: var(--dsh-swarm-warn, rgb(219, 88, 96));
+  color: #fff;
+}
+.dsh-swarm-run-menu-item.strong.confirm:hover { background: var(--dsh-swarm-warn, rgb(219, 88, 96)); }
+.dsh-swarm-run-menu-hint { margin: 4px 6px 2px; font-size: 10px; line-height: 1.35; opacity: 0.6; }
+.dsh-swarm-run-rename {
+  grid-area: title;
+  width: 100%;
+  padding: 2px 4px;
+  border: 1px solid rgba(56, 139, 253, 0.6);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+}
+.dsh-swarm-run.removed { opacity: 0.55; cursor: default; }
+/* Two actions share the menu column in a removed row: wrap them side by side. */
+.dsh-swarm-run-removed-actions { grid-area: menu; display: flex; gap: 4px; align-items: center; }
+.dsh-swarm-run-removed-actions .dsh-swarm-btn { grid-area: auto; font-size: 11px; padding: 2px 6px; }
+/* Delete permanently from the removed list: warning colour, filled once armed.
+   The extra class keeps it ahead of the later `.dsh-swarm-btn.ghost` rules. */
+.dsh-swarm-run .dsh-swarm-run-purge { color: var(--dsh-swarm-warn, rgb(219, 88, 96)); }
+.dsh-swarm-run .dsh-swarm-run-purge.confirm {
+  background: var(--dsh-swarm-warn, rgb(219, 88, 96));
+  border-color: transparent;
+  color: #fff;
+}
+.dsh-swarm-removed-head { display: flex; justify-content: flex-end; padding: 0 4px 2px; }
+.dsh-swarm-removed-toggle {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0.6;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.dsh-swarm-removed-toggle:hover { opacity: 1; text-decoration: underline; }
 
 /* ── main run view ────────────────────────────────────── */
 .dsh-swarm-main { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }

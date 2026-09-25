@@ -18,6 +18,21 @@ export interface BoardSnapshot {
   runtime?: RuntimeOverrides & Record<string, number>
   /** P6: rolling success-rate telemetry. */
   telemetry?: { completed: number; failed: number; successRate: number }
+  /**
+   * A8: runs the operator removed from the board (`boardState: 'removed'`),
+   * newest first — the recycle bin, and the only place the restore UI reads from.
+   * Present only when there are any. Permanently hidden runs (`purged`) appear
+   * here in neither list.
+   */
+  removedRuns?: RemovedRun[]
+}
+
+/** A8: a run in the recoverable removed list, carried so the board can offer Restore. */
+export interface RemovedRun {
+  id: string
+  title: string
+  status: Run['status']
+  createdAt: number
 }
 
 const MAX_RUNS = 50
@@ -29,6 +44,7 @@ export function buildBoardSnapshot(
   version: string,
   scope?: { cwd?: string; unresolvable?: boolean },
   runtime?: RuntimeOverrides & Record<string, number>,
+  removedRuns?: readonly RemovedRun[],
 ): BoardSnapshot {
   const runs = [...state.runs.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_RUNS)
   const runIds = new Set(runs.map((run) => run.id))
@@ -49,6 +65,7 @@ export function buildBoardSnapshot(
     ...(scope !== undefined && (scope.cwd !== undefined || scope.unresolvable === true) ? { scope } : {}),
     ...(runtime !== undefined ? { runtime } : {}),
     ...(telemetry !== undefined ? { telemetry } : {}),
+    ...(removedRuns !== undefined && removedRuns.length > 0 ? { removedRuns: [...removedRuns] } : {}),
     at: Date.now(),
   }
 }

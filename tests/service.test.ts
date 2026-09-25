@@ -2787,3 +2787,148 @@ describe('B2: human-attention notification to the dispatching session', () => {
     expect(attention(followupTexts).length).toBe(0)
   }, 30000)
 })
+
+describe('A8: board run management — rename + the three board states', () => {
+  /** A finished run with one completed task, seeded straight through the event log. */
+  const seedTerminalRun = (service: SwarmService, runId: string, title: string): void => {
+    service.events.append('run/created', {
+      runId,
+      data: { title, spec: 's', tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }] },
+    })
+    service.events.append('run/endorsed', { runId })
+    service.events.append('task/started', { runId, taskId: 'a', data: { label: 'swarm:a' } })
+    service.events.append('task/completed', { runId, taskId: 'a', data: { summary: 'done' } })
+    service.events.append('run/completed', { runId, data: {} })
+  }
+
+  it('renames a finished run, trims it, and rejects a blank or over-long title', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    seedTerminalRun(service, 'run-r1', 'original')
+
+    expect(service.renameRun('run-r1', '  Renamed run  ')).toBe('Renamed run')
+    expect(service.snapshot().runs.find((r) => r.id === 'run-r1')?.title).toBe('Renamed run')
+    expect(service.events.all().some((e) => e.kind === 'run/renamed' && e.runId === 'run-r1')).toBe(true)
+
+    expect(() => service.renameRun('run-r1', '   ')).toThrow(/title required/)
+    expect(() => service.renameRun('run-r1', 'x'.repeat(121))).toThrow(/too long/)
+    expect(service.renameRun('run-r1', 'x'.repeat(120))).toBe('x'.repeat(120))
+    expect(() => service.renameRun('run-ghost', 'nope')).toThrow(/unknown run/)
+  })
+
+  it('removes a run and its tasks from the board, keeps every event, and lists it for restore', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    seedTerminalRun(service, 'run-keep', 'stays')
+    seedTerminalRun(service, 'run-gone', 'goes')
+    const eventsBefore = service.events.all().length
+
+    service.setRunBoardState('run-gone', 'removed')
+
+    const snap = service.snapshot()
+    expect(snap.runs.map((r) => r.id)).toEqual(['run-keep'])
+    // Nothing is orphaned: the removed run's tasks leave the columns with it.
+    expect(snap.tasks.every((task) => task.runId === 'run-keep')).toBe(true)
+    // The recycle bin is the only place it still appears.
+    expect(snap.removedRuns?.map((r) => r.id)).toEqual(['run-gone'])
+    expect(snap.removedRuns?.[0]?.title).toBe('goes')
+    // `swarm_status` reads this same snapshot, so it cannot disagree with the board.
+
+    // Soft means soft: the log only GREW, and history is intact.
+    const after = service.events.all()
+    expect(after.length).toBe(eventsBefore + 1)
+    expect(after.filter((e) => e.kind === 'run/created').map((e) => e.runId)).toContain('run-gone')
+  })
+
+  it('restores a removed run unchanged — same status, same task summary', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    seedTerminalRun(service, 'run-back', 'returns')
+
+    service.setRunBoardState('run-back', 'removed')
+    expect(service.snapshot().runs).toHaveLength(0)
+    expect(() => service.setRunBoardState('run-ghost', 'removed')).toThrow(/unknown run/)
+
+    service.setRunBoardState('run-back', 'visible')
+    const snap = service.snapshot()
+    const restored = snap.runs.find((r) => r.id === 'run-back')
+    expect(restored?.title).toBe('returns')
+    expect(restored?.status).toBe('completed')
+    expect(snap.tasks.find((task) => task.runId === 'run-back' && task.id === 'a')?.summary).toBe('done')
+    // Nothing left to restore, so the list is gone from the payload entirely.
+    expect(snap.removedRuns).toBeUndefined()
+  })
+
+  it('hides a RUNNING run without aborting it or changing its status', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    service.events.append('run/created', {
+      runId: 'run-live',
+      data: { title: 'live', spec: 's', tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }] },
+    })
+    service.events.append('run/endorsed', { runId: 'run-live' })
+
+    service.setRunBoardState('run-live', 'removed')
+    expect(service.snapshot().runs).toHaveLength(0)
+
+    service.setRunBoardState('run-live', 'visible')
+    // The board state is a view concern: scheduling state is untouched, so
+    // clearing a noisy run off the board can never abort work in flight.
+    expect(service.snapshot().runs.find((r) => r.id === 'run-live')?.status).toBe('running')
+  })
+
+  it('purges a run out of BOTH lists while deleting nothing (the soft-only proof)', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    seedTerminalRun(service, 'run-bin', 'in the bin')
+    seedTerminalRun(service, 'run-puff', 'gone for good')
+    service.setRunBoardState('run-bin', 'removed')
+    const eventsBefore = service.events.all().length
+
+    // removed -> purged. (visible -> purged is the same single event path; the
+    // projection test folds both chains.)
+    service.setRunBoardState('run-puff', 'purged')
+
+    const snap = service.snapshot()
+    // Out of sight everywhere: not on the board, and not in the recycle bin.
+    expect(snap.runs.map((r) => r.id)).toEqual([])
+    expect(snap.removedRuns?.map((r) => r.id)).toEqual(['run-bin'])
+    // Nor are its tasks orphaned anywhere.
+    expect(snap.tasks).toHaveLength(0)
+
+    // Soft only: the log grew by exactly one event, and it is still folded in
+    // the unfolded view with its status, tasks and history intact.
+    const after = service.events.all()
+    expect(after.length).toBe(eventsBefore + 1)
+    expect(after[after.length - 1]?.kind).toBe('run/board-state')
+    expect(after[after.length - 1]?.data?.state).toBe('purged')
+    const unfolded = (service as unknown as {
+      view(): { runs: Map<string, { boardState?: string; status: string }>; tasks: Map<string, { summary?: string }> }
+    }).view()
+    expect(unfolded.runs.get('run-puff')?.boardState).toBe('purged')
+    expect(unfolded.runs.get('run-puff')?.status).toBe('completed')
+    expect(unfolded.tasks.get('run-puff/a')?.summary).toBe('done')
+    // Not even purging destroys anything: the run can be brought back.
+    service.setRunBoardState('run-puff', 'visible')
+    expect(service.snapshot().runs.map((r) => r.id)).toEqual(['run-puff'])
+  })
+
+  it('rejects an invalid state string and an unknown run without writing an event', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+    seedTerminalRun(service, 'run-r1', 'r1')
+
+    expect(() => service.setRunBoardState('run-r1', 'deleted')).toThrow(/state must be visible, removed or purged/)
+    expect(() => service.setRunBoardState('run-r1', '')).toThrow(/state must be visible, removed or purged/)
+    expect(() => service.setRunBoardState('run-r1', 'REMOVED')).toThrow(/state must be visible, removed or purged/)
+    expect(() => service.setRunBoardState('run-ghost', 'purged')).toThrow(/unknown run/)
+    // A rejected call must not have appended anything.
+    expect(service.events.all().some((e) => e.kind === 'run/board-state')).toBe(false)
+  })
+})
