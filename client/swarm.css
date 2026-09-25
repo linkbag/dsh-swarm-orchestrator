@@ -128,6 +128,26 @@
 }
 .dsh-swarm-run-menu-item.strong.confirm:hover { background: var(--dsh-swarm-warn, rgb(219, 88, 96)); }
 .dsh-swarm-run-menu-hint { margin: 4px 6px 2px; font-size: 10px; line-height: 1.35; opacity: 0.6; }
+
+/* B1: the running host predates this bundle, so run curation is inert — visibly so,
+   with the reason in the tooltip, instead of clicking into a rejection. */
+.dsh-swarm-run-notice {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--dsh-swarm-warn, rgb(219, 88, 96));
+  background: rgba(219, 88, 96, 0.1);
+  border: 1px solid rgba(219, 88, 96, 0.35);
+}
+.dsh-swarm-run-menu-btn:disabled,
+.dsh-swarm-run:hover .dsh-swarm-run-menu-btn:disabled,
+.dsh-swarm-run:focus-within .dsh-swarm-run-menu-btn:disabled,
+.dsh-swarm-run.active .dsh-swarm-run-menu-btn:disabled { opacity: 0.25; cursor: not-allowed; }
+.dsh-swarm-run-menu-item:disabled,
+.dsh-swarm-run-restore:disabled,
+.dsh-swarm-run-purge:disabled { opacity: 0.45; cursor: not-allowed; }
 .dsh-swarm-run-rename {
   grid-area: title;
   width: 100%;

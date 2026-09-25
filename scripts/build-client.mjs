@@ -3,18 +3,23 @@
 // module system expects (same convention as the dsh-client-* packages and
 // dsh-swarm). Externals resolve through the loader's injected require table.
 import { build } from 'esbuild';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outfile = join(root, 'lib', 'client.js');
+const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 
 const result = await build({
   entryPoints: [join(root, 'client', 'index.ts')],
   bundle: true,
   format: 'cjs',
   platform: 'browser',
+  // The browser half is re-read from disk on every page load while the host only
+  // reloads at boot, so the bundle must know which release it came from to detect
+  // a host older than itself (client/version.ts).
+  define: { __CLIENT_VERSION__: JSON.stringify(pkg.version) },
   // Browser-half externals: provided by the client module system's require table.
   external: [
     'react',
@@ -49,4 +54,4 @@ ${factoryBody.split('\n').map((l) => '\t\t' + l).join('\n')}
 
 mkdirSync(dirname(outfile), { recursive: true });
 writeFileSync(outfile, wrapped);
-console.log('build:client ->', outfile, '(' + wrapped.length + ' bytes)');
+console.log('build:client ->', outfile, '(' + wrapped.length + ' bytes, v' + pkg.version + ')');

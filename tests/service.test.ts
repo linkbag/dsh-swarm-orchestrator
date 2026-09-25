@@ -2139,12 +2139,12 @@ describe('swarm service (integration, fake subagents)', () => {
 
     await waitFor(
       () => service.snapshot().tasks.find((t) => t.id === 'hand')?.status === 'completed',
-      8000,
+      30000,
       'task adopted from its on-disk report',
       () => 'tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, t.lastNote])),
     )
     expect(service.snapshot().tasks.find((t) => t.id === 'hand')?.summary).toMatch(/landed before the crash/)
-  }, 15000)
+  }, 60000)
 
   it('J10: a report that does not claim completion is NOT adopted', async () => {
     const { service, fake, dir } = await bootRunnable({ maxRetries: 0 })

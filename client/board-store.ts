@@ -87,6 +87,11 @@ export interface BoardRuntime {
 export interface Board {
   service: string
   version: string
+  /**
+   * B1: dashboard actions the host serves. Absent on hosts older than the guard,
+   * which is why client/version.ts falls back to version math and then fails open.
+   */
+  capabilities?: string[]
   seq: number
   runs: BoardRun[]
   tasks: BoardTask[]

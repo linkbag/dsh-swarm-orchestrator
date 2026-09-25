@@ -4,6 +4,7 @@ import { DutyTableEditor } from './DutyTableEditor'
 import { FlowChart } from './FlowChart'
 import { RuntimeSettings } from './RuntimeSettings'
 import { statusT, useT, t as translate } from './locale'
+import { isCurationAction, isHostStale, isUnknownActionError } from './version'
 
 type T = (key: string, vars?: Record<string, string | number>) => string
 
@@ -122,17 +123,38 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
     [board, run],
   )
 
+  // B1: is the RUNNING host older than this page? The browser re-reads this bundle
+  // from disk on every load while the host only reloads at boot, so after an upgrade
+  // the UI can offer actions the host never registered — observed as a bare
+  // `unknown action "…"` with nothing happening (the 0.6.20 menu against a 0.6.17
+  // host). Capabilities first, then version math, never disabled on a parse failure
+  // — see client/version.ts.
+  const hostVersion = board?.version ?? '?'
+  const hostStale = board !== null && isHostStale(board.version, board.capabilities)
+
   const runAction = useCallback(async (body: { action: string; runId?: string; taskId?: string; verdict?: string; title?: string; state?: BoardRunState }) => {
+    // Refuse the actions only a restarted host serves, so a stale host is never sent
+    // a request it must reject. Every other action exists on every host.
+    if (isCurationAction(body.action) && hostStale) {
+      setActionError(translate('run.actionUnknown', { version: boardStore().get()?.version ?? '?' }))
+      return
+    }
     setBusy(true)
     setActionError(null)
     try {
       await boardStore().action(body)
     } catch (err) {
-      setActionError(String(err instanceof Error ? err.message : err))
+      const message = String(err instanceof Error ? err.message : err)
+      // Last-resort net for any action a FUTURE release adds: a raw
+      // `unknown action "…"` means the host has not registered it, which calls for a
+      // restart rather than leaving the operator with an opaque string.
+      setActionError(isUnknownActionError(message)
+        ? translate('run.actionUnknown', { version: boardStore().get()?.version ?? '?' })
+        : message)
     } finally {
       setBusy(false)
     }
-  }, [])
+  }, [hostStale])
 
   // A8: close the row menu on any outside click. The menu itself stops
   // propagation, so its own items — including the two-step confirms — never
@@ -229,6 +251,11 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
       ) : (
         <div className="dsh-swarm-body">
           <aside className="dsh-swarm-runs">
+            {hostStale && (
+              <p className="dsh-swarm-run-notice" title={t('run.hostStaleTitle', { version: hostVersion })}>
+                {t('run.hostStaleNotice', { version: hostVersion })}
+              </p>
+            )}
             {(board?.removedRuns?.length ?? 0) > 0 && (
               <div className="dsh-swarm-removed-head">
                 <button className="dsh-swarm-removed-toggle" onClick={() => { setShowRemoved(!showRemoved) }}>
@@ -242,12 +269,13 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                 <span className="dsh-swarm-run-title">{r.title}</span>
                 <span className="dsh-swarm-run-meta">{statusT(r.status)} · {timeAgo(r.createdAt, t)}</span>
                 <span className="dsh-swarm-run-removed-actions">
-                  <button className="dsh-swarm-btn ghost dsh-swarm-run-restore" onClick={() => { setBoardState(r.id, 'visible') }}>
+                  <button className="dsh-swarm-btn ghost dsh-swarm-run-restore" disabled={hostStale} title={hostStale ? t('run.hostStaleTitle', { version: hostVersion }) : undefined} onClick={() => { setBoardState(r.id, 'visible') }}>
                     {t('run.restore')}
                   </button>
                   <button
                     className={confirmPurgeId === r.id ? 'dsh-swarm-btn ghost dsh-swarm-run-purge confirm' : 'dsh-swarm-btn ghost dsh-swarm-run-purge'}
-                    title={t('run.purgeHint')}
+                    disabled={hostStale}
+                    title={hostStale ? t('run.hostStaleTitle', { version: hostVersion }) : t('run.purgeHint')}
                     onClick={() => {
                       // Same two-step as the menu, and the same stronger wording:
                       // permanent is never one stray click from a recoverable list.
@@ -279,6 +307,8 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                   }}
                   onContextMenu={(event) => {
                     event.preventDefault()
+                    // A stale host cannot serve the menu's actions, so do not offer it.
+                    if (hostStale) return
                     setMenuRunId(r.id)
                     setConfirmRemoveId(null)
                     setConfirmPurgeId(null)
@@ -305,7 +335,8 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                   {renamingRunId !== r.id && (
                     <button
                       className="dsh-swarm-run-menu-btn"
-                      title={t('run.menu')}
+                      disabled={hostStale}
+                      title={hostStale ? t('run.hostStaleTitle', { version: hostVersion }) : t('run.menu')}
                       aria-label={t('run.menu')}
                       onClick={(event) => {
                         event.stopPropagation()

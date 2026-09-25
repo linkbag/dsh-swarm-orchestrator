@@ -91,6 +91,9 @@ const en: Record<string, string> = {
   'run.purge': 'Delete permanently',
   'run.confirmPurge': 'Confirm permanent delete',
   'run.purgeHint': 'Only hides it from the board and the removed list — files and history are kept',
+  'run.hostStaleNotice': 'Host v{version} — restart DSH to enable rename / remove',
+  'run.hostStaleTitle': 'Needs a restarted host (running v{version})',
+  'run.actionUnknown': 'Host v{version} does not serve this action yet — restart DSH',
 
   'col.queued': 'Queued',
   'col.running': 'Running',
@@ -307,6 +310,9 @@ const zh: Record<string, string> = {
   'run.purge': '永久删除',
   'run.confirmPurge': '确认永久删除',
   'run.purgeHint': '仅从看板与已移除列表隐藏——文件与历史仍保留',
+  'run.hostStaleNotice': '宿主 v{version} —— 重启 DSH 后即可重命名 / 移除',
+  'run.hostStaleTitle': '需重启宿主后可用（当前运行 v{version}）',
+  'run.actionUnknown': '宿主 v{version} 尚不支持此操作 —— 请重启 DSH',
 
   'col.queued': '排队',
   'col.running': '运行中',

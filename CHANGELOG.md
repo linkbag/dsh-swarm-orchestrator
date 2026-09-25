@@ -2,6 +2,42 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.21
+
+**A stale host is now visible instead of failing silently, and the intermittent test failure is fixed.**
+
+### Added
+
+- **Host/client version-skew guard.** The browser re-reads the plugin's client half
+  from disk on every page load, while the host loads its half into memory at boot -
+  so after an install a refreshed page can offer UI whose host routes do not exist
+  yet. Observed live: the 0.6.20 run menu against a 0.6.17 host, where Rename
+  returned `unknown action "rename-run"` and nothing happened. The client now knows
+  its own build version (injected at build time), the board snapshot advertises
+  `capabilities`, and when the host is too old for run curation the curation actions
+  are disabled with an explanatory tooltip plus a one-line notice naming the host
+  version and asking for a restart. The check fails OPEN - a missing or unparseable
+  host version never disables anything - and an action that still returns
+  `unknown action ...` is shown as the restart hint rather than the raw string.
+- **The snapshot now carries a capability list** (`BOARD_CAPABILITIES`), so future
+  action additions are self-describing instead of inferred from version math.
+
+### Fixed
+
+- **The intermittent suite failure is named and fixed.** `J10: a completed on-disk
+  task report is adopted instead of re-running the task` waited on an 8-second
+  wall-clock budget for a dispatcher path whose timers run late on a loaded machine:
+  it failed at ~8.03 s on a build-then-test sequence and passed when run quietly -
+  the flake seen twice during the 0.6.18/0.6.19 release runs. Budget is now 30 s
+  with a 60 s test timeout. Test-only change.
+
+### Tests
+
+- 9 new version-guard tests (older, equal, newer, `v`-prefixed, prerelease,
+  unparseable and missing host versions, capability precedence, unknown-action
+  predicate).
+- Suite: **187 tests, 187 pass, 16/16 files.**
+
 ## 0.6.20
 
 **Run curation in the board, and higher concurrency defaults.**

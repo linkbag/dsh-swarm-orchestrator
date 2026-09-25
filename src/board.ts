@@ -6,6 +6,8 @@ import type { RuntimeOverrides } from './domain/runtime-store.js'
 export interface BoardSnapshot {
   service: string
   version: string
+  /** B1: dashboard actions this host serves (see BOARD_CAPABILITIES). */
+  capabilities: readonly string[]
   seq: number
   runs: Run[]
   tasks: Task[]
@@ -35,6 +37,16 @@ export interface RemovedRun {
   createdAt: number
 }
 
+/**
+ * B1: dashboard actions this host serves, advertised in every snapshot so a NEWER
+ * client can detect an OLDER host without version math. The browser re-reads its
+ * bundle from disk on every page load while the host only reloads at boot, so after
+ * an upgrade the UI can otherwise offer actions the running host never registered —
+ * observed as a bare `unknown action "…"` with nothing happening. Add a capability
+ * here whenever a release adds a dashboard action.
+ */
+export const BOARD_CAPABILITIES: readonly string[] = ['run-curation']
+
 const MAX_RUNS = 50
 
 export function buildBoardSnapshot(
@@ -57,6 +69,7 @@ export function buildBoardSnapshot(
   return {
     service: 'dsh-swarm-orchestrator',
     version,
+    capabilities: [...BOARD_CAPABILITIES],
     seq,
     runs,
     tasks,
