@@ -47,9 +47,8 @@ protection is inactive until the new settings location is wired into
 
 ### Tests
 
-- 2 new prompt tests (the self-verification instructions, and a minimal report
-  still completing with a contract declared).
-- Suite: **189 tests, 189 pass, 16/16 files.**
+- 1 new prompt test (the self-verification instructions, including the report-section repeat). A second test for a minimal report with a contract declared was REMOVED in this release: it duplicated the existing J10 adoption test and proved wall-clock sensitive under a loaded suite (green in isolation in 45 ms, timed out at its 30 s budget in a full parallel run).
+- Suite: **188 tests, 188 pass, 16/16 files.**
 
 ## 0.6.21
 

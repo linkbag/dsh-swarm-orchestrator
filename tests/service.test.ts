@@ -2257,37 +2257,6 @@ describe('swarm service (integration, fake subagents)', () => {
     service.abort(result.runId)
   }, 15000)
 
-  it('J10: a minimal report still completes with an evidence contract declared (no new hard gate)', async () => {
-    // The prompt now asks for proof in the summary, but nothing parses it: a report
-    // carrying only taskId/status/summary must still be adopted, or the instruction
-    // would itself become a new way for a task to fail.
-    const { service, fake, dir } = await bootRunnable({ maxRetries: 0 })
-    fake.failOnce = true
-    fake.beforeFail = () => {
-      mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
-      writeFileSync(
-        join(dir, '.dsh-swarm', 'task-ev2.json'),
-        JSON.stringify({ taskId: 'ev2', status: 'completed', summary: 'work landed before the crash' }),
-      )
-    }
-
-    const result = service.dispatch({
-      title: 'minimal report with evidence',
-      spec: 's',
-      // The declared evidence is the durable report itself: it exists and is
-      // non-empty by the time the report is adopted, so the file row is satisfied and
-      // the only thing under test is that a three-field report still completes.
-      tasks: [{ id: 'ev2', subject: 'E2', description: 'd', role: 'builder', evidence: { files: ['.dsh-swarm/task-ev2.json'] } }],
-    }, makeDispatcher(dir) as never)
-    service.endorse(result.runId)
-
-    await waitFor(
-      () => service.snapshot().tasks.find((t) => t.id === 'ev2')?.status === 'completed',
-      30000,
-      'task adopted from its on-disk report',
-      () => 'tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, t.lastNote])),
-    )
-  }, 60000)
 
   // ── J11: swarm_report no longer requires the model to pass taskId ─────────
   it('J11: report() resolves the task from the authenticated agent when taskId is omitted', async () => {
