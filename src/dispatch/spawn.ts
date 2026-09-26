@@ -62,6 +62,17 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context:
           '## Evidence contract (the task is NOT done until ALL of this holds)',
           ...(context.evidence.files ?? []).map((f) => `- File exists and is non-empty: \`${f}\` (relative to the workspace)`),
           ...(context.evidence.commands ?? []).map((c) => `- Command exits 0: \`${c}\``),
+          // Observed live (w0-baseline-contracts, 2026-09-26): the agent reported done
+          // while its own declared command failed (`fatal: not a git repository`), and
+          // the path it asserted on held no `.git` at all. The brief already said the
+          // task is not done until the contract holds; what was missing was the demand
+          // to RUN the commands before claiming completion, and to report not-done
+          // instead of done when they fail.
+          '',
+          'Before you write your report, run every command above YOURSELF — after your final change, not earlier.',
+          'Never report the task done while any command above fails. If it fails and you cannot fix the cause, report **not done** and include the failure output: a false "done" blocks the whole run for a human.',
+          'Put the proof in your summary: for each command, the exact line you ran, its exit code, and the last ~10 lines of output — exit code plus a short tail, never a full log.',
+          'Write commands and checks that do not depend on where they run: prefer absolute paths, and do not assert on git topology, branch names or relative directories you have not just verified exist.',
         ]
       : []),
     ...(task.reviewFeedback !== undefined
@@ -93,6 +104,9 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context:
     '```',
     'Write it only when the work is genuinely done and verified — it is machine-checked and the',
     'dispatcher treats it as proof of completion. If you cannot finish, do not write it.',
+    ...(context.evidence !== undefined
+      ? ['Before writing it, run every command in your evidence contract and confirm each exits 0 — the dispatcher re-runs them, and one that fails stops the run for a human.']
+      : []),
     'This exists because a host restart can kill you between finishing the work and being recorded:',
     'the report is what preserves the finished work instead of discarding it.',
   ].join('\n')

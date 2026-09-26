@@ -3,7 +3,6 @@
 // the symptom is a bare `unknown action "…"` with nothing happening.
 import { describe, expect, it } from 'vitest'
 import {
-  CLIENT_VERSION,
   RUN_CURATION_CAPABILITY,
   RUN_CURATION_FLOOR,
   isCurationAction,
@@ -77,11 +76,9 @@ describe('version-skew guard (host older than the page)', () => {
     expect(isHostStale(snapshot.version, snapshot.capabilities)).toBe(false)
   })
 
-  it('the built bundle carries a real client version (0.0.0 only in the test host)', () => {
-    // esbuild's `define` replaces the symbol in lib/client.js; under vitest there is
-    // no define, so the fallback applies — the shape is what matters here, and the
-    // injected value is asserted against the built bundle in the release check.
-    expect(CLIENT_VERSION).toMatch(/^\d+\.\d+\.\d+/)
+  it('the guard is anchored to the release that introduced the actions', () => {
+    // The guard decides from this floor plus the advertised capability — never from
+    // the bundle's own version, which is why no build-time version define is needed.
     expect(RUN_CURATION_FLOOR).toBe('0.6.20')
   })
 })

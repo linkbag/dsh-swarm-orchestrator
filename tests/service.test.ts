@@ -2224,6 +2224,71 @@ describe('swarm service (integration, fake subagents)', () => {
     service.abort(result.runId)
   }, 15000)
 
+  it('J10/J2: the task prompt demands the agent verify its own evidence before claiming done', async () => {
+    const { service, fake, dir } = await bootRunnable()
+    const result = service.dispatch({
+      title: 'evidence self-verification',
+      spec: 's',
+      tasks: [{
+        id: 'ev1', subject: 'E', description: 'd', role: 'builder',
+        // Files-only contract: it renders the whole evidence section (what this test
+        // asserts on) without executing a command — a live evidence process would
+        // still hold the workspace when afterEach deletes it (Windows EPERM).
+        evidence: { files: ['README.md'] },
+      }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(() => fake.calls.length >= 1, 5000, 'spawn')
+    const prompt = fake.calls[0]?.prompt?.[0]?.text ?? ''
+    // Run the proof yourself, after the final change
+    expect(prompt).toMatch(/run every command above YOURSELF/)
+    // A failing command means NOT done, and the failure travels with the claim
+    expect(prompt).toMatch(/Never report the task done while any command above fails/)
+    expect(prompt).toContain('**not done**')
+    // The proof is part of the report: command line, exit code, bounded tail
+    expect(prompt).toMatch(/its exit code, and the last ~10 lines of output/)
+    expect(prompt).toMatch(/never a full log/)
+    // cwd-independent checks (the class that produced the false "done")
+    expect(prompt).toMatch(/prefer absolute paths/)
+    expect(prompt).toMatch(/do not assert on git topology/)
+    // ...and the report section repeats the demand at the point of writing
+    expect(prompt).toMatch(/Before writing it, run every command in your evidence contract/)
+    service.abort(result.runId)
+  }, 15000)
+
+  it('J10: a minimal report still completes with an evidence contract declared (no new hard gate)', async () => {
+    // The prompt now asks for proof in the summary, but nothing parses it: a report
+    // carrying only taskId/status/summary must still be adopted, or the instruction
+    // would itself become a new way for a task to fail.
+    const { service, fake, dir } = await bootRunnable({ maxRetries: 0 })
+    fake.failOnce = true
+    fake.beforeFail = () => {
+      mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
+      writeFileSync(
+        join(dir, '.dsh-swarm', 'task-ev2.json'),
+        JSON.stringify({ taskId: 'ev2', status: 'completed', summary: 'work landed before the crash' }),
+      )
+    }
+
+    const result = service.dispatch({
+      title: 'minimal report with evidence',
+      spec: 's',
+      // The declared evidence is the durable report itself: it exists and is
+      // non-empty by the time the report is adopted, so the file row is satisfied and
+      // the only thing under test is that a three-field report still completes.
+      tasks: [{ id: 'ev2', subject: 'E2', description: 'd', role: 'builder', evidence: { files: ['.dsh-swarm/task-ev2.json'] } }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+
+    await waitFor(
+      () => service.snapshot().tasks.find((t) => t.id === 'ev2')?.status === 'completed',
+      30000,
+      'task adopted from its on-disk report',
+      () => 'tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, t.lastNote])),
+    )
+  }, 60000)
+
   // ── J11: swarm_report no longer requires the model to pass taskId ─────────
   it('J11: report() resolves the task from the authenticated agent when taskId is omitted', async () => {
     const { service, fake, dir } = await bootRunnable()

@@ -2,6 +2,55 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.22
+
+**Task agents must prove their own work before claiming done, and the dead client-version plumbing is gone.**
+
+### Added
+
+- **Self-verification is now part of the task brief.** The prompt's evidence
+  contract tells the agent to run every declared command ITSELF after its final
+  change, never to report done while one fails, to report **not done** with the
+  failure output when it cannot fix the cause, and to put each command's exit code
+  and a short output tail in its report. It also warns against commands that depend
+  on where they run (absolute paths; never assert on git topology or relative
+  directories you have not just verified). Motivated by a live false "done":
+  `w0-baseline-contracts` reported complete while its own proof returned
+  `fatal: not a git repository` — the mirror it claimed to create did not exist.
+  Prompt text only: the report field is deliberately NOT a hard requirement, and a
+  test proves a minimal report still completes, so the instruction cannot itself
+  cause a failure.
+
+### Removed
+
+- **The dead `__CLIENT_VERSION__` plumbing** from 0.6.21 (the esbuild `define`, its
+  ambient declaration, and the unused export). The run-curation guard decides from
+  `RUN_CURATION_FLOOR` plus the advertised capability, never from the client's own
+  version - confirmed by the client bundle staying byte-identical in size.
+
+### Fixed
+
+- **The live preflight test no longer assumes `settings.yaml` exists.** DSH
+  0.1.7-rc.2 imports the deployment file (`settings.yaml.imported`) and keeps live
+  settings elsewhere, so the hard-coded absolute path failed red. It now resolves
+  the candidates and SKIPS with a message when none exists, rather than validating
+  an outdated copy.
+
+### Known issue (disclosed, not fixed here)
+
+Because the deployment settings file moved, the J21 effort preflight currently
+finds nothing and therefore validates nothing - a silent no-op, not a failure.
+The 2026-09-26 run is consistent with that being harmless today (a task ran on
+`xiaomi/mimo-v2.6-pro` with `effort=max` pinned and did real work), but the
+protection is inactive until the new settings location is wired into
+`effortSupport()`. Finding that location is its own piece of work.
+
+### Tests
+
+- 2 new prompt tests (the self-verification instructions, and a minimal report
+  still completing with a contract declared).
+- Suite: **189 tests, 189 pass, 16/16 files.**
+
 ## 0.6.21
 
 **A stale host is now visible instead of failing silently, and the intermittent test failure is fixed.**

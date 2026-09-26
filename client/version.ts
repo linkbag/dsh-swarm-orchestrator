@@ -16,9 +16,6 @@
 //
 // Pure and DOM-free so it can be unit-tested directly.
 
-/** The version this bundle was built from, injected by scripts/build-client.mjs. */
-export const CLIENT_VERSION: string = typeof __CLIENT_VERSION__ === 'string' ? __CLIENT_VERSION__ : '0.0.0'
-
 /** Capability a host advertises once it serves the run-curation actions. */
 export const RUN_CURATION_CAPABILITY = 'run-curation'
 

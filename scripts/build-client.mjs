@@ -16,10 +16,6 @@ const result = await build({
   bundle: true,
   format: 'cjs',
   platform: 'browser',
-  // The browser half is re-read from disk on every page load while the host only
-  // reloads at boot, so the bundle must know which release it came from to detect
-  // a host older than itself (client/version.ts).
-  define: { __CLIENT_VERSION__: JSON.stringify(pkg.version) },
   // Browser-half externals: provided by the client module system's require table.
   external: [
     'react',
