@@ -5,6 +5,7 @@ import { FlowChart } from './FlowChart'
 import { RuntimeSettings } from './RuntimeSettings'
 import { statusT, useT, t as translate } from './locale'
 import { isCurationAction, isHostStale, isUnknownActionError } from './version'
+import { formatWriteScope } from './write-scope'
 
 type T = (key: string, vars?: Record<string, string | number>) => string
 
@@ -523,22 +524,12 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                   <>
                     <dt>{t('field.writeScope')}</dt>
                     <dd>
-                      {selectedTask.writes.map((f, i) => {
-                        // The roster carries strings, but a config-authored scope can be an
-                        // object (e.g. {path, glob}) — show its path rather than
-                        // "[object Object]", and never throw on a malformed entry.
-                        const label = ((): string => {
-                          if (typeof f === 'string') return f
-                          if (f === null || typeof f !== 'object') return String(f)
-                          const o = f as Record<string, unknown>
-                          for (const key of ['path', 'glob', 'pattern', 'scope', 'file']) {
-                            const v = o[key]
-                            if (typeof v === 'string' && v.length > 0) return v
-                          }
-                          try { return JSON.stringify(f) } catch { return '[unprintable write scope]' }
-                        })()
-                        return <code key={i}>{label}</code>
-                      })}
+                      {formatWriteScope(selectedTask.writes).map((label, i) => (
+                        // Formatting lives in client/write-scope.ts (pure, unit-tested):
+                        // a config-authored scope can be an object, and a malformed
+                        // payload must never print "[object Object]" or throw.
+                        <code key={i}>{label}</code>
+                      ))}
                     </dd>
                   </>
                 )}

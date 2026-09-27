@@ -2,6 +2,50 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.26
+
+**Write-scope rendering is now pinned by tests - and a 0.6.25 claim is withdrawn as unproven.**
+
+### Added
+
+- **Write scope moved into a pure, DOM-free formatter** (`client/write-scope.ts`) with
+  12 tests, the same pattern that makes the badge testable. Coverage: arrays of
+  strings; objects resolving through `path`/`glob`/`pattern`/`scope`/`file` (`path`
+  winning when several are present); mixed arrays; a bare string; `undefined`/`null`;
+  a non-array, which previously threw; nested and circular objects (JSON fallback, no
+  throw); empty entries; and a blanket assertion that no supported shape can ever
+  produce `[object Object]`. Writing the tests found a real edge - `{path: ''}` fell
+  through to JSON instead of counting as empty - and the formatter was fixed rather
+  than the expectation.
+
+### Corrected
+
+- **0.6.25's retry fix is withdrawn as UNPROVEN (not as wrong).** Its changelog said a
+  one-line `scheduleTick()` makes a manual retry relaunch. Attempting to pin that with
+  a regression test showed the test **also passes with the line removed**: `pumpUntil`
+  calls `service.tick()` itself, and - decisively - with the fix removed a tick is
+  still scheduled on the retry / `run/resumed` path, so something else there already
+  schedules one. The line is idempotent and harmless and stays, but the 62-minute stall
+  in `run-mujadjk9-d7zr` may have had a different cause, and that needs re-diagnosis
+  before any fix can be claimed. The candidate test was removed rather than kept: a
+  test that pins nothing while adding subprocess load (it pushed J10 over its budget
+  under load) is strictly negative value.
+
+### Still open (disclosed)
+
+- **The acceptance/verdict race is not fixed.** An evidence recheck that finalizes
+  after a human acceptance can still flip the task back - observed live, where it
+  forced a second acceptance. The minimal fix remains mapped: record the accepted
+  attempt id on the human decision and drop a late verdict for that same attempt,
+  scoped per attempt so a later attempt's genuine failure is still honoured. It needs
+  an interleaving test that fails without the change.
+- The retry path needs re-diagnosis: establish what actually stopped the loop in that
+  run before claiming any remedy.
+
+### Tests
+
+- 12 new write-scope tests. Suite: **227 tests, 227 pass**, verified twice.
+
 ## 0.6.25
 
 **A manual retry relaunches, the ceiling timeout explains itself, and two small fixes.**
