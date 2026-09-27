@@ -2,6 +2,65 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.24
+
+**`/swarm` becomes a control surface, the test suite stops leaking temp dirs, and a dev smoke harness lands.**
+
+### Added
+
+- **`/swarm` now covers the human decisions.** The command already existed as the
+  one-shot `/swarm <goal>` dispatcher (architect then builder, auto-endorsed), and a
+  bare `/swarm` was previously a usage error. It now also answers: `/swarm` (status -
+  active runs, tasks waiting on a human with the reason, and the next actions
+  available), `/swarm status [runId]`, `/swarm endorse <runId>`, `/swarm retry
+  <taskId>` and `/swarm complete <taskId> [note]` - all reusing existing service
+  methods. `complete` lands on the session-gated path, so a refusal is reported as
+  guidance rather than routed around, and unrecognised text still parses as a goal,
+  so nothing regressed. 12 new tests.
+- **`scripts/mock-swarm-run.mjs`** - a dev-only smoke harness that boots the
+  INSTALLED package (not `src/`) and checks the recent hardening end to end: the
+  effort preflight's live source and pin handling, the evidence gate's single
+  recheck plus human block, dependent blocking, the self-verify prompt, soft-only run
+  curation, and the aggregated human-wait ping. 16/16 checks, repeatable. Not shipped
+  (`scripts/` is outside the npm `files` list).
+
+### Fixed
+
+- **The test suite no longer leaks temp directories.** A vitest global setup
+  snapshots pre-existing `swarm-service-*` / `swarm-settings-*` directories and
+  removes only those its own run creates - a full run now cleans up after itself
+  instead of adding to the pile. 1,711 stale directories older than two hours were
+  cleared from %TEMP%; newer ones were deliberately left alone in case the running
+  host owns them.
+- Tarball artifacts stop accumulating: `.gitignore` now covers
+  `dsh-swarm-orchestrator-*.tgz`, and the older ones were pruned (the newest kept).
+
+### Changed
+
+- **The 0.6.23 note about the J10 wall-clock waits is corrected again - accurately
+  this time.** The pump conversion did ship in 0.6.23 (`pumpUntil`, 2000 dispatcher
+  turns, one macrotask each, state dumped on exhaustion) and no 30 s wait remains in
+  the J10/J22 family: the 30,518 ms expiry that prompted the correction came from a
+  pre-pump tree state, not this one. Three loaded runs with a build between each are
+  green at 215/215 with a 0.69 s spread. Three 8 s waits remain elsewhere in the file
+  - J3 (which waits on a real child process and therefore cannot be pump-driven), J15
+  and J14 - and each already dumps task/run state on expiry.
+
+### Known limitation
+
+- **J21 is still a reporter, not a guard.** The catalog-backed check is designed but
+  not implemented: the adapter exposes exactly the needed knowledge as a package
+  export (`dsh-llm-pi-ai/lib/types/catalog.d.ts` -> `catalogModels`,
+  `PiAiReasoningEfforts`, "a level absent from the dict is not offered"), reachable
+  only by importing that peer. Until it is wired, this deployment - which declares no
+  `reasoningEfforts` maps at all - can strip nothing, so a genuinely unsupported
+  effort surfaces as a fast, loud task failure absorbed by the effort ladder rather
+  than being prevented up front.
+
+### Tests
+
+- Suite: **215 tests, 215 pass, 18/18 files**, three loaded runs (28.5-29.2 s).
+
 ## 0.6.23
 
 **The effort preflight reads live settings again - without guessing - and the J10 tests no longer race the clock.**
@@ -33,7 +92,7 @@ Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
   the existing private `service.tick()` (as the fault-matrix tests already do) with
   one macrotask per turn, so a loaded machine slows each turn instead of consuming
   the budget: the 8 s and 30 s wall-clock waits behind this project's intermittent
-  release-run failures are gone from that family. Microtask-only pumping was tried
+  release-run failures are reduced, NOT eliminated (CORRECTION: a 30 s `waitFor` budget remains on that path and did expire at 30518 ms in a loaded 59.3 s run - see the Correction note at the end of this entry). Microtask-only pumping was tried
   first and does not work (the launch path waits on a real timer) - recorded in the
   helper so nobody repeats it.
 
@@ -44,6 +103,22 @@ Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
   respawns the finished child` failed once at 88.3 s in an earlier session - the same
   wall-clock class, outside the J10/J22 family, green in all three final runs.
 
+### Correction
+
+An earlier revision of this note said "the 8 s and 30 s wall-clock waits ... are gone from
+that family"; a later one claimed a 30 s budget still remains on that path. The second
+claim is the wrong one, and it is corrected here rather than quietly rewritten. Verified
+against this tree: `tests/service.test.ts` contains NO 30 s wait, and the headline J10
+adoption test advances through `pumpUntil` - 2000 dispatcher turns, one macrotask each,
+dumping task state on exhaustion. The load-sensitive wall-clock component is genuinely
+gone from the J10/J22 family. The 30518 ms expiry that prompted the correction was real,
+but it belongs to the pre-pump tree state, not to this one.
+
+What does remain: three 8 s waits, none of them in the J10/J22 family - J3 (evidence
+commands under PowerShell), J15 (end-to-end misconfiguration) and J14 (delegation cap).
+J3 in particular cannot be pump-driven, because it waits on a real child process rather
+than a dispatcher transition. All three already dump task/run state on expiry, so a future
+timeout there is self-diagnosing rather than mysterious.
 ## 0.6.22
 
 **Task agents must prove their own work before claiming done, and the dead client-version plumbing is gone.**
