@@ -2,6 +2,45 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.30
+
+**The Flow layout fix that actually works - and a correction to 0.6.29's diagnosis.**
+
+### Corrected
+
+- **0.6.29 diagnosed the Flow collapse as a missing `flex-grow` and fixed it with a
+  flex rule. That was wrong, and the fix was inert.** `.dsh-swarm-body` is not a flex
+  row: it is a 3-column **grid** (`grid-template-columns: 230px 1fr auto`) sized for
+  the board's three children - runs list, main, drawer. The Flow arm supplies only TWO
+  children, so its `<main>` landed in the **230px track** (the squeezed canvas, whose
+  fit-to-pane observer then clamped the scale to its 0.3 floor) and the drawer landed
+  in the **1fr track**, stretching across the rest of the window. Grid ignores the
+  `flex` property, so 0.6.29 changed nothing.
+
+### Fixed
+
+- The Flow body overrides the columns for itself only:
+  `.dsh-swarm-body.dsh-swarm-flow-body { grid-template-columns: 1fr auto; }` - the
+  canvas takes the flexible column, the drawer its own `auto` track (still
+  `width: 320px`), and the board's layout is untouched.
+- The drawer's definition list could blow past its 320px box: its `1fr` column has a
+  min-content floor, and long unbreakable values (write-scope paths) forced the panel
+  wider than its `width`. It is now `auto minmax(0, 1fr)` with `overflow-wrap: anywhere`
+  on the values, so long paths wrap instead of stretching the panel.
+
+### Tests
+
+- The stylesheet test now pins what the fix actually depends on - the grid override
+  for the flow body (the old assertion pinned a `flex` rule that grid ignores) - plus
+  the drawer's fixed `width: 320px` as a second guard.
+- Suite: **252 tests, 252 pass** - this release adds no tests, it corrects what an
+  existing one pinned.
+
+### Known residual
+
+- unchanged: J10's turn-bounded pump can exhaust its 2000 turns under load; the only
+  red in recent verification batches.
+
 ## 0.6.29
 
 **Two Flow-view defects fixed: the drawer no longer crushes the canvas, and a run with no tasks can no longer render a blank tab.**

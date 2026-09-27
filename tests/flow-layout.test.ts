@@ -58,7 +58,8 @@ describe('the flow arm is a real column and never draws a blank canvas', () => {
     // above would still pass with the rule gone, and the canvas would silently collapse
     // again — so CSS a fix depends on is worth pinning by reading the file.
     const css = readFileSync(new URL('../client/swarm.css', import.meta.url), 'utf8')
-    expect(css).toMatch(/\.dsh-swarm-flow-main\s*\{[^}]*flex\s*:/)
+    expect(css).toMatch(/\.dsh-swarm-body\.dsh-swarm-flow-body\s*\{[^}]*grid-template-columns:\s*1fr auto/)
+    expect(css).toMatch(/\.dsh-swarm-drawer\s*\{[^}]*width:\s*320px/)
   })
 
   it('Flow with no tasks explains itself instead of drawing an empty canvas', () => {

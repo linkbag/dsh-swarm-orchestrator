@@ -342,7 +342,7 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
         // The canvas sits in the same two-column body the board uses, so the task
         // drawer has a real column: the canvas shrinks/scrolls inside <main> instead of
         // being clipped by it. Same selection state as the board cards.
-        <div className="dsh-swarm-body">
+        <div className="dsh-swarm-body dsh-swarm-flow-body">
           <main className="dsh-swarm-main dsh-swarm-flow-main">
             {run === null ? (
               <div className="dsh-swarm-placeholder"><p>{t('flow.noRun')}</p></div>

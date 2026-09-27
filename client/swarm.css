@@ -187,11 +187,12 @@
 /* ── main run view ────────────────────────────────────── */
 .dsh-swarm-main { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
 /* Flow arm only. 0.6.28 wrapped the canvas in .dsh-swarm-main so the drawer had a
-   sibling column, but that rule has no flex-grow: nothing gave the column a definite
+   sibling column, but the real cause was the grid columns below: nothing gave the column a definite
    width, so FlowChart's fit-to-pane (ResizeObserver) measured a sliver and clamped to
    its 0.3 floor — tiny overlapping nodes at the far left. The board's .dsh-swarm-main
    is load-bearing as-is (it works), so the fix is additive here, not there. */
-.dsh-swarm-flow-main { flex: 1 1 auto; min-width: 0; }
+.dsh-swarm-body.dsh-swarm-flow-body { grid-template-columns: 1fr auto; }
+.dsh-swarm-flow-main { min-width: 0; }
 .dsh-swarm-run-header {
   display: flex;
   justify-content: space-between;
@@ -296,9 +297,9 @@
 .dsh-swarm-drawer header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
 .dsh-swarm-drawer h3 { margin: 0; font-size: 14px; }
 .dsh-swarm-drawer h4 { margin: 6px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.7; }
-.dsh-swarm-drawer dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; font-size: 12px; }
+.dsh-swarm-drawer dl { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px; font-size: 12px; }
 .dsh-swarm-drawer dt { opacity: 0.6; }
-.dsh-swarm-drawer dd { margin: 0; }
+.dsh-swarm-drawer dd { margin: 0; overflow-wrap: anywhere; }
 .dsh-swarm-brief { margin: 0; font-size: 12.5px; line-height: 1.45; white-space: pre-wrap; }
 
 /* ── segmented control ────────────────────────────────── */
