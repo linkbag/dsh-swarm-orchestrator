@@ -66,6 +66,7 @@ const en: Record<string, string> = {
   'board.emptyHint': 'Ask the agent to decompose work and call swarm_dispatch — runs appear here live.',
   'roster.unresolvable': "Couldn't resolve this chat's workspace — showing the shared roster for all workspaces.",
   'flow.noRun': 'No run selected — dispatch a run or pick one on the Board first.',
+  'flow.noTasks': 'This run has no tasks — nothing to draw yet.',
 
   'run.created': 'created {time}',
   'run.finished': 'finished {time}',
@@ -285,6 +286,7 @@ const zh: Record<string, string> = {
   'board.emptyHint': '让 agent 分解工作并调用 swarm_dispatch——运行会实时显示在这里。',
   'roster.unresolvable': '无法解析此聊天的工作区——显示所有工作区共用的分工表。',
   'flow.noRun': '未选择运行——请先派发运行，或在看板中选择一个。',
+  'flow.noTasks': '此运行还没有任务——暂无可绘制的流程。',
 
   'run.created': '创建于 {time}',
   'run.finished': '完成于 {time}',

@@ -186,6 +186,12 @@
 
 /* ── main run view ────────────────────────────────────── */
 .dsh-swarm-main { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+/* Flow arm only. 0.6.28 wrapped the canvas in .dsh-swarm-main so the drawer had a
+   sibling column, but that rule has no flex-grow: nothing gave the column a definite
+   width, so FlowChart's fit-to-pane (ResizeObserver) measured a sliver and clamped to
+   its 0.3 floor — tiny overlapping nodes at the far left. The board's .dsh-swarm-main
+   is load-bearing as-is (it works), so the fix is additive here, not there. */
+.dsh-swarm-flow-main { flex: 1 1 auto; min-width: 0; }
 .dsh-swarm-run-header {
   display: flex;
   justify-content: space-between;

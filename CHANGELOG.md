@@ -2,6 +2,48 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.29
+
+**Two Flow-view defects fixed: the drawer no longer crushes the canvas, and a run with no tasks can no longer render a blank tab.**
+
+### Fixed
+
+- **The 0.6.28 drawer collapse.** `.dsh-swarm-main` carries `min-width: 0;
+  overflow: hidden` but **no `flex: 1`** - correct for the Board arm, whose content
+  supplies the width, but the Flow arm that 0.6.28 wrapped in that same class has no
+  definite width, so the column collapsed to roughly the legend's width. FlowChart's
+  fit-to-pane observer then measured that sliver and clamped the scale to its 0.3
+  floor - the reported tiny, overlapping node cluster at the far left, with the X
+  sitting left of the panel edge. The Flow arm now carries a flow-specific
+  `.dsh-swarm-flow-main { flex: 1 1 auto; min-width: 0 }`, and `.dsh-swarm-main` is
+  deliberately untouched because the Board view depends on its current form. The scale
+  clamp is unchanged: given a definite width the canvas scales normally and scrolls,
+  since `.dsh-swarm-flow` already has `overflow: auto`.
+- **A run with no tasks rendered a blank Flow tab** - just the legend, which reads as a
+  broken canvas, because there was no empty state at all. The Flow arm now
+  distinguishes the two empty cases explicitly: no run in scope (the existing
+  placeholder) and a run with no tasks (new `flow.noTasks`, English and Chinese),
+  reusing the existing placeholder styling rather than inventing any.
+
+### Tests
+
+- 4 new tests, rendering `SwarmTab` itself rather than the chart in isolation: the Flow
+  arm's `main` carries both classes (catching exactly the 0.6.28 collapse);
+  `client/swarm.css` still contains a flex rule for `.dsh-swarm-flow-main` (catching
+  silent CSS removal, which the class assertion alone would pass); a run with no tasks
+  renders the placeholder and NOT a bare legend; and a run with tasks renders the
+  canvas and legend with no placeholder (catching an over-eager empty state that would
+  hide a real run).
+- Layout geometry itself stays unprovable without a DOM/jsdom harness: these tests pin
+  the class, the rule and the empty state, not the rendered result. Confirming the
+  canvas fills its column is the operator's refresh.
+
+### Known residual
+
+- J10's turn-bounded pump can still exhaust its 2000 turns under load: it failed once
+  at 30.9 s during this work and was the only red in the suite. Pre-existing, first
+  documented in 0.6.26, unrelated to these changes - and the next thing worth fixing.
+
 ## 0.6.28
 
 **Fix: the Flow tab's new click selected a task but could not show a sidebar.**

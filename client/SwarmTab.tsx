@@ -343,16 +343,20 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
         // drawer has a real column: the canvas shrinks/scrolls inside <main> instead of
         // being clipped by it. Same selection state as the board cards.
         <div className="dsh-swarm-body">
-          <main className="dsh-swarm-main">
-            {run !== null ? (
+          <main className="dsh-swarm-main dsh-swarm-flow-main">
+            {run === null ? (
+              <div className="dsh-swarm-placeholder"><p>{t('flow.noRun')}</p></div>
+            ) : tasks.length === 0 ? (
+              // An empty flow rendered as a legend with no nodes — indistinguishable from
+              // a broken canvas. Say so, the way the Board already does for an empty run.
+              <div className="dsh-swarm-placeholder"><p>{t('flow.noTasks')}</p></div>
+            ) : (
               <FlowChart
                 run={run}
                 tasks={tasks}
                 selectedTaskId={selectedTask?.id ?? null}
                 onSelectTask={(task) => { setSelectedTask(selectedTask !== null && selectedTask.id === task.id ? null : task) }}
               />
-            ) : (
-              <div className="dsh-swarm-placeholder"><p>{t('flow.noRun')}</p></div>
             )}
           </main>
           {taskDrawer}
