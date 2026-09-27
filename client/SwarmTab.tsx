@@ -238,7 +238,15 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
         </>
       ) : view === 'flow' ? (
         run !== null ? (
-          <FlowChart run={run} tasks={tasks} />
+          // One selection state for both views: opening a task from a flow box and
+          // then switching to Board (or vice versa) shows that same task selected.
+          // The toggle matches the Board card's: clicking the open task closes it.
+          <FlowChart
+            run={run}
+            tasks={tasks}
+            selectedTaskId={selectedTask?.id ?? null}
+            onSelectTask={(task) => { setSelectedTask(selectedTask !== null && selectedTask.id === task.id ? null : task) }}
+          />
         ) : (
           <div className="dsh-swarm-placeholder"><p>{t('flow.noRun')}</p></div>
         )

@@ -7,6 +7,7 @@
 // (bottom-center → top-center). The canvas scales to fit the pane.
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { BoardRun, BoardTask } from './board-store'
+import { flowNodeAttributes, isActivationKey, resolveFlowSelection } from './flow-select'
 import { statusT, useT, type Translate } from './locale'
 
 const NODE_W = 200
@@ -39,7 +40,14 @@ function phaseLabel(task: BoardTask, t: Translate): string {
   }
 }
 
-export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] }): JSX.Element {
+export function FlowChart({ run, tasks, onSelectTask, selectedTaskId }: {
+  run: BoardRun
+  tasks: BoardTask[]
+  /** Opens the task in the shared detail sidebar — Board and Flow drive one selection state. */
+  onSelectTask?: (task: BoardTask) => void
+  /** The task currently open in the sidebar, so its box can render as active. */
+  selectedTaskId?: string | null
+}): JSX.Element {
   const t = useT()
   const layout = useMemo(() => {
     // Longest-path ranking: tasks with no blockers sit in wave 0.
@@ -238,10 +246,31 @@ export function FlowChart({ run, tasks }: { run: BoardRun; tasks: BoardTask[] })
             const writeHint = (task.writes ?? []).length > 0
               ? `✎ ${(task.writes ?? []).slice(0, 2).join(', ')}${(task.writes ?? []).length > 2 ? '…' : ''}`
               : ''
+            // Selection is resolved through the pure module: only a real task of THIS
+            // run is selectable, and the same toggle the Board cards use applies here
+            // (clicking the open task closes the sidebar).
+            const selection = onSelectTask === undefined ? null : resolveFlowSelection({ taskId: task.id }, run.id, tasks)
+            const interactive = selection !== null
+            const attrs = flowNodeAttributes(interactive, interactive && selectedTaskId === task.id)
+            const activate = (): void => {
+              if (selection !== null && onSelectTask !== undefined) onSelectTask(selection.task)
+            }
             return (
               <div
                 key={task.id}
-                className="dsh-swarm-flow-node"
+                className={attrs.className}
+                role={attrs.role}
+                tabIndex={attrs.tabIndex}
+                aria-pressed={attrs['aria-pressed']}
+                onClick={interactive ? activate : undefined}
+                onKeyDown={interactive
+                  ? (event) => {
+                      if (isActivationKey(event.key)) {
+                        event.preventDefault()
+                        activate()
+                      }
+                    }
+                  : undefined}
                 style={{ left: pos.x, top: pos.y, width: NODE_W, height: NODE_H, borderColor: color, zIndex: 1 }}
                 title={`${task.subject}${(task.writes ?? []).length > 0 ? `\n${t('flow.writesTitle', { paths: (task.writes ?? []).join(', ') })}` : ''}`}
               >

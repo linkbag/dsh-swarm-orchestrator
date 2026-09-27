@@ -2,6 +2,48 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.27
+
+**Flow-chart boxes now open the task detail sidebar, exactly like board cards do.**
+
+### Added
+
+- **Click a task box in the Flow tab to open the same right-hand task sidebar.** The
+  two views share one selection, so opening from Flow and switching to Board shows the
+  same task selected, and closing with the X clears both. A node resolves to its own
+  task AND run, so the sidebar can never show a task under another run's context, and
+  non-task nodes - scheduler, run report, wave labels - stay deliberately inert.
+- **Real interaction affordances**, not just a click handler: pointer cursor; hover
+  feedback (brightness plus a subtle ring, because the box border is set inline from
+  status and should not be fought); a 2px blue ring on the open task; `role="button"`,
+  `tabIndex`, `aria-pressed`; and Enter/Space activation, with Space preventing the
+  page from scrolling. No new dependencies and no new locale strings were needed.
+
+### Tests
+
+- 14 pure tests for the new `client/flow-select.ts` - selection resolution and the
+  attribute rules, including refusing decoration (`{}`, `null`, `undefined`,
+  `taskId: 42`, blank strings), refusing a task that is absent from the run or that
+  belongs to a different run, degrading to no-selection on a malformed board, and
+  never letting a non-task node select anything.
+- 5 structural tests over `renderToStaticMarkup`: task boxes carry the button
+  semantics and the clickable class, scheduler and report nodes carry none of it, with
+  no handler the whole flow is inert, and the open task - and only it - carries the
+  active state and `aria-pressed="true"`.
+- **Honest scope:** `jsdom` is not resolvable in any of this package's resolution
+  roots and nothing extra was installed for a test, so the structural tests prove the
+  wiring exists but cannot prove React invokes it on a real click. That last step is
+  the operator's click-through after a refresh.
+- Suite: **245 tests, 245 pass, 21/21 files**, three loaded runs with a build between
+  each (28.4-28.7 s, spread 0.21 s).
+
+### Known residual
+
+- J10's turn-bounded pump can still exhaust its 2000 turns under back-to-back loaded
+  runs: it failed once at 26.6 s in an interim batch during this work, then passed all
+  three final runs. Same class as before - the assertion is load-sensitive, not the
+  behaviour under test.
+
 ## 0.6.26
 
 **Write-scope rendering is now pinned by tests - and a 0.6.25 claim is withdrawn as unproven.**

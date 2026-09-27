@@ -508,3 +508,23 @@
   font-size: 12.5px;
   color: rgb(227, 148, 36);
 }
+
+/* Flow nodes: task boxes are clickable — they open the same detail sidebar the
+   Board cards do. The affordance is scoped to .clickable so the scheduler, report
+   and wave nodes keep their inert look. A node's border colour is set inline from
+   its status, so hover/selected use a ring rather than touching the border. */
+.dsh-swarm-flow-node.clickable {
+  cursor: pointer;
+  transition: box-shadow 120ms ease, filter 120ms ease;
+}
+.dsh-swarm-flow-node.clickable:hover {
+  filter: brightness(1.12);
+  box-shadow: 0 0 0 1px rgba(125, 125, 125, 0.45);
+}
+.dsh-swarm-flow-node.clickable:focus-visible {
+  outline: 2px solid rgb(56, 139, 253);
+  outline-offset: 1px;
+}
+.dsh-swarm-flow-node.clickable.active {
+  box-shadow: 0 0 0 2px rgb(56, 139, 253);
+}
