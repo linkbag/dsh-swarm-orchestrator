@@ -20,19 +20,37 @@
  * field is the rejection, not its value. The same pin survived on
  * `deepseek-official/deepseek-flash`, which is the `llm-deepseek` adapter, not pi-ai.
  *
- * This is deliberately a *declarative* check against settings.yaml, not a probe of
- * the LLM service. Consequences:
- *   - model under an effort-validating root, NO map   -> pin must be stripped
+ * This is deliberately a *declarative* check against the deployment's settings, not a
+ * probe of the LLM service. Consequences:
  *   - model under an effort-validating root, WITH map -> only its declared levels
+ *   - model under an effort-validating root, NO map   -> NOT judged: the pin is kept
  *   - model outside those roots (deepseek, …)         -> not judged
  *   - the deployment's default model with a declared
- *     reasoningEffort                                 -> that pair is proven-good
+ *     reasoningEffort                                 -> that LEVEL is proven-good, and
+ *     the pair may only widen a declared map: proof of one level is not evidence
+ *     against another, so it can never create an exclusion set
  *
- * Known over-approximation: pi-ai falls back to the *installed catalog's* reasoning
- * metadata when a hand-declared entry matches a catalog id (`base?.reasoning ?? false`),
- * so such a model could in principle accept levels this file cannot see. The adapter
- * documents hand-declared entries as carrying no reasoning metadata, and stripping a
- * pin is always safe — the pin is a preference — so the check errs that way.
+ * POLICY (2026-09-26): strip only on POSITIVE evidence — a declared map that excludes
+ * the pin. The mere ABSENCE of a map is unknown, not a rejection, so the pin stays:
+ *   - The over-approximation above is real and was decisive. pi-ai resolves a
+ *     hand-declared entry that matches an installed catalog id through the catalog's
+ *     own reasoning metadata (`base?.reasoning ?? false`), so such a model does accept
+ *     levels this check cannot see. Judging absence as rejection therefore condemned
+ *     all 51 of the deployment's map-less pi-ai models and silently dropped every pin.
+ *   - The live evidence contradicts the old reading: on 2026-09-26 a task ran
+ *     `xiaomi/mimo-v2.6-pro` with `max` pinned and did real work, and across 4,566
+ *     events there are ZERO recorded unsupported-effort refusals (8 of the 15 pinned
+ *     attempts in the upgrade era completed).
+ * A pin that is genuinely refused must stay a loud, fast, recoverable failure — the
+ * effort ladder / internal rung retry is the escape — never a silent downgrade. How
+ * many models rest on that uncertainty is reported in the preflight's once-only log
+ * line, so it is visible rather than invisible.
+ *
+ * The default pair is read the same way, and this was the last carve-out: its declared
+ * level is proof FOR that level (so it may widen a declared map), never proof AGAINST
+ * the others. Treating it as a level set invented `{max}` for the deployment's own
+ * `zai/glm-5.3` — which declares no map at all — so a legitimate `high` pin on the
+ * default model was stripped, with a warning that claimed a map existed.
  *
  * Pure so the policy is directly testable.
  */
@@ -46,11 +64,26 @@
 const KNOWN_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
 
 export interface EffortSupport {
-  /** Models declared with a reasoningEfforts map containing the effort. */
+  /**
+   * Models whose levels are known: those with a declared map, plus the default pair's
+   * model (its own level is proven first-hand). Feeds the once-only log's counts.
+   */
   readonly supported: ReadonlySet<string>
-  /** Models declared WITHOUT any reasoningEfforts map: pi-ai reports them as `off`-only. */
+  /**
+   * Models declared WITHOUT any reasoningEfforts map. Absence is NOT evidence of
+   * rejection (see the policy note above): their pins are left in place. The set is
+   * still collected because it is what makes the uncertainty reportable, and it counts
+   * toward "this source declared something" — so a map-less deployment keeps an ACTIVE
+   * preflight that says so, instead of one that goes quiet.
+   */
   readonly declaredWithoutMap: ReadonlySet<string>
-  /** Model id -> the reasoning levels it may be pinned to (its map's keys, plus a proven default pair). */
+  /**
+   * Model id -> the levels its DECLARED MAP accepts, and nothing else. Presence here is
+   * what licenses exclusion: a map enumerates a model's levels, so a pin outside it is
+   * positively unsupported. The default-model pair is deliberately never merged in —
+   * proof of one level cannot exclude another, and merging it invented `{max}` for a
+   * map-less model (the live default) and stripped its other pins.
+   */
   readonly declaredLevels: ReadonlyMap<string, ReadonlySet<string>>
 }
 
@@ -141,20 +174,208 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
       }
     }
     flushCurrent()
-    // The deployment's default model runs with its declared effort: first-hand
-    // evidence that this exact pair is accepted, so that level — and only it — is
-    // allowed for the model. It must NOT mark a map-less model capable of any
-    // other level (that is the mismatch that killed the run).
+    // The deployment's default model runs with its declared effort: first-hand proof
+    // that this LEVEL is accepted for this model. Proof for one level is never proof
+    // against another, so the pair may only WIDEN a declared map (adding a level the map
+    // omits but the deployment demonstrably runs). It must never CREATE a level set: a
+    // set excludes, and for a map-less model — the live `zai/glm-5.3` — that turned the
+    // pair's own `max` into an invented `{max}` that stripped a legitimate `high`.
     if (defaultModelId !== null && defaultEffort !== null) {
       supported.add(defaultModelId)
-      const levels = declaredLevels.get(defaultModelId) ?? new Set<string>()
-      levels.add(defaultEffort)
-      declaredLevels.set(defaultModelId, levels)
+      declaredLevels.get(defaultModelId)?.add(defaultEffort)
     }
   } catch {
     // tolerant: an unreadable file simply yields no declarations
   }
   return { supported, declaredWithoutMap, declaredLevels }
+}
+
+/**
+ * The profile entry whose models pi-ai validates. Matched as a suffix so both the
+ * entry id (`llm-pi-ai`) and the package name (`@deepseek-ai/dsh-llm-pi-ai`) count,
+ * while `llm-deepseek` — which accepts efforts without declaring maps — does not.
+ */
+const PI_AI_ENTRY = /llm-pi-ai$/i
+
+/** The entry that names the deployment's default model and its effort. */
+const DEFAULT_MODEL_ENTRY = /agent-default-model$/i
+
+/**
+ * J21 live source: one settings entry as the settings service reports it — the
+ * profile entry id and its live Config value (an object, not YAML text).
+ */
+export interface SettingsEntryValue {
+  readonly ns: string
+  readonly value: unknown
+}
+
+/** Model-ish object: a declared `id` plus any of the fields a model entry carries. */
+function isModelEntry(record: Record<string, unknown>): boolean {
+  if (typeof record.id !== 'string') return false
+  return record.name !== undefined || record.contextWindow !== undefined
+    || record.maxTokens !== undefined || record.input !== undefined
+}
+
+/**
+ * Walk a live llm-pi-ai Config value and record what it declares per model.
+ *
+ * Mirrors the adapter's rule (`resolveModelReasoning`): a model whose
+ * `reasoningEfforts` is absent keeps the installed catalog's capability, and for a
+ * hand-declared model the catalog has no entry of that id — so it is reported as
+ * `off`-only. `false` is the schema's explicit "not a reasoning model", which is
+ * also `off`-only. Either way the model is UNJUDGED here: it lands in
+ * `declaredWithoutMap`, which is counted and logged but never used to strip a pin —
+ * the installed catalog may still resolve that model's reasoning capability.
+ */
+function collectPiAiModels(
+  value: unknown,
+  out: { supported: Set<string>; declaredWithoutMap: Set<string>; declaredLevels: Map<string, Set<string>> },
+  seen: Set<object>,
+): void {
+  if (value === null || typeof value !== 'object') return
+  if (seen.has(value)) return
+  seen.add(value)
+  if (Array.isArray(value)) {
+    for (const item of value) collectPiAiModels(item, out, seen)
+    return
+  }
+  const record = value as Record<string, unknown>
+  if (isModelEntry(record)) {
+    const id = record.id as string
+    const efforts = record.reasoningEfforts
+    if (efforts !== null && typeof efforts === 'object' && !Array.isArray(efforts)) {
+      const levels = new Set<string>()
+      for (const key of Object.keys(efforts as Record<string, unknown>)) {
+        if (KNOWN_THINKING_LEVELS.has(key)) levels.add(key)
+      }
+      // A map with no recognizable level is a config error the adapter rejects at
+      // load; reading it as off-only strips rather than invents capability.
+      if (levels.size > 0) {
+        out.supported.add(id)
+        out.declaredLevels.set(id, levels)
+      } else {
+        out.declaredWithoutMap.add(id)
+      }
+    } else {
+      out.declaredWithoutMap.add(id)
+    }
+  }
+  for (const nested of Object.values(record)) collectPiAiModels(nested, out, seen)
+}
+
+/**
+ * The `{ model, reasoningEffort }` pair the default-model entry carries, at any depth.
+ * The level lands in `proven`, NOT in `declaredLevels`: `declaredLevels` is the
+ * exclusion set (a real map's keys) while this evidence only ever widens — see the
+ * merge in `parseEffortSupportFromEntries`.
+ */
+function collectDefaultPairs(
+  value: unknown,
+  out: { supported: Set<string>; proven: Map<string, Set<string>> },
+  seen: Set<object>,
+): void {
+  if (value === null || typeof value !== 'object' || seen.has(value)) return
+  seen.add(value)
+  if (Array.isArray(value)) {
+    for (const item of value) collectDefaultPairs(item, out, seen)
+    return
+  }
+  const record = value as Record<string, unknown>
+  const model = typeof record.model === 'string' ? record.model : undefined
+  const effort = typeof record.reasoningEffort === 'string' ? record.reasoningEffort : undefined
+  if (model !== undefined && effort !== undefined) {
+    out.supported.add(model)
+    const levels = out.proven.get(model) ?? new Set<string>()
+    levels.add(effort)
+    out.proven.set(model, levels)
+  }
+  for (const nested of Object.values(record)) collectDefaultPairs(nested, out, seen)
+}
+
+/**
+ * The same declarations, read from the LIVE settings service instead of YAML text.
+ *
+ * The deployment's `settings.yaml` is gone: DSH imported it into the active profile
+ * and renamed the document, so the service's `describe()` values are the only
+ * current truth. Kept tolerant for the same reason as the file parser — a shape we
+ * do not recognize must yield NOTHING judged, never a verdict we cannot justify.
+ */
+export function parseEffortSupportFromEntries(entries: readonly SettingsEntryValue[]): EffortSupport {
+  const supported = new Set<string>()
+  const declaredWithoutMap = new Set<string>()
+  const declaredLevels = new Map<string, Set<string>>()
+  const proven = new Map<string, Set<string>>()
+  try {
+    for (const entry of entries) {
+      if (entry === null || typeof entry !== 'object') continue
+      const ns = typeof entry.ns === 'string' ? entry.ns : ''
+      if (PI_AI_ENTRY.test(ns)) {
+        collectPiAiModels(entry.value, { supported, declaredWithoutMap, declaredLevels }, new Set())
+      } else if (DEFAULT_MODEL_ENTRY.test(ns)) {
+        collectDefaultPairs(entry.value, { supported, proven }, new Set())
+      }
+    }
+    // Applied AFTER both entry kinds are read, so entry order cannot decide the outcome.
+    // The pair proves its own level for its model: that may WIDEN a declared map (the
+    // running pair is proof the map is incomplete), but it never creates one — a set
+    // excludes, and a map-less model's levels are unknown rather than `{default}`.
+    for (const [id, levels] of proven) {
+      const declared = declaredLevels.get(id)
+      if (declared === undefined) continue
+      for (const level of levels) declared.add(level)
+    }
+  } catch {
+    // tolerant: an unrecognized shape yields no declarations
+  }
+  return { supported, declaredWithoutMap, declaredLevels }
+}
+
+/** Whether a parse actually declared anything — an empty result judges no model. */
+export function isUsableEffortSupport(support: EffortSupport): boolean {
+  return support.supported.size + support.declaredWithoutMap.size + support.declaredLevels.size > 0
+}
+
+/** A legacy settings document read from disk, with the path for the log line. */
+export interface EffortSourceFile {
+  readonly path: string
+  readonly text: string
+}
+
+export interface EffortResolution {
+  /** undefined means "nothing judged" — never "everything supported". */
+  readonly support?: EffortSupport
+  /** Which source produced the verdict, for the log line. */
+  readonly source?: string
+  /** Every source consulted, in order, whether or not it produced anything. */
+  readonly consulted: readonly string[]
+}
+
+/**
+ * Pick the effort declarations from the first source that actually declares
+ * something: the live settings service first (authoritative since DSH moved the
+ * document), the legacy `settings.yaml` after it (installs that predate the
+ * service). An unparseable or empty source is skipped, not trusted — the failure
+ * this guards: a stale document yielding a verdict the deployment no longer holds.
+ */
+export function resolveEffortSupport(sources: {
+  service?: { label: string; entries?: readonly SettingsEntryValue[] }
+  files?: readonly EffortSourceFile[]
+}): EffortResolution {
+  const consulted: string[] = []
+  const service = sources.service
+  if (service !== undefined) {
+    consulted.push(service.label)
+    if (service.entries !== undefined && service.entries.length > 0) {
+      const support = parseEffortSupportFromEntries(service.entries)
+      if (isUsableEffortSupport(support)) return { support, source: service.label, consulted }
+    }
+  }
+  for (const file of sources.files ?? []) {
+    consulted.push(file.path)
+    const support = parseEffortSupport(file.text)
+    if (isUsableEffortSupport(support)) return { support, source: file.path, consulted }
+  }
+  return { consulted }
 }
 
 export interface EffortCheck {
@@ -165,13 +386,15 @@ export interface EffortCheck {
 }
 
 /**
- * Whether a pinned effort on this model is declared unsupported. `incompatible` is
- * true only for a model we have a DECLARATION about:
- *   - it declares levels, and the pinned one is not among them; or
- *   - it is hand-declared under an effort-validating root with no map, which pi-ai
- *     reports as supporting only `off` — so any explicit level is refused.
- * A model we have no declaration for (deepseek, anything outside those roots) cannot
- * be judged and is never flagged.
+ * Whether a pinned effort on this model is DECLARED unsupported. `incompatible` is
+ * true only on POSITIVE evidence: the model declares levels, and the pinned one is not
+ * among them. Everything else is unknown, and unknown keeps the pin —
+ *   - a model outside the effort-validating roots (deepseek, …) is not judged;
+ *   - a model with no map at all is not judged either. The pre-2026-09-26 rule flagged
+ *     those on the adapter's documented `off`-only reading; the live evidence
+ *     contradicted it and the cost was a blanket silent downgrade.
+ * A pin that is genuinely refused therefore surfaces as the loud ~41 ms death, which
+ * the effort ladder recovers — fast, visible, recoverable.
  */
 export function checkEffortSupport(model: string, effort: string, support: EffortSupport | undefined): EffortCheck {
   if (support === undefined) return { incompatible: false }
@@ -184,11 +407,11 @@ export function checkEffortSupport(model: string, effort: string, support: Effor
       warning: `model "${model}" declares reasoningEfforts (${declared}) in settings.yaml, so effort "${effort}" is not one of its levels — the dispatcher will strip the pin rather than let the request die with UNSUPPORTED_REASONING_EFFORT`,
     }
   }
-  // No declaration at all: absence is not proof for models outside the validating
-  // roots (deepseek models declare no maps and accept efforts).
-  if (!support.declaredWithoutMap.has(model)) return { incompatible: false }
-  return {
-    incompatible: true,
-    warning: `model "${model}" is hand-declared under llm-pi-ai with no reasoningEfforts map, and pi-ai reports such a model as supporting only "off": any explicit level — including "${effort}" — is refused at request time with UNSUPPORTED_REASONING_EFFORT (observed live: xiaomi/mimo-v2.6-pro died 41 ms after agent-started with "max" and 94 ms with "high"). Declare reasoningEfforts for this model, or leave the effort unset`,
-  }
+  // No map: UNKNOWN, not unsupported. `declaredWithoutMap` is deliberately NOT
+  // consulted here — the adapter may resolve the model through the installed catalog,
+  // and a pin dropped on a guess is a silent behaviour change (the operator's standing
+  // preference: a loud, recoverable failure beats a quiet downgrade). The bucket is
+  // still collected, and `effortSupport()`'s once-only log line reports its size, so
+  // the uncertainty stays visible.
+  return { incompatible: false }
 }

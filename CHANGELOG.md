@@ -2,6 +2,48 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.23
+
+**The effort preflight reads live settings again - without guessing - and the J10 tests no longer race the clock.**
+
+### Fixed
+
+- **J21 was blind: the deployment settings file moved.** DSH 0.1.7-rc.2 imports
+  `settings.yaml` once (leaving `settings.yaml.imported`, deliberately dead) and
+  serves live values from the `settings` service. `effortSupport()` looked only for
+  the old file, found nothing, and validated nothing - silently. It now reads the
+  live service first (resolved structurally, like `tools`/`agents`), keeps the file
+  path as a legacy fallback, and logs ONCE whether the preflight is active and what
+  it read, so the state is never invisible again.
+- **Only positive evidence may strip a pin.** A model merely declared without a
+  `reasoningEfforts` map is UNKNOWN, not unsupported - the adapter may resolve it
+  through its installed catalog. Every pi-ai model in this deployment is declared
+  without a map, so the old rule would have stripped EVERY pin, including
+  `xiaomi/mimo-v2.6-pro @ max`, which the 2026-09-26 run proves works (the child did
+  real work; 0 unsupported-effort refusals across 4,566 events). Pins are now
+  stripped only when a declared map omits the requested level.
+- **The default-model pair no longer invents an exclusion set.** Proving the default
+  model supports `max` was recorded as "declares {max}", so `high` was silently
+  dropped for that model. It now widens a real map only - order-independently, since
+  the levels are applied after both entry kinds are read - and never creates one.
+
+### Changed
+
+- **The J10/J22 adoption tests are turn-bounded, not deadline-bounded.** They drive
+  the existing private `service.tick()` (as the fault-matrix tests already do) with
+  one macrotask per turn, so a loaded machine slows each turn instead of consuming
+  the budget: the 8 s and 30 s wall-clock waits behind this project's intermittent
+  release-run failures are gone from that family. Microtask-only pumping was tried
+  first and does not work (the launch path waits on a real timer) - recorded in the
+  helper so nobody repeats it.
+
+### Tests
+
+- Suite: **203 tests, 203 pass, 17/17 files**, three sequential runs (28.3-28.6 s).
+- Known residual, not fixed: `A7: re-runs only the declared commands, once, and never
+  respawns the finished child` failed once at 88.3 s in an earlier session - the same
+  wall-clock class, outside the J10/J22 family, green in all three final runs.
+
 ## 0.6.22
 
 **Task agents must prove their own work before claiming done, and the dead client-version plumbing is gone.**

@@ -240,6 +240,42 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, what: string
   throw new Error(`timed out waiting for: ${what}`)
 }
 
+/**
+ * Deterministic alternative to `waitFor` for the report-adoption tests (J10/J22).
+ *
+ * `waitFor` polls on a 25 ms `setTimeout` against a wall-clock DEADLINE, so a correct
+ * adoption that happens immediately can still miss it on a busy machine: these tests
+ * failed exactly that way three times (an 8 s budget burned to 8.03 s, a 30 s budget
+ * to 30.04 s) while passing in isolation in tens of milliseconds.
+ *
+ * This counts TURNS instead of milliseconds, and each turn both drives the
+ * dispatcher's own `tick()` — the private lever the fault-matrix tests use — and
+ * yields a macrotask so timers the launch path scheduled can fire. A turn is a
+ * `setTimeout(0)` (clamped to ~1 ms by the runtime), so 2000 turns advance roughly
+ * two seconds of timer time while a slow machine only makes each turn slower, never
+ * the budget smaller: the test can no longer fail for being run under load.
+ *
+ * A microtask-only pump was tried first and was NOT enough: it exited in 51-76 ms with
+ * the state unreachable, because the launch path waits on a timer that `setImmediate`
+ * alone never lets fire. Exhausting the turns is a real failure, reported as one.
+ */
+async function pumpUntil(
+  service: SwarmService,
+  predicate: () => boolean,
+  what: string,
+  dump?: () => string,
+  turns = 2000,
+): Promise<void> {
+  for (let i = 0; i < turns; i++) {
+    if (predicate()) return
+    ;(service as unknown as { tick(): void }).tick()
+    await new Promise<void>((resolve) => { setTimeout(resolve, 0) })
+  }
+  if (predicate()) return
+  if (dump !== undefined) console.error('[pumpUntil dump] ' + dump())
+  throw new Error(`unreachable after ${turns} dispatcher turns: ${what}`)
+}
+
 async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx: Context; service: SwarmService; fake: FakeSubagents; dir: string }> {
   const dir = mkdtempSync(join(tmpdir(), 'swarm-service-'))
   // J21: the effort preflight reads `$DSH_HOME/settings.yaml`. Point it at a fixture
@@ -280,11 +316,10 @@ const contexts: Context[] = []
 
 /**
  * The settings.yaml fixture a booted service reads for its J21 effort preflight
- * (`$DSH_HOME/settings.yaml`). It declares exactly the levels these tests pin: a
- * real deployment must declare `reasoningEfforts` for a pin to be legal at all,
- * because pi-ai refuses any explicit level on a hand-declared model that has no map.
- * `glm-5.3-air` is deliberately map-less — the production mimo shape — so the
- * review-path strip tests have an effort-incapable pi-ai model to pin against.
+ * (`$DSH_HOME/settings.yaml`). It declares the levels these tests pin, because a
+ * DECLARED map is the only positive evidence the preflight acts on.
+ * `glm-5.3-air` is deliberately map-less — the production mimo shape — and is what the
+ * "absence is not a rejection" tests pin, on the task path and on both review paths.
  */
 const DECLARING_SETTINGS = [
   'llm-pi-ai:',
@@ -725,7 +760,7 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(fake.calls.length).toBe(1)
   }, 20000)
 
-  it('J21: checkEffortSupport flags a declared model without an efforts map', async () => {
+  it('J21: a declared model without an efforts map is UNKNOWN, so its pin is kept', async () => {
     const { parseEffortSupport, checkEffortSupport } = await import('../src/preflight.js')
     const settings = [
       'llm-pi-ai:',
@@ -739,11 +774,14 @@ describe('swarm service (integration, fake subagents)', () => {
     ].join('\n')
     const support = parseEffortSupport(settings)
     expect(support.supported.has('glm-5.3-flash')).toBe(true)
+    // Still collected — this is what makes the uncertainty reportable...
     expect(support.declaredWithoutMap.has('glm-5.3')).toBe(true)
-    // The exact production mismatch: max pinned on glm-5.3.
+    // ...but the absence of a map is not evidence of rejection. The adapter may resolve
+    // the model through the installed catalog, so the pin goes out unchanged: a loud,
+    // recoverable failure beats a silent downgrade.
     const check = checkEffortSupport('glm-5.3', 'max', support)
-    expect(check.incompatible).toBe(true)
-    expect(check.warning).toMatch(/glm-5\.3/)
+    expect(check.incompatible).toBe(false)
+    expect(check.warning).toBeUndefined()
   })
 
   it('J21: a model with no declaration is not judged', async () => {
@@ -785,14 +823,52 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(denied.incompatible).toBe(true)
     // The warning names the levels the model does declare, so the fix is obvious.
     expect(denied.warning).toMatch(/high, low/)
-    // A model in the same file with no map is refused at every explicit level.
-    expect(checkEffortSupport('glm-5.3-flash', 'max', support).incompatible).toBe(true)
+    // A model in the same file with no map is not judged at all: its pin is kept
+    // (the deployment's 51 map-less pi-ai models are exactly this shape).
+    expect(checkEffortSupport('glm-5.3-flash', 'max', support).incompatible).toBe(false)
   })
 
-  it('J21: an undeclared pi-ai model gets the pin stripped, and keeps its place in the chain', async () => {
-    // The production shape (xiaomi/mimo-v2.6-pro, 2026-09-23): hand-declared under
-    // llm-pi-ai with no reasoningEfforts map. The old parser judged such a file not at
-    // all, so the pin went out and the child died 41 ms after agent-started.
+  it('J21: the settings.yaml default pair widens a map and never creates one', async () => {
+    const { parseEffortSupport, checkEffortSupport } = await import('../src/preflight.js')
+    // The live shape: zai/glm-5.3 declares NO map and is the default model, so the pair's
+    // own `max` is all that is ever known about it. That must not become an exclusion set
+    // — doing so stripped a legitimate `high` pin on the deployment's own default model.
+    const base = [
+      'llm-pi-ai:',
+      '  providers:',
+      '    zai:',
+      '      models:',
+      '        - id: glm-5.3',
+      'agent-default-model:',
+      '  provider: zai',
+      '  model: glm-5.3',
+      '  reasoningEffort: max',
+    ].join('\n')
+    const support = parseEffortSupport(base)
+    expect(support.supported.has('glm-5.3')).toBe(true)
+    expect(support.declaredLevels.has('glm-5.3')).toBe(false)
+    expect(checkEffortSupport('glm-5.3', 'max', support).incompatible).toBe(false)
+    expect(checkEffortSupport('glm-5.3', 'high', support).incompatible).toBe(false)
+
+    // With a real map the pair is still proof FOR its level: it widens the map (the
+    // deployment demonstrably runs `max`), while the map keeps excluding what neither names.
+    const mapped = base.replace(
+      '        - id: glm-5.3\n',
+      '        - id: glm-5.3\n          reasoningEfforts:\n            high: high\n',
+    )
+    const widened = parseEffortSupport(mapped)
+    expect([...(widened.declaredLevels.get('glm-5.3') ?? [])].sort()).toEqual(['high', 'max'])
+    expect(checkEffortSupport('glm-5.3', 'high', widened).incompatible).toBe(false)
+    expect(checkEffortSupport('glm-5.3', 'max', widened).incompatible).toBe(false)
+    expect(checkEffortSupport('glm-5.3', 'medium', widened).incompatible).toBe(true)
+  })
+
+  it('J21: an undeclared pi-ai model KEEPS the pin — absence of a map is not a rejection', async () => {
+    // The production shape (xiaomi/mimo-v2.6-pro): hand-declared under llm-pi-ai with
+    // no reasoningEfforts map. Reading that absence as "off-only" stripped the pin here
+    // and, in the live deployment, every pin there was. The live evidence says the
+    // absence is UNKNOWN — a pinned mimo task did real work, and 4,566 events carry zero
+    // unsupported-effort refusals — so the pin must go out and be recorded as such.
     effortSettingsHome = makeSettingsHome(UNDECLARED_SETTINGS)
     try {
       const { service, fake, dir } = await bootEffortLadder()
@@ -806,13 +882,12 @@ describe('swarm service (integration, fake subagents)', () => {
       await waitFor(
         () => service.snapshot().tasks.find((t) => t.id === 'u1')?.status === 'completed',
         10000,
-        'task completed without a pin',
+        'task completed with its pin kept',
       )
-      // No pin anywhere: not on the durable event, not on the board.
-      expect(service.events.all().find((e) => e.kind === 'task/started' && e.taskId === 'u1')?.data?.effort).toBeUndefined()
-      expect(service.snapshot().tasks.find((t) => t.id === 'u1')?.agent?.effort).toBeUndefined()
-      // The MODEL was not dropped with the pin: the attempt ran on the role's model,
-      // once, with no rung retry (every rung would be refused by the same model).
+      // On the durable event AND on the board: no strip anywhere.
+      expect(service.events.all().find((e) => e.kind === 'task/started' && e.taskId === 'u1')?.data?.effort).toBe('max')
+      expect(service.snapshot().tasks.find((t) => t.id === 'u1')?.agent?.effort).toBe('max')
+      // One child on the role's model: a kept pin never fails fast, so no rung is spent.
       expect(fake.calls.length).toBe(1)
       expect(fake.calls[0].agentOptions?.model).toBe('glm-5.3')
     } finally {
@@ -919,7 +994,10 @@ describe('swarm service (integration, fake subagents)', () => {
     return pins
   }
 
-  it('J21: a reviewer pinned on a map-less pi-ai model gets the pin stripped, and the review still completes', async () => {
+  it('J21: a reviewer pinned on a map-less pi-ai model KEEPS the pin, and the review still completes', async () => {
+    // The reviewer spawn site takes the same decision as the task site: a map-less
+    // model is unknown, not incapable, so the reviewer's pin survives. This is the
+    // production reviewer shape — a mimo-class reviewer with an effort configured.
     const { service, fake, dir } = await bootRunnable()
     const pins = spyPins(service)
     const table = structuredClone(service.duty.get())
@@ -927,7 +1005,7 @@ describe('swarm service (integration, fake subagents)', () => {
     service.setDutyTable(table, 'test')
 
     const result = service.dispatch({
-      title: 'reviewer strip',
+      title: 'reviewer keep on a map-less model',
       spec: 's',
       tasks: [{ id: 'r1', subject: 'R', description: 'd', role: 'builder', reviewBy: 'reviewer' }],
     }, makeDispatcher(dir) as never)
@@ -936,12 +1014,44 @@ describe('swarm service (integration, fake subagents)', () => {
     await waitFor(
       () => service.snapshot().tasks.find((t) => t.id === 'r1')?.status === 'completed',
       10000,
-      'task completed with a stripped reviewer pin',
+      'task completed with the reviewer pin kept',
     )
     // call 0 = builder (sess-1, unpinned), call 1 = reviewer (sess-2).
     expect(fake.calls[1]?.agentOptions?.model).toBe('glm-5.3-air')
-    expect(pins.find((p) => p.child === 'sess-2')?.effort).toBeUndefined()
+    expect(pins.find((p) => p.child === 'sess-2')?.effort).toBe('max')
     expect(service.snapshot().tasks.find((t) => t.id === 'r1')?.reviewed).toBe(true)
+  }, 20000)
+
+  it('J21: a reviewer pinned to a level its model does not declare still gets the pin stripped', async () => {
+    // Dropping the map-less rule must not drop the strip: positive evidence still wins,
+    // on the review path too. glm-5.3 declares ONLY `high` in this fixture, and the
+    // reviewer asks for `max` — the one shape that is genuinely unsupported.
+    effortSettingsHome = makeSettingsHome(HIGH_ONLY_SETTINGS)
+    try {
+      const { service, fake, dir } = await bootRunnable()
+      const pins = spyPins(service)
+      const table = structuredClone(service.duty.get())
+      table.roles.reviewer = { ...table.roles.reviewer, provider: 'zai', model: 'glm-5.3', reasoningEffort: 'max' }
+      service.setDutyTable(table, 'test')
+
+      const result = service.dispatch({
+        title: 'reviewer strip on positive evidence',
+        spec: 's',
+        tasks: [{ id: 'r1b', subject: 'R', description: 'd', role: 'builder', reviewBy: 'reviewer' }],
+      }, makeDispatcher(dir) as never)
+      service.endorse(result.runId)
+
+      await waitFor(
+        () => service.snapshot().tasks.find((t) => t.id === 'r1b')?.status === 'completed',
+        10000,
+        'task completed with the reviewer pin stripped',
+      )
+      expect(fake.calls[1]?.agentOptions?.model).toBe('glm-5.3')
+      expect(pins.find((p) => p.child === 'sess-2')?.effort).toBeUndefined()
+      expect(service.snapshot().tasks.find((t) => t.id === 'r1b')?.reviewed).toBe(true)
+    } finally {
+      effortSettingsHome = undefined
+    }
   }, 20000)
 
   it('J21: a reviewer pinned to a DECLARED level keeps the pin', async () => {
@@ -969,31 +1079,39 @@ describe('swarm service (integration, fake subagents)', () => {
   }, 20000)
 
   it('J21: the reviewer re-ask spawn gets the same strip', async () => {
-    const { service, fake, dir } = await bootRunnable()
-    const pins = spyPins(service)
-    const table = structuredClone(service.duty.get())
-    table.roles.reviewer = { ...table.roles.reviewer, provider: 'zai', model: 'glm-5.3-air', reasoningEffort: 'high' }
-    service.setDutyTable(table, 'test')
-    // The reviewer forgets the verdict line on the first pass; the 0.6.9 re-ask
-    // (the SECOND review spawn site) then supplies it.
-    fake.script = { 1: 'a long assessment with no verdict line at all', 2: 'VERDICT: APPROVE' }
+    // The re-ask is the SECOND review spawn site, so the strip must reach it too — and
+    // it is proven here with positive evidence (a declared map that excludes the pin),
+    // which is the only case that still strips after the 2026-09-26 policy change.
+    effortSettingsHome = makeSettingsHome(HIGH_ONLY_SETTINGS)
+    try {
+      const { service, fake, dir } = await bootRunnable()
+      const pins = spyPins(service)
+      const table = structuredClone(service.duty.get())
+      table.roles.reviewer = { ...table.roles.reviewer, provider: 'zai', model: 'glm-5.3', reasoningEffort: 'max' }
+      service.setDutyTable(table, 'test')
+      // The reviewer forgets the verdict line on the first pass; the 0.6.9 re-ask
+      // (the SECOND review spawn site) then supplies it.
+      fake.script = { 1: 'a long assessment with no verdict line at all', 2: 'VERDICT: APPROVE' }
 
-    const result = service.dispatch({
-      title: 'reviewer re-ask strip',
-      spec: 's',
-      tasks: [{ id: 'r3', subject: 'R', description: 'd', role: 'builder', reviewBy: 'reviewer' }],
-    }, makeDispatcher(dir) as never)
-    service.endorse(result.runId)
+      const result = service.dispatch({
+        title: 'reviewer re-ask strip',
+        spec: 's',
+        tasks: [{ id: 'r3', subject: 'R', description: 'd', role: 'builder', reviewBy: 'reviewer' }],
+      }, makeDispatcher(dir) as never)
+      service.endorse(result.runId)
 
-    await waitFor(
-      () => service.snapshot().tasks.find((t) => t.id === 'r3')?.status === 'completed',
-      10000,
-      'task completed after the re-ask',
-    )
-    expect(fake.calls.length).toBe(3) // builder + reviewer + re-ask
-    expect(pins.find((p) => p.child === 'sess-2')?.effort).toBeUndefined()
-    expect(pins.find((p) => p.child === 'sess-3')?.effort).toBeUndefined()
-    expect(service.snapshot().tasks.find((t) => t.id === 'r3')?.reviewed).toBe(true)
+      await waitFor(
+        () => service.snapshot().tasks.find((t) => t.id === 'r3')?.status === 'completed',
+        10000,
+        'task completed after the re-ask',
+      )
+      expect(fake.calls.length).toBe(3) // builder + reviewer + re-ask
+      expect(pins.find((p) => p.child === 'sess-2')?.effort).toBeUndefined()
+      expect(pins.find((p) => p.child === 'sess-3')?.effort).toBeUndefined()
+      expect(service.snapshot().tasks.find((t) => t.id === 'r3')?.reviewed).toBe(true)
+    } finally {
+      effortSettingsHome = undefined
+    }
   }, 20000)
 
   it('swarm_report authenticates tracked child sessions only', async () => {
@@ -2137,9 +2255,9 @@ describe('swarm service (integration, fake subagents)', () => {
     }, makeDispatcher(dir) as never)
     service.endorse(result.runId)
 
-    await waitFor(
+    await pumpUntil(
+      service,
       () => service.snapshot().tasks.find((t) => t.id === 'hand')?.status === 'completed',
-      30000,
       'task adopted from its on-disk report',
       () => 'tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, t.lastNote])),
     )
@@ -2165,9 +2283,9 @@ describe('swarm service (integration, fake subagents)', () => {
     }, makeDispatcher(dir) as never)
     service.endorse(result.runId)
 
-    await waitFor(
+    await pumpUntil(
+      service,
       () => ['failed', 'retrying'].includes(service.snapshot().tasks.find((t) => t.id === 'half')?.status ?? ''),
-      8000,
       'incomplete report left the task failed',
     )
     expect(service.snapshot().tasks.find((t) => t.id === 'half')?.status).not.toBe('completed')
@@ -2197,9 +2315,9 @@ describe('swarm service (integration, fake subagents)', () => {
     }, makeDispatcher(dir) as never)
     service.endorse(result.runId)
 
-    await waitFor(
+    await pumpUntil(
+      service,
       () => ['failed', 'retrying'].includes(service.snapshot().tasks.find((t) => t.id === 'stale')?.status ?? ''),
-      8000,
       'stale report rejected so the task is charged as failed',
       () => 'tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, t.summary])),
     )

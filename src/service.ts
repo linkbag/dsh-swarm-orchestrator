@@ -12,7 +12,7 @@ import { Service } from '@deepseek-ai/cordis'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-subagent'
 import { PLUGIN_VERSION, type SwarmConfig } from './config.js'
-import { checkEffortSupport, parseEffortSupport, type EffortSupport } from './preflight.js'
+import { checkEffortSupport, resolveEffortSupport, type EffortSourceFile, type EffortSupport, type SettingsEntryValue } from './preflight.js'
 import { validateDag } from './domain/dag.js'
 import { DutyTableStore } from './domain/duty-table.js'
 import { EventStore } from './domain/event-store.js'
@@ -1578,24 +1578,98 @@ export class SwarmService extends Service {
   }
 
   /**
-   * J21: the deployment's declared effort support, from settings.yaml. Read once.
-   * Returns undefined when the file cannot be located or parsed — the check is
-   * then skipped entirely rather than guessing.
+   * J21: the deployment's declared effort support. Read once, then cached.
+   *
+   * Two sources, in order (2026-09-26): the LIVE settings service first — DSH moved
+   * the document out of `$DSH_HOME/settings.yaml` into the active profile and renamed
+   * the old file (`settings.yaml.imported`), which is exactly why this check went
+   * blind and validated nothing while still looking healthy. `ctx.settings.describe()`
+   * reports each profile entry with its live Config value, so it is the authoritative
+   * source now. The legacy file remains as a fallback for installs that predate the
+   * service; the renamed `.imported` document is deliberately NOT a candidate — it is
+   * a stale copy, and a verdict read from it would describe a deployment that no
+   * longer exists.
+   *
+   * A source that declares nothing is skipped rather than trusted, and when NO source
+   * declares anything the check is inactive — "nothing judged", never "everything
+   * supported". That inactivity is now logged once (this method is cached), because
+   * silence is how it went unnoticed in the first place.
    */
   private effortSupport(): EffortSupport | undefined {
     if (this.effortSupportRead) return this.effortSupportCache
     this.effortSupportRead = true
+
+    // 1. Live settings service. Resolved structurally via ctx.get(), like the other
+    //    optional services this plugin uses, so there is no host-package import.
+    const serviceEntries: SettingsEntryValue[] = []
+    let serviceLabel = 'settings service (absent)'
+    const settings = this.ctx.get('settings') as
+      { describe?: (options?: { redactSecrets?: boolean }) => unknown } | undefined
+    if (settings !== undefined && typeof settings.describe === 'function') {
+      serviceLabel = 'settings service'
+      try {
+        const described = settings.describe({ redactSecrets: true })
+        if (Array.isArray(described)) {
+          for (const descriptor of described) {
+            const record = descriptor as { ns?: unknown; value?: unknown } | null
+            if (record !== null && typeof record === 'object' && typeof record.ns === 'string') {
+              serviceEntries.push({ ns: record.ns, value: record.value })
+            }
+          }
+        }
+      } catch {
+        // An unreadable service is simply not a source; the file fallback still runs.
+      }
+    }
+
+    // 2. Legacy file fallback.
+    const files: EffortSourceFile[] = []
     try {
       const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '', '.dsh')
       for (const candidate of [join(home, 'settings.yaml'), join(homedir(), '.dsh', 'settings.yaml')]) {
         if (!existsSync(candidate)) continue
-        this.effortSupportCache = parseEffortSupport(readFileSync(candidate, 'utf8'))
-        return this.effortSupportCache
+        try {
+          files.push({ path: candidate, text: readFileSync(candidate, 'utf8') })
+        } catch {
+          // unreadable candidate: try the next one
+        }
       }
     } catch {
-      // unreadable settings: no preflight, J18's graceful degradation still applies
+      // no filesystem access: the service above already had its chance
     }
-    return undefined
+
+    const resolved = resolveEffortSupport({
+      service: { label: serviceLabel, entries: serviceEntries.length > 0 ? serviceEntries : undefined },
+      files,
+    })
+    this.effortSupportCache = resolved.support
+    const log = this.ctx.logger('swarm')
+    if (resolved.support === undefined) {
+      log.warn(
+        'effort preflight INACTIVE: no settings source declared any model (consulted: %s) — effort pins are NOT validated, so an unsupported pin will surface only as a dead child',
+        resolved.consulted.join(', '),
+      )
+    } else {
+      // Distinct models, not a sum: the default-model pair can put the same id in both
+      // `supported` and `declaredWithoutMap` (the live deployment is exactly that case),
+      // and an operator-facing count that double-counts a model is worse than no count.
+      // "Known levels" covers a declared map and that proven pair alike; the map-less
+      // count is the uncertainty the policy change accepts, and it is reported so the
+      // number is never invisible.
+      const read = new Set([
+        ...resolved.support.supported,
+        ...resolved.support.declaredWithoutMap,
+        ...resolved.support.declaredLevels.keys(),
+      ])
+      log.info(
+        'effort preflight active from %s (%d model(s) read, %d with known levels; %d declared without an effort map: pins left in place there — the adapter\'s catalog may still support them)',
+        resolved.source ?? 'unknown',
+        read.size,
+        resolved.support.supported.size,
+        resolved.support.declaredWithoutMap.size,
+      )
+    }
+    return this.effortSupportCache
   }
 
   /**
