@@ -2,6 +2,45 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.28
+
+**Fix: the Flow tab's new click selected a task but could not show a sidebar.**
+
+### Fixed
+
+- **0.6.27 wired the Flow boxes to a selection the Flow view had no way to display.**
+  The task drawer was rendered inside the *board* arm of the tab ternary
+  (`client/SwarmTab.tsx`, the drawer opening at ~509 within the board branch), while
+  the flow arm returned a bare `<FlowChart>` with neither the `.dsh-swarm-body` flex
+  row nor any drawer. So clicking a box set the shared selection - the blue ring
+  appeared, exactly as the operator reported - and nothing else could happen, because
+  the drawer had no render site in that view. The drawer is now built once as a shared
+  value and consumed by both arms, and the Flow canvas is wrapped in the same
+  `.dsh-swarm-body` / `main.dsh-swarm-main` structure so it shrinks and scrolls beside
+  the drawer instead of being clipped. The board's own layout is untouched: its
+  wrapper and its drawer slot are unchanged, which is why this was the smaller, safer
+  change than hoisting the drawer to the component root.
+- Roster deliberately does not share the drawer - it is a full-width settings form
+  with no task context and would need its own semantics.
+
+### Tests
+
+- **The test that would have caught it**: `tests/flow-drawer.test.ts` renders
+  `SwarmTab` itself (mocked board store, stubbed localStorage, `renderToStaticMarkup`)
+  instead of `FlowChart` in isolation - which is precisely why the 0.6.27 tests missed
+  this. It asserts the drawer is present in the Flow view with a selected task, that it
+  sits after the canvas as a sibling column rather than nested inside it, that it is
+  absent with no selection, and that it is still present in the Board view (guarding
+  the extraction). **Fail-before proof**: removing the flow arm's drawer render fails
+  the first of those in 11 ms.
+- Suite: **248 tests, 248 pass, 22/22 files**.
+
+### Known residual
+
+- J10's turn-bounded pump can still exhaust its 2000 turns in the heaviest loaded run:
+  it failed once (59.3 s total) in run 1 of three during this work, with runs 2 and 3
+  green. The assertion is load-sensitive; the behaviour under test is not.
+
 ## 0.6.27
 
 **Flow-chart boxes now open the task detail sidebar, exactly like board cards do.**

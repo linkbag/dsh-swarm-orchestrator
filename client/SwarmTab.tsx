@@ -37,13 +37,21 @@ function timeAgo(at: number, t: T): string {
   return t('time.days', { n: Math.round(seconds / 86400) })
 }
 
-export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
+// The optional initial* props are a TEST SEAM for renderToStaticMarkup: the board,
+// the tab and the selected task are otherwise only reachable through effects or a
+// click, which a DOM-less render cannot produce. Production passes none of them.
+export function SwarmTab({ sessionId, initialBoard, initialView, initialSelectedTask }: {
+  sessionId?: string
+  initialBoard?: Board
+  initialView?: 'board' | 'flow' | 'roster'
+  initialSelectedTask?: BoardTask
+} = {}): JSX.Element {
   const t = useT()
-  const [board, setBoard] = useState<Board | null>(null)
+  const [board, setBoard] = useState<Board | null>(initialBoard ?? null)
   const [error, setError] = useState<string | null>(null)
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
-  const [selectedTask, setSelectedTask] = useState<BoardTask | null>(null)
-  const [view, setView] = useState<'board' | 'flow' | 'roster'>('board')
+  const [selectedTask, setSelectedTask] = useState<BoardTask | null>(initialSelectedTask ?? null)
+  const [view, setView] = useState<'board' | 'flow' | 'roster'>(initialView ?? 'board')
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -197,6 +205,100 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
     void runAction({ action: 'set-run-board-state', runId, state })
   }, [runAction])
 
+  // One drawer instance for every view: the Flow canvas and the board share the
+  // same selection, so re-nesting this inside the board branch is exactly the
+  // defect this replaced (clicking a flow box highlighted the task but opened
+  // nothing). tests/flow-drawer.test.ts pins the Flow case.
+  const taskDrawer = selectedTask !== null ? (
+    <aside className="dsh-swarm-drawer">
+      <header>
+        <h3>{selectedTask.subject}</h3>
+        <button className="dsh-swarm-btn ghost" onClick={() => { setSelectedTask(null) }}>✕</button>
+      </header>
+      <dl>
+        <dt>{t('field.task')}</dt><dd><code>{selectedTask.id}</code></dd>
+        <dt>{t('field.status')}</dt><dd style={{ color: statusColor(selectedTask.status) }}>{statusT(selectedTask.status)}{selectedTask.blockedReason !== undefined ? ` — ${selectedTask.blockedReason}` : ''}</dd>
+        <dt>{t('field.role')}</dt><dd><kbd>{selectedTask.role}</kbd></dd>
+        <dt>{t('field.model')}</dt>
+        <dd>{selectedTask.agent?.model !== undefined ? `${selectedTask.agent.provider ?? ''} / ${selectedTask.agent.model}` : t('field.deploymentDefault')}</dd>
+        {selectedTask.blockedBy !== undefined && selectedTask.blockedBy.length > 0 && (
+          <>
+            <dt>{t('field.dependsOn')}</dt><dd>{selectedTask.blockedBy.map((b) => <code key={b}>{b}</code>)}</dd>
+          </>
+        )}
+        {selectedTask.reviewBy !== undefined && (
+          <>
+            <dt>{t('field.reviewedBy')}</dt><dd><kbd>{selectedTask.reviewBy}</kbd>{selectedTask.reviewed === true ? ' ✓' : ''}{(selectedTask.reviews ?? 0) > 0 ? ` ${t('field.rounds', { count: selectedTask.reviews ?? 0, plural: (selectedTask.reviews ?? 0) === 1 ? '' : 's' })}` : ''}{selectedTask.reviewExhausted === true ? t('field.loopExhausted') : ''}</dd>
+          </>
+        )}
+        {Array.isArray(selectedTask.writes) && selectedTask.writes.length > 0 && (
+          <>
+            <dt>{t('field.writeScope')}</dt>
+            <dd>
+              {formatWriteScope(selectedTask.writes).map((label, i) => (
+                // Formatting lives in client/write-scope.ts (pure, unit-tested):
+                // a config-authored scope can be an object, and a malformed
+                // payload must never print "[object Object]" or throw.
+                <code key={i}>{label}</code>
+              ))}
+            </dd>
+          </>
+        )}
+        <dt>{t('field.attempts')}</dt><dd>{selectedTask.attempts}</dd>
+        <dt>{t('field.updated')}</dt><dd>{timeAgo(selectedTask.updatedAt, t)}</dd>
+      </dl>
+      <h4>{t('field.brief')}</h4>
+      <p className="dsh-swarm-brief">{selectedTask.description}</p>
+      {selectedTask.summary !== undefined && selectedTask.summary.length > 0 && (
+        <>
+          <h4>{t('field.finalSummary')}</h4>
+          <p className="dsh-swarm-brief">{selectedTask.summary}</p>
+        </>
+      )}
+      {selectedTask.reviewFeedback !== undefined && selectedTask.reviewFeedback.length > 0 && (
+        <>
+          <h4>{t('field.reviewerFeedback')}</h4>
+          <p className="dsh-swarm-brief">{selectedTask.reviewFeedback}</p>
+        </>
+      )}
+      {selectedTask.lastNote !== undefined && selectedTask.lastNote !== selectedTask.summary && (
+        <>
+          <h4>{t('field.latestNote')}</h4>
+          <p className="dsh-swarm-brief">{selectedTask.lastNote}</p>
+        </>
+      )}
+      {(selectedTask.humanReview === true && selectedTask.status === 'reviewing') && (
+        <>
+          <h4>{t('review.pending')}</h4>
+          <div className="dsh-swarm-tvc-actions">
+            <button
+              className="dsh-swarm-btn primary"
+              disabled={busy}
+              onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'approve' }).then(() => setSelectedTask(null)) }}
+            >
+              {t('review.approve')}
+            </button>
+            <button
+              className="dsh-swarm-btn danger"
+              disabled={busy}
+              onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'reject' }) }}
+            >
+              {t('review.reject')}
+            </button>
+          </div>
+        </>
+      )}
+      {(selectedTask.status === 'failed' || selectedTask.status === 'blocked') && (
+        <button
+          className="dsh-swarm-btn primary"
+          disabled={busy}
+          onClick={() => { void runAction({ action: 'retry-task', runId: selectedTask.runId, taskId: selectedTask.id }) }}
+        >
+          {t('task.retry')}
+        </button>
+      )}
+    </aside>
+  ) : null
   return (
     <div className="dsh-swarm-tab">
       <header className="dsh-swarm-header">
@@ -237,19 +339,24 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
           <RuntimeSettings board={board} />
         </>
       ) : view === 'flow' ? (
-        run !== null ? (
-          // One selection state for both views: opening a task from a flow box and
-          // then switching to Board (or vice versa) shows that same task selected.
-          // The toggle matches the Board card's: clicking the open task closes it.
-          <FlowChart
-            run={run}
-            tasks={tasks}
-            selectedTaskId={selectedTask?.id ?? null}
-            onSelectTask={(task) => { setSelectedTask(selectedTask !== null && selectedTask.id === task.id ? null : task) }}
-          />
-        ) : (
-          <div className="dsh-swarm-placeholder"><p>{t('flow.noRun')}</p></div>
-        )
+        // The canvas sits in the same two-column body the board uses, so the task
+        // drawer has a real column: the canvas shrinks/scrolls inside <main> instead of
+        // being clipped by it. Same selection state as the board cards.
+        <div className="dsh-swarm-body">
+          <main className="dsh-swarm-main">
+            {run !== null ? (
+              <FlowChart
+                run={run}
+                tasks={tasks}
+                selectedTaskId={selectedTask?.id ?? null}
+                onSelectTask={(task) => { setSelectedTask(selectedTask !== null && selectedTask.id === task.id ? null : task) }}
+              />
+            ) : (
+              <div className="dsh-swarm-placeholder"><p>{t('flow.noRun')}</p></div>
+            )}
+          </main>
+          {taskDrawer}
+        </div>
       ) : board === null && error === null ? (
         <div className="dsh-swarm-placeholder"><p>{t('board.connecting')}</p></div>
       ) : runs.length === 0 ? (
@@ -506,96 +613,7 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
             </main>
           )}
 
-          {selectedTask !== null && (
-            <aside className="dsh-swarm-drawer">
-              <header>
-                <h3>{selectedTask.subject}</h3>
-                <button className="dsh-swarm-btn ghost" onClick={() => { setSelectedTask(null) }}>✕</button>
-              </header>
-              <dl>
-                <dt>{t('field.task')}</dt><dd><code>{selectedTask.id}</code></dd>
-                <dt>{t('field.status')}</dt><dd style={{ color: statusColor(selectedTask.status) }}>{statusT(selectedTask.status)}{selectedTask.blockedReason !== undefined ? ` — ${selectedTask.blockedReason}` : ''}</dd>
-                <dt>{t('field.role')}</dt><dd><kbd>{selectedTask.role}</kbd></dd>
-                <dt>{t('field.model')}</dt>
-                <dd>{selectedTask.agent?.model !== undefined ? `${selectedTask.agent.provider ?? ''} / ${selectedTask.agent.model}` : t('field.deploymentDefault')}</dd>
-                {selectedTask.blockedBy !== undefined && selectedTask.blockedBy.length > 0 && (
-                  <>
-                    <dt>{t('field.dependsOn')}</dt><dd>{selectedTask.blockedBy.map((b) => <code key={b}>{b}</code>)}</dd>
-                  </>
-                )}
-                {selectedTask.reviewBy !== undefined && (
-                  <>
-                    <dt>{t('field.reviewedBy')}</dt><dd><kbd>{selectedTask.reviewBy}</kbd>{selectedTask.reviewed === true ? ' ✓' : ''}{(selectedTask.reviews ?? 0) > 0 ? ` ${t('field.rounds', { count: selectedTask.reviews ?? 0, plural: (selectedTask.reviews ?? 0) === 1 ? '' : 's' })}` : ''}{selectedTask.reviewExhausted === true ? t('field.loopExhausted') : ''}</dd>
-                  </>
-                )}
-                {Array.isArray(selectedTask.writes) && selectedTask.writes.length > 0 && (
-                  <>
-                    <dt>{t('field.writeScope')}</dt>
-                    <dd>
-                      {formatWriteScope(selectedTask.writes).map((label, i) => (
-                        // Formatting lives in client/write-scope.ts (pure, unit-tested):
-                        // a config-authored scope can be an object, and a malformed
-                        // payload must never print "[object Object]" or throw.
-                        <code key={i}>{label}</code>
-                      ))}
-                    </dd>
-                  </>
-                )}
-                <dt>{t('field.attempts')}</dt><dd>{selectedTask.attempts}</dd>
-                <dt>{t('field.updated')}</dt><dd>{timeAgo(selectedTask.updatedAt, t)}</dd>
-              </dl>
-              <h4>{t('field.brief')}</h4>
-              <p className="dsh-swarm-brief">{selectedTask.description}</p>
-              {selectedTask.summary !== undefined && selectedTask.summary.length > 0 && (
-                <>
-                  <h4>{t('field.finalSummary')}</h4>
-                  <p className="dsh-swarm-brief">{selectedTask.summary}</p>
-                </>
-              )}
-              {selectedTask.reviewFeedback !== undefined && selectedTask.reviewFeedback.length > 0 && (
-                <>
-                  <h4>{t('field.reviewerFeedback')}</h4>
-                  <p className="dsh-swarm-brief">{selectedTask.reviewFeedback}</p>
-                </>
-              )}
-              {selectedTask.lastNote !== undefined && selectedTask.lastNote !== selectedTask.summary && (
-                <>
-                  <h4>{t('field.latestNote')}</h4>
-                  <p className="dsh-swarm-brief">{selectedTask.lastNote}</p>
-                </>
-              )}
-              {(selectedTask.humanReview === true && selectedTask.status === 'reviewing') && (
-                <>
-                  <h4>{t('review.pending')}</h4>
-                  <div className="dsh-swarm-tvc-actions">
-                    <button
-                      className="dsh-swarm-btn primary"
-                      disabled={busy}
-                      onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'approve' }).then(() => setSelectedTask(null)) }}
-                    >
-                      {t('review.approve')}
-                    </button>
-                    <button
-                      className="dsh-swarm-btn danger"
-                      disabled={busy}
-                      onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'reject' }) }}
-                    >
-                      {t('review.reject')}
-                    </button>
-                  </div>
-                </>
-              )}
-              {(selectedTask.status === 'failed' || selectedTask.status === 'blocked') && (
-                <button
-                  className="dsh-swarm-btn primary"
-                  disabled={busy}
-                  onClick={() => { void runAction({ action: 'retry-task', runId: selectedTask.runId, taskId: selectedTask.id }) }}
-                >
-                  {t('task.retry')}
-                </button>
-              )}
-            </aside>
-          )}
+          {taskDrawer}
         </div>
       )}
     </div>
