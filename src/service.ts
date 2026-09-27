@@ -114,7 +114,10 @@ function describeEvidenceFailure(outcome: EvidenceCommandOutcome): string {
     ? outcome.command.slice(0, EVIDENCE_COMMAND_CHARS) + '…'
     : outcome.command
   const verdict = outcome.timedOut
-    ? 'TIMED OUT — the runner killed it at the ceiling before it exited'
+    ? 'TIMED OUT — the runner killed it at the ceiling before it exited: that is the'
+      + ' configured limit, NOT a verdict on the command, so a slow-but-passing command'
+      + ' looks exactly like this. Raise evidenceTimeoutMs if it legitimately needs longer,'
+      + ' or replace it with a cheap targeted assertion'
     : outcome.spawnError !== undefined
       ? `could not be started (${outcome.spawnError}) — the run workspace or the interpreter is missing`
       : `exit code ${outcome.exitCode ?? 'unknown'}`
@@ -2609,6 +2612,11 @@ export class SwarmService extends Service {
       this.events.append('run/resumed', { runId })
     }
     this.events.append('task/failed', { runId, taskId, data: { retry: true, reason: 'manual retry' } })
+    // Observed live (run-mujadjk9-d7zr): the retry left the task in `retrying` and the
+    // revived run then sat idle for 62 minutes, because a terminal run's tick loop has
+    // stopped and appending the event does not restart it. Kick it explicitly —
+    // scheduleTick is idempotent, so calling it here cannot double-schedule.
+    this.scheduleTick()
   }
 
   /** Track a spawned child session for report authentication + effort pinning. */

@@ -73,6 +73,10 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context:
           'Never report the task done while any command above fails. If it fails and you cannot fix the cause, report **not done** and include the failure output: a false "done" blocks the whole run for a human.',
           'Put the proof in your summary: for each command, the exact line you ran, its exit code, and the last ~10 lines of output — exit code plus a short tail, never a full log.',
           'Write commands and checks that do not depend on where they run: prefer absolute paths, and do not assert on git topology, branch names or relative directories you have not just verified exist.',
+          // Observed live (Mimo mirrors v2, 2026-09-27): the declared command ran the whole
+          // suite — 2042 tests, 122s — against the 120s default ceiling, so the runner killed
+          // it and the task blocked for a human on a command that would have passed.
+          'Keep each command cheap and targeted: a single assertion or a short script. Never declare a full test suite or a long build as evidence — the runner kills it at the configured ceiling, and a slow-but-passing command then looks exactly like a failure.',
         ]
       : []),
     ...(task.reviewFeedback !== undefined

@@ -519,9 +519,27 @@ export function SwarmTab({ sessionId }: { sessionId?: string }): JSX.Element {
                     <dt>{t('field.reviewedBy')}</dt><dd><kbd>{selectedTask.reviewBy}</kbd>{selectedTask.reviewed === true ? ' ✓' : ''}{(selectedTask.reviews ?? 0) > 0 ? ` ${t('field.rounds', { count: selectedTask.reviews ?? 0, plural: (selectedTask.reviews ?? 0) === 1 ? '' : 's' })}` : ''}{selectedTask.reviewExhausted === true ? t('field.loopExhausted') : ''}</dd>
                   </>
                 )}
-                {selectedTask.writes !== undefined && selectedTask.writes.length > 0 && (
+                {Array.isArray(selectedTask.writes) && selectedTask.writes.length > 0 && (
                   <>
-                    <dt>{t('field.writeScope')}</dt><dd>{selectedTask.writes.map((f) => <code key={f}>{f}</code>).join(' ')}</dd>
+                    <dt>{t('field.writeScope')}</dt>
+                    <dd>
+                      {selectedTask.writes.map((f, i) => {
+                        // The roster carries strings, but a config-authored scope can be an
+                        // object (e.g. {path, glob}) — show its path rather than
+                        // "[object Object]", and never throw on a malformed entry.
+                        const label = ((): string => {
+                          if (typeof f === 'string') return f
+                          if (f === null || typeof f !== 'object') return String(f)
+                          const o = f as Record<string, unknown>
+                          for (const key of ['path', 'glob', 'pattern', 'scope', 'file']) {
+                            const v = o[key]
+                            if (typeof v === 'string' && v.length > 0) return v
+                          }
+                          try { return JSON.stringify(f) } catch { return '[unprintable write scope]' }
+                        })()
+                        return <code key={i}>{label}</code>
+                      })}
+                    </dd>
                   </>
                 )}
                 <dt>{t('field.attempts')}</dt><dd>{selectedTask.attempts}</dd>

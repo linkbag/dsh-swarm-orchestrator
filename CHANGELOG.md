@@ -2,6 +2,58 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.25
+
+**A manual retry relaunches, the ceiling timeout explains itself, and two small fixes.**
+
+### Fixed
+
+- **A manual retry on a stopped run now actually launches the new attempt.**
+  `retryTask` appended `task/failed {retry:true}` - the task correctly became
+  `retrying` and the terminal run emitted `run/resumed` - but a terminal run's tick
+  loop has stopped, and appending an event never restarted it, so nothing ever
+  dispatched the retried task. Live case (`run-mujadjk9-d7zr`): no event for 62
+  minutes, `running=0`, 15 dependents still blocked, while the board read
+  "retrying". The fix is one line - `scheduleTick()` after the retry event - and it is
+  idempotent by construction, since `scheduleTick()` returns immediately when a tick
+  is already scheduled.
+- **The ceiling timeout now says what it is.** A command killed at the runner ceiling
+  is reported as exactly that - naming the limit and the remedy - instead of reading
+  like a verdict on the command: "that is the configured limit, NOT a verdict on the
+  command, so a slow-but-passing command looks exactly like this. Raise
+  evidenceTimeoutMs if it legitimately needs longer, or replace it with a cheap
+  targeted assertion." The live case: a 122 s suite against the 120 s default.
+- **`Write scope: [object Object]`** in the task detail panel. The row now tolerates a
+  non-array (which previously threw), renders strings directly, resolves an object
+  entry through `path`/`glob`/`pattern`/`scope`/`file`, falls back to JSON, and can no
+  longer print `[object Object]` or crash the panel.
+
+### Changed
+
+- **One line added to the task prompt**: keep each evidence command cheap and targeted
+  - a single assertion or a short script - and never declare a full test suite or a
+  long build as evidence, because the runner kills it at the configured ceiling and a
+  slow-but-passing command then looks exactly like a failure.
+
+### Known issues (disclosed, not fixed here)
+
+- **The acceptance/verdict race is still open.** An evidence recheck that finalizes
+  after a human acceptance can flip the task back - observed live, where it forced a
+  second acceptance. It is mapped rather than guessed at: acceptance lives in
+  `completeTaskExternally` (reached by `swarm_complete` and `/swarm complete`), and the
+  late verdict is applied in the completion path which already scopes its recheck by
+  attempt token, so the minimal fix is to record the accepted attempt id on the human
+  decision and drop a verdict arriving for that same attempt. It needs a test that
+  reproduces the interleaving; shipping the map beats shipping a rushed edit.
+- The retry and write-scope fixes are verified by reading and by the unchanged suite;
+  **neither has a dedicated regression test yet**. That gap is real and is the next
+  test work, not something to leave implied.
+
+### Tests
+
+- Suite: **215 tests, 215 pass, 18/18 files**, three runs with a build between each
+  (28.1-28.3 s).
+
 ## 0.6.24
 
 **`/swarm` becomes a control surface, the test suite stops leaking temp dirs, and a dev smoke harness lands.**
