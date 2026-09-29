@@ -40,10 +40,11 @@ It has already shipped real work: the first production run reverse-engineered a 
 
 ## Example Kanban View (real-time workflow)
 
-<img width="1045" height="507" alt="image" src="https://github.com/user-attachments/assets/ab727b4a-c75a-41fe-be3c-3f68e9499c88" />
+<img width="1047" height="565" alt="image" src="https://github.com/user-attachments/assets/b95a5179-df02-4f07-afa7-c805913f5682" />
 
 ## Optional hybrid workteam
-<img width="1057" height="541" alt="image" src="https://github.com/user-attachments/assets/9259d6f0-ea08-4aaa-9a5b-8f0302a839b4" />
+
+<img width="1141" height="455" alt="image" src="https://github.com/user-attachments/assets/6d98540d-d795-4bfd-a652-39058e69b6ed" />
 
 ## Why not just ask one agent?
 
