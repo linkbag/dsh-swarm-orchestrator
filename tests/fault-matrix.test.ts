@@ -337,7 +337,7 @@ describe('fault matrix (J20)', () => {
     // looked like; recovery must be idempotent per boot.
     const { service } = await boot()
     const runId = 'run-cold'
-    service.events.append('run/created', { runId, data: { title: 'cold', spec: 's', tasks: oneTask('c1') } })
+    service.events.append('run/created', { runId, data: { title: 'cold', spec: 's', tasks: oneTask('c1'), dispatch: { authority: { version: 1, sandbox: { mode: 'read-only', workspaceRoot: tmpdir() }, delegated: { sandboxMode: 'read-only', approvalPolicy: 'never' } } } } })
     service.events.append('run/endorsed', { runId })
     service.events.append('task/started', { runId, taskId: 'c1', data: { attemptId: 'att-cold-1' } })
     service.events.append('task/agent-started', { runId, taskId: 'c1', data: { sessionId: 'sess-cold' } })

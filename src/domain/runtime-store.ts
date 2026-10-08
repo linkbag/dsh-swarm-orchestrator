@@ -1,29 +1,48 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { assertAllowedKeys, isPlainRecord, RUNTIME_LIMITS, validateRuntimeInteger, type RuntimeKey } from './limits.js'
 
 /** User-tunable runtime parameters, persisted alongside the duty table. */
-export interface RuntimeOverrides {
-  maxConcurrent?: number
-  maxTotalConcurrentAgents?: number
-  spawnStaggerMs?: number
-  retryBackoffBaseMs?: number
-  circuitBreakerThreshold?: number
-  circuitBreakerCooldownMs?: number
-  nudgeAfterMinutes?: number
-  staleTimeoutSeconds?: number
-  spawnTimeoutSeconds?: number
+export type RuntimeOverrides = Partial<Record<RuntimeKey, number>>
+
+/** Strict on both save and load: a bad override must never turn into a wider policy. */
+export function validateRuntimeOverrides(value: unknown): RuntimeOverrides {
+  if (!isPlainRecord(value)) throw new Error('runtime overrides must be a plain object')
+  assertAllowedKeys(value, Object.keys(RUNTIME_LIMITS), 'runtime overrides')
+  const clean: RuntimeOverrides = {}
+  for (const key of Object.keys(value) as RuntimeKey[]) {
+    clean[key] = validateRuntimeInteger(key, value[key])
+  }
+  return clean
 }
 
-const NUMERIC_KEYS = [
-  'maxConcurrent', 'maxTotalConcurrentAgents', 'spawnStaggerMs', 'retryBackoffBaseMs',
-  'circuitBreakerThreshold', 'circuitBreakerCooldownMs',
-  'nudgeAfterMinutes', 'staleTimeoutSeconds', 'spawnTimeoutSeconds',
-] as const
+/**
+ * Write a validated settings snapshot via a same-directory temporary file.
+ * fsync makes file contents durable before rename; directory-entry durability
+ * after sudden power loss remains filesystem/platform dependent. Single writer.
+ */
+function persist(file: string, value: RuntimeOverrides): void {
+  mkdirSync(dirname(file), { recursive: true })
+  const temporary = `${file}.tmp-${randomUUID()}`
+  let descriptor: number | undefined
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600)
+    writeFileSync(descriptor, JSON.stringify(value, null, 2) + '\n', 'utf8')
+    fsyncSync(descriptor)
+    closeSync(descriptor)
+    descriptor = undefined
+    renameSync(temporary, file)
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+    if (existsSync(temporary)) unlinkSync(temporary)
+  }
+}
 
 /**
- * Persisted runtime parameter overrides. Values here win over the profile's
- * YAML config, so users can tune hardening parameters from the dashboard
- * without editing cordis.patch.yml.
+ * Persisted runtime overrides win over YAML. Invalid legacy settings visibly
+ * disable loading rather than silently dropping a restrictive value and falling
+ * back to a potentially wider deployment default. No repair is performed here.
  */
 export class RuntimeStore {
   private overrides: RuntimeOverrides = {}
@@ -33,21 +52,17 @@ export class RuntimeStore {
   }
 
   private load(): void {
-    if (!existsSync(this.file)) return
+    let raw: string
     try {
-      const parsed = JSON.parse(readFileSync(this.file, 'utf8')) as RuntimeOverrides
-      if (parsed !== null && typeof parsed === 'object') {
-        const clean: RuntimeOverrides = {}
-        for (const key of NUMERIC_KEYS) {
-          const value = parsed[key]
-          if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
-            clean[key] = value
-          }
-        }
-        this.overrides = clean
-      }
-    } catch {
-      // corruption → fall through to defaults
+      raw = readFileSync(this.file, 'utf8')
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+      throw new Error(`cannot read runtime overrides ${this.file}: ${String(error)}`, { cause: error })
+    }
+    try {
+      this.overrides = validateRuntimeOverrides(JSON.parse(raw))
+    } catch (error) {
+      throw new Error(`invalid runtime overrides ${this.file}: ${String(error)}`, { cause: error })
     }
   }
 
@@ -56,16 +71,9 @@ export class RuntimeStore {
   }
 
   save(next: RuntimeOverrides): RuntimeOverrides {
-    const clean: RuntimeOverrides = {}
-    for (const key of NUMERIC_KEYS) {
-      const value = next[key]
-      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
-        clean[key] = Math.round(value)
-      }
-    }
+    const clean = validateRuntimeOverrides(next)
+    persist(this.file, clean)
     this.overrides = clean
-    mkdirSync(dirname(this.file), { recursive: true })
-    writeFileSync(this.file, JSON.stringify(clean, null, 2), 'utf8')
-    return { ...clean }
+    return this.get()
   }
 }

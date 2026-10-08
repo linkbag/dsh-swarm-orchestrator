@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import * as swarmPlugin from '../src/index.js'
+import { EventStore } from '../src/domain/event-store.js'
 
 const STORAGE = 'C:/Users/tsing/.dsh/storages/swarm'
 
@@ -39,6 +40,10 @@ describe('boot audit against the real deployment storage', () => {
     for (const f of ['events.jsonl', 'duty-table.json', 'runtime.json']) {
       if (existsSync(join(STORAGE, f))) cpSync(join(STORAGE, f), join(dir, f))
     }
+    // Validate the isolated copy directly so startup refusal reports its exact
+    // corruption/settings error, never a misleading partially constructed service.
+    const validated = new EventStore(join(dir, 'events.jsonl'))
+    expect(validated.all().length).toBeGreaterThan(0)
     const before = readFileSync(join(dir, 'events.jsonl'), 'utf8').trim().split('\n').length
 
     const ctx = new Context()

@@ -145,6 +145,8 @@ export function apply(ctx: ClientContext): (() => void) | void {
     // The pill tracks RUNS only: live activity, otherwise the newest run's status.
     // Human-waiting attention is the aggregated notification's job, not a count
     // here (a task count also aggregated history, so it never cleared).
+    let latestError: string | null = null
+    let latestSync = store.getSyncState()
     const render = (board: Board | null | undefined): void => {
       const statusWord = (status: string): string => {
         const translated = t(`status.${status}`)
@@ -158,11 +160,18 @@ export function apply(ctx: ClientContext): (() => void) | void {
         status: statusWord,
       }
       const view = badgeView(board?.runs, labels)
-      badge.textContent = view.text
-      badge.className = view.alert ? 'dsh-swarm-badge alert' : 'dsh-swarm-badge'
-      badge.style.display = view.text.length === 0 ? 'none' : 'block'
+      const freshness = t(`sync.${latestSync}`)
+      badge.textContent = [view.text || t('header.title'), freshness, latestError === null ? '' : t('board.refreshError', { error: latestError })].filter(Boolean).join(' · ')
+      const alert = view.alert || latestError !== null || (latestSync !== 'live' && latestSync !== 'snapshot')
+      badge.className = alert ? 'dsh-swarm-badge alert' : 'dsh-swarm-badge'
+      badge.setAttribute('role', latestError === null ? 'status' : 'alert')
+      badge.style.display = 'block'
     }
-    const unsubscribe = store.subscribe((board) => { if (board !== null) render(board) })
+    const unsubscribe = store.subscribe((board, error, sync) => {
+      latestError = error
+      latestSync = sync
+      render(board)
+    })
     // A language switch must re-label the badge too — re-render from the
     // snapshot already in hand, without touching the network.
     const offLocale = locale?.subscribe?.(() => { render(store.get()) })

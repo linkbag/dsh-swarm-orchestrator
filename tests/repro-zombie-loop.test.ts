@@ -88,14 +88,19 @@ describe('repro: host-restart zombie loop', () => {
 
     const at = svc.indexOf('private recoverOrphans()')
     expect(at).toBeGreaterThan(-1)
-    const recoverBody = svc.slice(at, at + 1400)
-    // Still selects the orphan candidates…
+    const end = svc.indexOf('\n  private ', at + 1)
+    const recoverBody = svc.slice(at, end === -1 ? undefined : end)
+    // Recovery now groups by run, and rejects terminal/paused owners BEFORE
+    // examining their tasks. Pin that ordering without an arbitrary line window.
+    const runGuard = recoverBody.indexOf("if (run.status !== 'running') continue")
+    const taskLookup = recoverBody.indexOf('for (const id of run.taskIds)')
+    expect(recoverBody).toContain('for (const run of state.runs.values())')
+    expect(runGuard).toBeGreaterThan(-1)
+    expect(taskLookup).toBeGreaterThan(runGuard)
     expect(recoverBody).toContain("task.status !== 'running'")
-    // …but must now skip any task whose owning run is not running.
-    expect(recoverBody).toMatch(/const\s+run\s*=\s*state\.runs\.get\(task\.runId\)/)
-    expect(recoverBody).toMatch(/run\?\.status\s*!==\s*'running'/)
 
     // The projection guard is what makes the unguarded version loop forever.
-    expect(proj).toMatch(/ownerRun\.status === 'aborted' \|\| ownerRun\.status === 'completed' \|\| ownerRun\.status === 'failed' \|\| ownerRun\.status === 'paused'/)
+    expect(proj).toMatch(/ownerRun\.status === 'aborted' \|\| ownerRun\.status === 'completed' \|\| ownerRun\.status === 'failed'/)
+    expect(proj).toContain("ownerRun?.status === 'paused' && d.source !== 'operator'")
   })
 })

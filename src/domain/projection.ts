@@ -1,4 +1,5 @@
 import type { Run, SwarmEventRecord, Task } from './types.js'
+import { validAuthority } from '../authority.js'
 /** Folded, owned board state — plain JSON only, no live harness objects. */
 export interface SwarmState {
   runs: Map<string, Run>
@@ -55,7 +56,9 @@ export function fold(events: readonly SwarmEventRecord[], state = newState()): S
  * retry is never blocked by its own bookkeeping.
  */
 function staleAttempt(task: Task, d: Record<string, unknown>): boolean {
+  if (d.source === 'operator') return false
   const claimed = d.attemptId
+  if (task.attemptProtocol === 2) return task.attemptRevoked === true || typeof claimed !== 'string' || claimed !== task.attemptId
   if (typeof claimed !== 'string' || claimed.length === 0) return false
   return task.attemptId !== undefined && task.attemptId !== claimed
 }
@@ -84,8 +87,10 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       if (typeof dispatch.provider === 'string') captured.provider = dispatch.provider
       if (typeof dispatch.model === 'string') captured.model = dispatch.model
       if (typeof dispatch.cwd === 'string') captured.cwd = dispatch.cwd
+      if (validAuthority(dispatch.authority)) captured.authority = dispatch.authority
       run.dispatch = captured
     }
+    if (typeof d.planPath === 'string') run.planPath = d.planPath
     state.runs.set(runId, run)
     const specs = Array.isArray(d.tasks) ? (d.tasks as Record<string, unknown>[]) : []
     for (const spec of specs) {
@@ -122,7 +127,8 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
   if (runId !== undefined) {
     const run = state.runs.get(runId)
     if (run === undefined) return
-    run.updatedAt = event.at
+    // Task events touch the run only AFTER task ownership/phase fences below.
+    if (kind.startsWith('run/')) run.updatedAt = event.at
 
     if (kind === 'run/endorsed') {
       // J5 legality: an endorsement may only bring a not-yet-running run to
@@ -145,6 +151,7 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       run.status = 'paused'
       run.pauseReason = str('reason')
     } else if (kind === 'run/resumed') {
+      if (validAuthority(d.authority)) run.dispatch = { ...run.dispatch, authority: d.authority }
       run.status = 'running'
       run.completedAt = undefined
       run.pauseReason = undefined
@@ -169,16 +176,35 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
   if (taskId !== undefined && runId !== undefined) {
     const task = state.tasks.get(taskKey(runId, taskId))
     if (task === undefined) return
-    // J5 legality: a terminal or paused run's tasks never move again (a human
-    // retry appends run/resumed first, which flips the run back to running).
+    // Terminal owners remain frozen; revival must first append run/resumed.
     const ownerRun = state.runs.get(runId)
-    if (ownerRun !== undefined && (ownerRun.status === 'aborted' || ownerRun.status === 'completed' || ownerRun.status === 'failed' || ownerRun.status === 'paused')) {
-      return
+    if (ownerRun !== undefined && (ownerRun.status === 'aborted' || ownerRun.status === 'completed' || ownerRun.status === 'failed')) return
+    // Pause stops autonomous writes, not explicit operator decisions. These do
+    // not resume the run or launch any sibling until the owner resumes it.
+    if (ownerRun?.status === 'paused' && d.source !== 'operator') return
+    if (kind !== 'task/started' && staleAttempt(task, d)) return
+    if (task.attemptProtocol === 2 && d.source !== 'operator') {
+      if (kind === 'task/started' && task.attemptRevoked !== true && (task.status === 'running' || task.status === 'reviewing' || task.status === 'dispatching')) return
+      if (kind === 'task/completed' && task.status !== 'running' && task.status !== 'dispatching') return
+      if (kind === 'task/reviewed' && task.status !== 'reviewing') return
     }
     task.updatedAt = event.at
+    if (ownerRun !== undefined) ownerRun.updatedAt = event.at
 
     switch (kind) {
       case 'task/started':
+        if (task.attemptProtocol === 2 && task.attemptRevoked !== true && (task.status === 'running' || task.status === 'reviewing' || task.status === 'dispatching')) break
+        if (d.attemptProtocol === 2) task.attemptProtocol = 2
+        delete task.attemptRevoked
+        delete task.humanReview
+        delete task.reviewed
+        delete task.reviewUnavailable
+        delete task.reviewExhausted
+        delete task.summary
+        delete task.reviewerAgent
+        delete task.fileWarnings
+        delete task.evidenceOutcomes
+        delete task.recovered
         task.status = 'running'
         task.attempts += 1
         // J19: a new attempt becomes the one and only writer for this task.
@@ -199,13 +225,22 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
           // diagnosable from the board. Absent on an attempt that pinned nothing,
           // which also clears any previous attempt's value (JSON drops undefined).
           effort: str('effort'),
+          requestedEffort: str('requestedEffort'),
         }
         task.blockedReason = undefined
         break
-      case 'task/agent-started':
+      case 'task/agent-started': {
         if (task.status === 'dispatching') task.status = 'running'
-        if (typeof d.sessionId === 'string') task.agent = { ...(task.agent ?? { label: `swarm:${taskId}` }), label: task.agent?.label ?? `swarm:${taskId}` }
+        const field = d.phase === 'review' ? 'reviewerAgent' : 'agent'
+        task[field] = {
+          ...task[field],
+          label: task[field]?.label ?? `swarm:${taskId}${d.phase === 'review' ? ':review' : ''}`,
+          provider: str('provider') ?? task[field]?.provider,
+          model: str('model') ?? task[field]?.model,
+          ...('effort' in d ? { effort: str('effort') } : {}),
+        }
         break
+      }
       case 'task/heartbeat':
         // J19: a superseded attempt must not even annotate the live task — its note
         // would misrepresent work the current attempt has not done.
@@ -214,22 +249,38 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         task.lastNoteAt = event.at
         break
       case 'task/model-fallback': {
-        task.agent = {
-          label: task.agent?.label ?? `swarm:${taskId}`,
-          provider: str('provider'),
-          model: str('model'),
-          // The fallback is a new child of the same attempt: the effort pin it
-          // was spawned with is unchanged, so the board keeps showing it.
-          effort: task.agent?.effort,
+        const field = d.phase === 'review' ? 'reviewerAgent' : 'agent'
+        task[field] = {
+          ...task[field],
+          label: task[field]?.label ?? `swarm:${taskId}:${d.phase === 'review' ? 'review' : 'build'}`,
+          provider: str('provider') ?? task[field]?.provider,
+          model: str('model') ?? task[field]?.model,
         }
         const runStats = state.runs.get(runId)?.stats
         if (runStats !== undefined) runStats.fallbacks += 1
         break
       }
+      case 'task/review-agent':
+        task.reviewerAgent = { label: `swarm:${taskId}:review`, provider: str('provider'), model: str('model'), effort: str('effort'), requestedEffort: str('requestedEffort') }
+        break
+      case 'task/effort-changed': {
+        const field = d.phase === 'review' ? 'reviewerAgent' : 'agent'
+        task[field] = { ...task[field], label: task[field]?.label ?? `swarm:${taskId}`, effort: str('effort') }
+        break
+      }
+      case 'task/recovery-started':
+        if (task.status === 'reviewing') task.status = 'running'
+        break
       case 'task/completed':
         // J19: a superseded attempt's success must not close the live task.
         if (staleAttempt(task, d)) break
+        if (task.attemptProtocol === 2 && d.source !== 'operator' && task.status !== 'running' && task.status !== 'dispatching') break
         task.status = 'completed'
+        delete task.humanReview
+        if (d.revokeAttempt === true) task.attemptRevoked = true
+        if (Array.isArray(d.fileWarnings)) task.fileWarnings = d.fileWarnings.filter((v): v is string => typeof v === 'string')
+        if (Array.isArray(d.evidence)) task.evidenceOutcomes = d.evidence.filter((v): v is Record<string, unknown> => v !== null && typeof v === 'object')
+        if (d.recovered === true) task.recovered = true
         if (typeof d.summary === 'string') {
           task.summary = d.summary
           task.lastNote = d.summary
@@ -242,6 +293,8 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         if (staleAttempt(task, d)) break
         const retrying = d.retry === true
         task.status = retrying ? 'retrying' : 'failed'
+        if (task.attemptProtocol === 2) task.attemptRevoked = true
+        delete task.humanReview
         task.lastNote = str('reason') ?? task.lastNote
         if (retrying) {
           const runStats = state.runs.get(runId)?.stats
@@ -250,6 +303,7 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         break
       }
       case 'task/blocked':
+        if (task.attemptProtocol === 2) task.attemptRevoked = true
         task.status = 'blocked'
         task.blockedReason = str('reason')
         // A7: reuse the review gate's `human: true` flag (J7). A task blocked because
@@ -274,6 +328,9 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         // J19: a review verdict produced for a superseded attempt is not a verdict
         // on the current one.
         if (staleAttempt(task, d)) break
+        if (task.attemptProtocol === 2 && d.source !== 'operator' && task.status !== 'reviewing') break
+        delete task.humanReview
+        if (task.attemptProtocol === 2) task.attemptRevoked = true
         const verdict = str('verdict') ?? 'error'
         const feedback = str('feedback')
         if (feedback !== undefined) task.reviewFeedback = feedback

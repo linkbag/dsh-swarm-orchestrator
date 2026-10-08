@@ -313,4 +313,103 @@ describe('dag validation', () => {
   })
 })
 
+describe('attempt protocol v2 authority and replay', () => {
+  const base = [
+    { seq: 1, at: 1, kind: 'run/created', runId: 'v2', data: { title: 'v2', spec: 's', tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }] } },
+    { seq: 2, at: 2, kind: 'run/endorsed', runId: 'v2' },
+    { seq: 3, at: 3, kind: 'task/started', runId: 'v2', taskId: 'a', data: { attemptProtocol: 2, attemptId: 'current', provider: 'safe', model: 'safe-model' } },
+  ]
+  const transitions: Array<[string, Record<string, unknown>]> = [
+    ['task/agent-started', { sessionId: 'zombie' }],
+    ['task/heartbeat', { note: 'zombie progress' }],
+    ['task/model-fallback', { provider: 'wrong', model: 'wrong' }],
+    ['task/effort-changed', { effort: 'wrong' }],
+    ['task/review-agent', { provider: 'wrong', model: 'wrong' }],
+    ['task/recovery-started', {}],
+    ['task/completed', { summary: 'false completion' }],
+    ['task/failed', { retry: true, reason: 'late failure' }],
+    ['task/blocked', { human: true, reason: 'late evidence' }],
+    ['task/unblocked', {}],
+    ['task/nudged', {}],
+    ['task/review-started', { human: true }],
+    ['task/reviewed', { verdict: 'approve', feedback: 'wrong attempt' }],
+  ]
+
+  it.each(transitions)('rejects stale and unfenced %s without timestamp or statistics changes', (kind, data) => {
+    const baseline = fold(base)
+    for (const fence of [{}, { attemptId: 'superseded' }]) {
+      const state = fold([...base, { seq: 4, at: 99, kind, runId: 'v2', taskId: 'a', data: { ...data, ...fence } }])
+      expect(state.tasks.get('v2/a')).toEqual(baseline.tasks.get('v2/a'))
+      expect(state.runs.get('v2')).toEqual(baseline.runs.get('v2'))
+    }
+  })
+
+  it.each(transitions)('revocation rejects a still-current writer for %s', (kind, data) => {
+    const accepted = { seq: 4, at: 4, kind: 'task/completed', runId: 'v2', taskId: 'a', data: { source: 'operator', revokeAttempt: true, summary: 'accepted by owner' } }
+    const baseline = fold([...base, accepted])
+    const state = fold([...base, accepted, { seq: 5, at: 100, kind, runId: 'v2', taskId: 'a', data: { ...data, attemptId: 'current' } }])
+    expect(state.tasks.get('v2/a')).toEqual(baseline.tasks.get('v2/a'))
+    expect(state.tasks.get('v2/a')?.attemptRevoked).toBe(true)
+    expect(state.runs.get('v2')?.stats).toEqual(baseline.runs.get('v2')?.stats)
+  })
+
+  it('operator retry establishes a fresh writer and clears obsolete per-attempt review state', () => {
+    const state = fold([
+      ...base,
+      { seq: 4, at: 4, kind: 'task/completed', runId: 'v2', taskId: 'a', data: { attemptId: 'current', summary: 'old work', recovered: true, fileWarnings: ['old warning'], evidence: [{ command: 'old command' }] } },
+      { seq: 5, at: 5, kind: 'task/review-started', runId: 'v2', taskId: 'a', data: { attemptId: 'current', human: true } },
+      { seq: 6, at: 6, kind: 'task/reviewed', runId: 'v2', taskId: 'a', data: { attemptId: 'current', verdict: 'reject', reviews: 1, exhausted: true, feedback: 'old feedback' } },
+      { seq: 7, at: 7, kind: 'task/failed', runId: 'v2', taskId: 'a', data: { source: 'operator', retry: true, reason: 'try again' } },
+      { seq: 8, at: 8, kind: 'task/started', runId: 'v2', taskId: 'a', data: { attemptProtocol: 2, attemptId: 'fresh' } },
+      { seq: 9, at: 9, kind: 'task/heartbeat', runId: 'v2', taskId: 'a', data: { attemptId: 'fresh', note: 'new work' } },
+    ])
+    const task = state.tasks.get('v2/a')!
+    expect(task.status).toBe('running')
+    expect(task.attemptId).toBe('fresh')
+    expect(task.attemptRevoked).not.toBe(true)
+    expect(task.attempts).toBe(2)
+    expect(task.lastNote).toBe('new work')
+    for (const field of ['humanReview', 'reviewed', 'reviewUnavailable', 'reviewExhausted', 'summary', 'reviewerAgent', 'fileWarnings', 'evidenceOutcomes', 'recovered']) {
+      expect(task).not.toHaveProperty(field)
+    }
+  })
+
+  it('current fenced writes apply, and legacy logs retain their historical unfenced meaning', () => {
+    const current = fold([...base, { seq: 4, at: 4, kind: 'task/heartbeat', runId: 'v2', taskId: 'a', data: { attemptId: 'current', note: 'owned progress' } }])
+    expect(current.tasks.get('v2/a')?.lastNote).toBe('owned progress')
+    const legacy = fold([
+      ...base.slice(0, 2),
+      { seq: 3, at: 3, kind: 'task/started', runId: 'v2', taskId: 'a', data: { attemptId: 'legacy' } },
+      { seq: 4, at: 4, kind: 'task/completed', runId: 'v2', taskId: 'a', data: { summary: 'historical completion' } },
+    ])
+    expect(legacy.tasks.get('v2/a')?.status).toBe('completed')
+    expect(legacy.tasks.get('v2/a')?.summary).toBe('historical completion')
+  })
+
+  it.each(['error', 'unavailable'])('fail-open review %s remains visibly unapproved after replay', (verdict) => {
+    const events = [
+      ...base,
+      { seq: 4, at: 4, kind: 'task/completed', runId: 'v2', taskId: 'a', data: { attemptId: 'current', summary: 'builder output' } },
+      { seq: 5, at: 5, kind: 'task/review-started', runId: 'v2', taskId: 'a', data: { attemptId: 'current' } },
+      { seq: 6, at: 6, kind: 'task/reviewed', runId: 'v2', taskId: 'a', data: { attemptId: 'current', verdict, feedback: 'no usable verdict' } },
+    ]
+    const state = fold(JSON.parse(JSON.stringify(events)) as typeof events)
+    const task = state.tasks.get('v2/a')!
+    expect(task.status).toBe('completed')
+    expect(task.reviewed).toBe(false)
+    expect(task.reviewUnavailable).toBe(true)
+    expect(state.runs.get('v2')?.stats?.reviewsPassed).toBe(0)
+    expect(state.runs.get('v2')?.stats?.reviewsUnavailable).toBe(1)
+  })
+
+  it('persists a caller authority snapshot and refuses malformed authority on replay', () => {
+    const authority = { version: 1, sandbox: { mode: 'workspace-write', workspaceRoot: process.cwd() }, delegated: { sandboxMode: 'workspace-write', approvalPolicy: 'never' } }
+    const createdEvent = { ...base[0], data: { ...base[0].data, dispatch: { sessionId: 'owner', cwd: process.cwd(), authority } } }
+    const valid = fold(JSON.parse(JSON.stringify([createdEvent])) as typeof base)
+    expect(valid.runs.get('v2')?.dispatch?.authority).toEqual(authority)
+    const invalid = fold([{ ...createdEvent, data: { ...createdEvent.data, dispatch: { authority: { ...authority, sandbox: { ...authority.sandbox, workspaceRoot: 'relative' } } } } }])
+    expect(invalid.runs.get('v2')?.dispatch?.authority).toBeUndefined()
+  })
+})
+
 void created

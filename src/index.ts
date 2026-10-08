@@ -66,18 +66,23 @@ export function apply(ctx: Context, config: SwarmConfig) {
     return
   }
 
-  // Per-role reasoning effort: AgentOptions has no effort field, so pin it
-  // per LLM request through the agent/request waterfall, scoped to tracked
-  // swarm children only (same mechanism the host's model selection uses).
+  // Initial effort is supplied in agentOptions before the first request. Keep
+  // the request waterfall scoped to still-owned children for later requests;
+  // an explicit no-pin must remove inherited effort, not preserve it.
   ctx.effect(() => {
     const scoped = ctx as unknown as {
       on(event: 'agent/request', listener: (payload: { agent: { id: string } }, next: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>): () => void
     }
     return scoped.on('agent/request', async (payload, next) => {
-      const effort = service.effortFor(String(payload.agent.id))
       const resolved = await next()
-      if (effort === undefined) return resolved
-      return { ...resolved, reasoningEffort: effort }
+      // Resolve ownership AFTER the waterfall await: cancellation or a fallback
+      // may have revoked/replaced this child's pin while another hook yielded.
+      const override = service.effortOverrideFor(String(payload.agent.id))
+      if (override === undefined) return resolved
+      if (override.effort !== undefined) return { ...resolved, reasoningEffort: override.effort }
+      const unpinned = { ...resolved }
+      delete unpinned.reasoningEffort
+      return unpinned
     })
   })
 

@@ -1,4 +1,4 @@
-// Board wire types (mirror of the host snapshot — the client never imports host code).
+// Board wire types (mirror of the host snapshot without importing the host runtime).
 
 export interface BoardRun {
   id: string
@@ -11,9 +11,10 @@ export interface BoardRun {
   completedAt?: number
   taskIds: string[]
   report?: RunReport
+  planPath?: string
   pauseReason?: string
   dispatch?: { cwd?: string; presetId?: string }
-  stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number }
+  stats?: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number; reviewsUnavailable?: number }
   /** A8: how the board presents this run; absent means `visible`. */
   boardState?: BoardRunState
 }
@@ -31,7 +32,14 @@ export interface BoardTask {
   reviewBy?: string
   status: string
   attempts: number
-  agent?: { label: string; provider?: string; model?: string; effort?: string }
+  /** Builder identity; reviewer identity is separate on newer hosts. */
+  agent?: { label: string; provider?: string; model?: string; effort?: string; requestedEffort?: string }
+  reviewerAgent?: { label: string; provider?: string; model?: string; effort?: string; requestedEffort?: string }
+  attemptRevoked?: boolean
+  reviewGate?: 'agent' | 'human'
+  reviewQueueInfo?: Record<string, unknown>
+  fileWarnings?: string[]
+  evidenceOutcomes?: Array<Record<string, unknown>>
   blockedReason?: string
   lastNote?: string
   lastNoteAt?: number
@@ -40,6 +48,7 @@ export interface BoardTask {
   reviewFeedback?: string
   reviewed?: boolean
   reviewExhausted?: boolean
+  reviewUnavailable?: boolean
   humanReview?: boolean
   evidence?: { files?: string[]; commands?: string[] }
   writes?: string[]
@@ -52,7 +61,7 @@ export interface RunReport {
   durationMs: number
   taskCount: number
   byStatus: Record<string, number>
-  stats: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number }
+  stats: { fallbacks: number; retries: number; reviewsPassed: number; reviewsRejected: number; reviewsUnavailable?: number }
   tasks: Array<{ id: string; role: string; model?: string; status: string; reviewed?: boolean; reviewExhausted?: boolean; summary?: string }>
 }
 
@@ -82,6 +91,9 @@ export interface BoardRuntime {
   nudgeAfterMinutes?: number
   staleTimeoutSeconds?: number
   spawnTimeoutSeconds?: number
+  maxRetries?: number
+  reviewLoops?: number
+  evidenceTimeoutMs?: number
 }
 
 export interface Board {
@@ -126,9 +138,11 @@ export interface BoardActionBody {
   title?: string
   /** A8: set-run-board-state — the three board presentations. */
   state?: BoardRunState
+  verdict?: string
 }
 
-type Listener = (board: Board | null, error: string | null) => void
+export type BoardSyncState = 'connecting' | 'live' | 'catching-up' | 'reconnecting' | 'snapshot' | 'stopped'
+type Listener = (board: Board | null, error: string | null, sync: BoardSyncState) => void
 
 /**
  * Board data source: full-snapshot fetch + SSE change pings (one refetch per
@@ -146,49 +160,83 @@ type Listener = (board: Board | null, error: string | null) => void
  */
 export class BoardStore {
   private board: Board | null = null
-  private error: string | null = null
+  private fetchError: string | null = null
+  private streamError: string | null = null
   private readonly listeners = new Set<Listener>()
   private source: EventSource | null = null
+  private stream: 'connecting' | 'connected' | 'reconnecting' | 'unavailable' = 'connecting'
   private refetchTimer: ReturnType<typeof setTimeout> | null = null
-  private stopped = false
+  private stopped = true
   private refs = 0
+  private generation = 0
+  private inFlight: AbortController | null = null
+  private trailing = false
+  private latestSeq = 0
+  /** A successful mutation fences any snapshot that started before its ACK. */
+  private mutationRevision = 0
 
   start(): void {
+    if (!this.stopped) return
     this.stopped = false
-    void this.refetch()
+    const generation = ++this.generation
+    this.streamError = null
+    this.latestSeq = this.board?.seq ?? 0
+    this.stream = typeof EventSource === 'undefined' ? 'unavailable' : 'connecting'
+    this.refresh()
     if (this.source === null && typeof EventSource !== 'undefined') {
-      this.source = new EventSource('/swarm/events')
-      this.source.onmessage = (event) => {
+      let source: EventSource
+      try {
+        source = new EventSource('/swarm/events')
+      } catch {
+        this.stream = 'unavailable'
+        this.streamError = 'live stream unavailable — showing last snapshot'
+        this.notify()
+        return
+      }
+      this.source = source
+      const owns = (): boolean => !this.stopped && this.generation === generation && this.source === source
+      source.onmessage = (event) => {
+        if (!owns()) return
         try {
           const frame = JSON.parse(event.data) as { seq?: number }
-          if (typeof frame.seq !== 'number') return
-          // J6 seq-gap resync: a skipped seq means a frame was lost — refetch
-          // unconditionally instead of trusting the stale snapshot.
-          if (this.board !== null && frame.seq > this.board.seq + 1) {
-            void this.refetch()
-            return
+          if (typeof frame.seq !== 'number' || !Number.isSafeInteger(frame.seq) || frame.seq < 0) return
+          this.latestSeq = Math.max(this.latestSeq, frame.seq)
+          if (this.board === null || frame.seq > this.board.seq) {
+            // Gaps need an immediate resync; ordinary bursts share one debounce.
+            if (this.board !== null && frame.seq > this.board.seq + 1) this.refresh()
+            else this.scheduleRefetch()
           }
-          if (this.board === null || frame.seq > this.board.seq) this.scheduleRefetch()
         } catch {
           this.scheduleRefetch()
         }
       }
-      this.source.onerror = () => {
-        this.setError('stream disconnected — retrying')
+      source.onerror = () => {
+        if (!owns()) return
+        this.stream = 'reconnecting'
+        this.streamError = 'stream disconnected — reconnecting; showing last snapshot'
+        this.notify()
       }
-      this.source.onopen = () => {
-        this.setError(null)
-        this.scheduleRefetch()
+      source.onopen = () => {
+        if (!owns()) return
+        this.stream = 'connected'
+        this.streamError = null
+        // Opening the stream is NOT proof a failed board fetch recovered.
+        this.refresh()
       }
     }
   }
 
   stop(): void {
     this.stopped = true
+    this.generation += 1
     this.source?.close()
     this.source = null
     if (this.refetchTimer !== null) clearTimeout(this.refetchTimer)
     this.refetchTimer = null
+    this.inFlight?.abort()
+    this.inFlight = null
+    this.trailing = false
+    this.notify()
   }
 
   /**
@@ -216,51 +264,104 @@ export class BoardStore {
 
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener)
-    listener(this.board, this.error)
+    listener(this.board, this.fetchError ?? this.streamError, this.getSyncState())
     return () => this.listeners.delete(listener)
   }
 
-  async action(body: BoardActionBody): Promise<Record<string, unknown>> {
+  async action(body: BoardActionBody, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const generation = this.generation
     const response = await fetch('/swarm/action', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
+      signal,
     })
     const json = (await response.json()) as Record<string, unknown>
+    if (signal?.aborted) throw new Error('request cancelled')
     if (!response.ok || json.ok !== true) throw new Error(typeof json.error === 'string' ? json.error : `HTTP ${response.status}`)
-    this.scheduleRefetch()
+    if (generation === this.generation) {
+      this.mutationRevision += 1
+      this.scheduleRefetch()
+    }
     return json
   }
 
-  private scheduleRefetch(): void {
+  getSyncState(): BoardSyncState {
+    if (this.stopped) return 'stopped'
+    if (this.stream === 'reconnecting') return 'reconnecting'
+    if (this.board === null) return 'connecting'
+    if (this.fetchError !== null || this.inFlight !== null || this.refetchTimer !== null || this.latestSeq > this.board.seq) return 'catching-up'
+    return this.stream === 'connected' ? 'live' : this.stream === 'unavailable' ? 'snapshot' : 'connecting'
+  }
+
+  /** At most one fetch per lifetime, with one trailing refresh for a burst. */
+  refresh(): void {
     if (this.stopped) return
+    if (this.refetchTimer !== null) clearTimeout(this.refetchTimer)
+    this.refetchTimer = null
+    if (this.inFlight !== null) {
+      this.trailing = true
+      return
+    }
+    void this.refetch()
+  }
+
+  private scheduleRefetch(delay = 150): void {
+    if (this.stopped) return
+    if (this.inFlight !== null) {
+      this.trailing = true
+      this.notify()
+      return
+    }
     if (this.refetchTimer !== null) return
     this.refetchTimer = setTimeout(() => {
       this.refetchTimer = null
-      void this.refetch()
-    }, 150)
+      this.refresh()
+    }, delay)
+    this.notify()
   }
 
   private async refetch(): Promise<void> {
+    const generation = this.generation
+    const mutationRevision = this.mutationRevision
+    const controller = new AbortController()
+    this.inFlight = controller
+    this.trailing = false
+    const owns = (): boolean => !this.stopped && this.generation === generation && this.inFlight === controller && !controller.signal.aborted
+    let failed = false
+    this.notify()
     try {
-      const response = await fetch('/swarm/board')
+      const response = await fetch('/swarm/board', { signal: controller.signal, cache: 'no-store' })
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const board = (await response.json()) as Board
+      if (!owns() || mutationRevision !== this.mutationRevision) return
+      if (board === null || !Number.isSafeInteger(board.seq) || board.seq < 0 || !Number.isFinite(board.at) || !Array.isArray(board.runs) || !Array.isArray(board.tasks) || board.roles === null || Array.isArray(board.roles) || typeof board.roles !== 'object') {
+        throw new Error('invalid board snapshot')
+      }
+      // Even a later request can be answered by an older cached snapshot.
+      if (this.board !== null && (board.seq < this.board.seq || (board.seq === this.board.seq && board.at < this.board.at))) throw new Error('stale board snapshot — retrying')
       this.board = board
-      this.error = null
+      this.fetchError = null
     } catch (err) {
-      this.error = String(err instanceof Error ? err.message : err)
+      if (!owns() || mutationRevision !== this.mutationRevision) return
+      failed = true
+      this.fetchError = String(err instanceof Error ? err.message : err)
+    } finally {
+      // An old, aborted promise must not clear a newer lifetime's request.
+      if (owns()) {
+        this.inFlight = null
+        const again = this.trailing || this.latestSeq > (this.board?.seq ?? -1)
+        this.trailing = false
+        if (failed || again) this.scheduleRefetch(failed ? 3000 : 150)
+        this.notify()
+      }
     }
-    this.notify()
-  }
-
-  private setError(error: string | null): void {
-    this.error = error
-    this.notify()
   }
 
   private notify(): void {
-    for (const listener of this.listeners) listener(this.board, this.error)
+    const error = this.fetchError ?? this.streamError
+    const sync = this.getSyncState()
+    for (const listener of this.listeners) listener(this.board, error, sync)
   }
 }
 

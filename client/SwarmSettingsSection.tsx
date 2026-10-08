@@ -2,7 +2,7 @@
 // any surface, including the new-session page where conversation tabs do not
 // render). Embeds the live board summary and the full roster editor.
 import { useEffect, useState } from 'react'
-import { boardStore, type Board } from './board-store'
+import { boardStore, type Board, type BoardSyncState } from './board-store'
 import { DutyTableEditor } from './DutyTableEditor'
 import { RuntimeSettings } from './RuntimeSettings'
 import { statusT, useT } from './locale'
@@ -11,13 +11,15 @@ export function SwarmSettingsSection(): JSX.Element {
   const t = useT()
   const [board, setBoard] = useState<Board | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [sync, setSync] = useState<BoardSyncState>('connecting')
 
   useEffect(() => {
     const store = boardStore()
     const release = store.retain()
-    const unsubscribe = store.subscribe((next, err) => {
+    const unsubscribe = store.subscribe((next, err, state) => {
       setBoard(next)
       setError(err)
+      setSync(state ?? (err === null ? 'snapshot' : 'reconnecting'))
     })
     return () => {
       unsubscribe()
@@ -37,7 +39,8 @@ export function SwarmSettingsSection(): JSX.Element {
       <p className="dsh-swarm-dim">
         {t('section.description')}
       </p>
-      {error !== null && <p className="dsh-swarm-action-error">{t('section.offline', { error })}</p>}
+      <p role="status" className="dsh-swarm-dim">{t(`sync.${sync}`)}</p>
+      {error !== null && <p role="alert" className="dsh-swarm-action-error">{t('board.refreshError', { error })}{' '}<button className="dsh-swarm-btn ghost" onClick={() => { boardStore().refresh() }}>{t('board.refresh')}</button></p>}
       {board !== null && (
         <p className="dsh-swarm-dim">
           {t('section.summary', {

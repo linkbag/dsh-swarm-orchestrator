@@ -2,6 +2,18 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.31 — lifecycle hardening and readable Flow
+
+- Apply admission to reads and mutations before parsing; bound bodies, SSE streams, buffering and drain time. Authenticate completion and interruption.
+- Capture delegated sandbox authority before publication, execute command evidence through DSH Shell, and use one fenced finalizer for normal and recovered completion.
+- Retain concurrency holders through actual child/evidence cleanup, including cancellation, stagger reservations and cleanup failures. Repair retry wakeups, pause/resume and per-owner notification delivery.
+- Fence protocol-2 events and reports by exact run/task/attempt/phase; stale events cannot change task or run timestamps. Record actual provider-qualified fallback/effort and separate builder/reviewer identities.
+- Preserve append snapshots durably, repair torn tails without losing future appends, surface corruption, isolate listeners, and validate immutable bounded settings and DAG inputs.
+- Harden the single shared SSE transport and snapshot/action ownership. Preserve dirty settings drafts with observed conflicts, prevent stale drawer actions, and label unavailable/exhausted reviews honestly.
+- Left-align Flow waves, scheduler and report, default to readable native-size nodes, and add zoom/100%/Fit controls. Fit measures both axes; the scaled canvas no longer leaves phantom overflow. Resize, zoom and drawer changes return to the left edge, while ordinary progress preserves zoom and pan.
+- Add deterministic isolated transport, state, lifecycle, authority, persistence, routing, admission and Flow geometry regressions. Type checking and the host/client build pass; the full suite passes 601 tests across 32 files. The boot audit uses a copied production log in isolated storage; deployment-dependent assertions may skip when their prerequisites are absent.
+- Ten isolated headless Chrome checks passed for the earlier centered Flow revision, covering sizing, Fit, zoom, resizing, task clicks and progress. The subsequent left-alignment change adds geometry and rendering regressions. No verification against the operator's authenticated GUI or production mutation is claimed.
+
 ## 0.6.30
 
 **The Flow layout fix that actually works - and a correction to 0.6.29's diagnosis.**

@@ -19,7 +19,7 @@ export interface RoleConfig {
   provider?: string
   model?: string
   maxTokens?: number
-  /** Applied by intercepting the child's LLM requests (AgentOptions has no effort field). */
+  /** Applied to child AgentOptions and request-time effort ladder updates. */
   reasoningEffort?: string
   /** Effort ladder (A1): on spawn/turn failure the next entry is tried, ending at inherit. */
   effortFallbacks?: string[]
@@ -96,6 +96,9 @@ export interface Task extends TaskSpec {
    * any that belongs to an older attempt.
    */
   attemptId?: string
+  /** Versioned fencing preserves historical replay while refusing unfenced new writes. */
+  attemptProtocol?: 2
+  attemptRevoked?: boolean
   /**
    * J22: when the live attempt started (the `task/started` timestamp).
    *
@@ -106,7 +109,11 @@ export interface Task extends TaskSpec {
    * had already failed.
    */
   attemptStartedAt?: number
-  agent?: { label: string; provider?: string; model?: string; effort?: string }
+  agent?: { label: string; provider?: string; model?: string; effort?: string; requestedEffort?: string }
+  reviewerAgent?: { label: string; provider?: string; model?: string; effort?: string; requestedEffort?: string }
+  fileWarnings?: string[]
+  evidenceOutcomes?: Array<Record<string, unknown>>
+  recovered?: boolean
   blockedReason?: string
   lastNote?: string
   summary?: string
@@ -145,6 +152,8 @@ export interface RunReport {
  * join this preset and route; unpinned duty roles inherit this model).
  */
 export interface RunDispatchContext {
+  /** Captured from the caller, including the deployment ceiling; legacy runs require reconfirmation. */
+  authority?: import('../authority.js').ExecutionAuthority
   sessionId?: string
   presetId?: string
   provider?: string
@@ -164,6 +173,8 @@ export interface Run {
   taskIds: string[]
   report?: RunReport
   dispatch?: RunDispatchContext
+  /** Exact architect artifact; downstream prompts never guess a filename. */
+  planPath?: string
   /** Set while status = paused (A3): why the run stopped waiting for human action. */
   pauseReason?: string
   /** Live counters folded from task events. */
@@ -185,6 +196,10 @@ export type RunBoardState = 'visible' | 'removed' | 'purged'
 
 /** One append-only event record (JSONL line). */
 export interface SwarmEventRecord {
+  /** New writes use strict store protocol 2; older logs remain byte-preserving. */
+  storeVersion?: 2
+  /** Replay-only original cursor when a legacy sequence collision is normalized. */
+  storedSeq?: number
   seq: number
   at: number
   kind: string
@@ -209,6 +224,9 @@ export type SwarmEventKind =
   | 'task/agent-started'
   | 'task/heartbeat'
   | 'task/model-fallback'
+  | 'task/effort-changed'
+  | 'task/review-agent'
+  | 'task/recovery-started'
   | 'task/completed'
   | 'task/failed'
   | 'task/blocked'

@@ -64,8 +64,8 @@ function compareVersions(left: number[], right: number[]): number {
  * board disable them instead of letting the operator click into a rejection?
  */
 export function isHostStale(hostVersion: string | undefined, capabilities?: readonly string[]): boolean {
-  // 1. An advertised capability settles it, whatever the version says.
-  if (Array.isArray(capabilities) && capabilities.includes(RUN_CURATION_CAPABILITY)) return false
+  // 1. An explicit list (even []) is authoritative; absence alone permits fallback.
+  if (Array.isArray(capabilities)) return !capabilities.includes(RUN_CURATION_CAPABILITY)
   // 2/3. Version math, failing OPEN.
   const host = parseVersion(hostVersion)
   const floor = parseVersion(RUN_CURATION_FLOOR)

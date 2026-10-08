@@ -2,19 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { boardStore, type Board, type BoardRole } from './board-store'
 import { fetchModelCatalog, subscribeCatalogUpdates, type ModelCatalog } from './catalog'
 import { useT } from './locale'
+import { useRequestOwner } from './use-request-owner'
+import { acceptSaved, configKey, createDraft, dutyDraft, editDraft, isDirty, keepDraft, receiveLive, reloadDraft } from './settings-draft'
 
 const EFFORTS = ['', 'minimal', 'low', 'medium', 'high', 'max'] as const
 const BUILTIN_ROLES = ['architect', 'builder', 'reviewer', 'integrator']
 
 type DraftRole = BoardRole
-
-function cloneRoles(board: Board | null): Record<string, DraftRole> {
-  const clone: Record<string, DraftRole> = {}
-  for (const [id, role] of Object.entries(board?.roles ?? {})) {
-    clone[id] = { ...role, fallbacks: role.fallbacks.map((f) => ({ ...f })) }
-  }
-  return clone
-}
 
 function providerLabel(catalog: ModelCatalog | null, provider: string): string {
   return catalog?.providers.find((p) => p.provider === provider)?.displayName ?? provider
@@ -47,6 +41,9 @@ function ModelSelect({ catalog, modelsByProvider, value, onChange, allowInherit 
       }}
     >
       {allowInherit && <option value="">{t('select.inherit')}</option>}
+      {encoded !== '' && !(modelsByProvider.get(value.provider) ?? []).some((model) => model.id === value.model) && (
+        <option value={encoded}>{t('select.unavailable', { model: `${value.provider}/${value.model}` })}</option>
+      )}
       {[...modelsByProvider.keys()].sort().map((provider) => (
         <optgroup key={provider} label={providerLabel(catalog, provider)}>
           {(modelsByProvider.get(provider) ?? []).map((model) => (
@@ -63,28 +60,35 @@ function ModelSelect({ catalog, modelsByProvider, value, onChange, allowInherit 
 
 export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSaved: () => void }): JSX.Element {
   const t = useT()
-  const [draft, setDraft] = useState<Record<string, DraftRole>>(() => cloneRoles(board))
+  const [state, setState] = useState(() => createDraft(dutyDraft(board)))
+  const { roles: draft, locked, lockNote } = state.value
+  const dirty = isDirty(state)
+  const catalogOwner = useRequestOwner()
+  const saveOwner = useRequestOwner()
+  const setDraft = useCallback((update: (roles: Record<string, DraftRole>) => Record<string, DraftRole>) => {
+    setState((current) => editDraft(current, { ...current.value, roles: update(current.value.roles) }))
+    setSavedAt(null)
+  }, [])
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null)
   const [catalogError, setCatalogError] = useState<string | null>(null)
-  const [locked, setLocked] = useState(false)
-  const [lockNote, setLockNote] = useState('')
   const [busy, setBusy] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
-  const [savedAt, setSavedAt] = useState<string | null>(null)
+  const [savedAt, setSavedAt] = useState<{ time: string; config: string } | null>(null)
   const [newRole, setNewRole] = useState('')
 
   useEffect(() => {
-    setDraft(cloneRoles(board))
-    setLocked(board?.override?.enabled === true)
-    setLockNote(board?.override?.note ?? '')
+    if (board !== null) setState((current) => receiveLive(current, dutyDraft(board)))
   }, [board])
 
   const refreshCatalog = useCallback(() => {
+    const request = catalogOwner.begin()
     setCatalogError(null)
-    fetchModelCatalog()
-      .then(setCatalog)
-      .catch((err: unknown) => { setCatalogError(String(err instanceof Error ? err.message : err)) })
-  }, [])
+    void fetchModelCatalog()
+      .then((next) => { if (request.owns()) setCatalog(next) })
+      .catch((err: unknown) => {
+        if (request.owns()) setCatalogError(String(err instanceof Error ? err.message : err))
+      })
+  }, [catalogOwner])
 
   useEffect(() => { refreshCatalog() }, [refreshCatalog])
 
@@ -161,10 +165,15 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
   }, [])
 
   const save = useCallback(async () => {
+    if (busy || state.conflict || board === null) return
+    const request = saveOwner.begin()
+    const revision = state.revision
+    const submitted = state.value
     setBusy(true)
     setSaveError(null)
+    setSavedAt(null)
     try {
-      await boardStore().action({
+      const result = await boardStore().action({
         action: 'set-duty-table',
         table: {
           version: 1,
@@ -172,15 +181,19 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
           roles: draft,
           override: { enabled: locked, note: lockNote.length > 0 ? lockNote : undefined, setBy: 'dashboard', at: Date.now() },
         },
-      })
-      setSavedAt(new Date().toLocaleTimeString())
+      }, request.signal)
+      if (!request.owns()) return
+      const saved = result.table as Pick<Board, 'roles' | 'override'> | undefined
+      const accepted = saved?.roles !== undefined ? dutyDraft(saved) : submitted
+      setState((current) => acceptSaved(current, revision, accepted, state.latest))
+      setSavedAt({ time: new Date().toLocaleTimeString(), config: configKey(accepted) })
       onSaved()
     } catch (err) {
-      setSaveError(String(err instanceof Error ? err.message : err))
+      if (request.owns()) setSaveError(String(err instanceof Error ? err.message : err))
     } finally {
-      setBusy(false)
+      if (request.owns()) setBusy(false)
     }
-  }, [draft, locked, lockNote, onSaved])
+  }, [busy, state, board, saveOwner, draft, locked, lockNote, onSaved])
 
   const addRole = useCallback(() => {
     const id = newRole.trim().toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '')
@@ -203,16 +216,21 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
 
   return (
     <div className="dsh-swarm-roster">
+      <fieldset className="dsh-swarm-edit-fields" disabled={busy || board === null}>
       <div className="dsh-swarm-roster-bar">
         <div>
           {catalog !== null
-            ? <span className="dsh-swarm-pill">{t('roster.catalogLive', { providers: catalog.providers.length, models: catalog.models.length })}</span>
+            ? <span className={catalogError === null ? 'dsh-swarm-pill' : 'dsh-swarm-pill warn'}>{t(catalogError === null ? 'roster.catalogLive' : 'roster.catalogCached', { providers: catalog.providers.length, models: catalog.models.length })}</span>
             : <span className="dsh-swarm-pill warn">{catalogError ?? t('roster.loadingCatalog')}</span>}
           {' '}<button className="dsh-swarm-btn ghost" onClick={refreshCatalog}>{t('roster.refreshCatalog')}</button>
         </div>
         <div className="dsh-swarm-run-actions">
           <label className="dsh-swarm-lock">
-            <input type="checkbox" checked={locked} onChange={(event) => { setLocked(event.target.checked) }} />
+            <input type="checkbox" checked={locked} onChange={(event) => {
+              const value = event.target.checked
+              setState((current) => editDraft(current, { ...current.value, locked: value }))
+              setSavedAt(null)
+            }} />
             {t('roster.overrideLock')}
           </label>
           {locked && (
@@ -220,16 +238,27 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
               className="dsh-swarm-input"
               placeholder={t('roster.lockNotePh')}
               value={lockNote}
-              onChange={(event) => { setLockNote(event.target.value) }}
+              onChange={(event) => {
+                const value = event.target.value
+                setState((current) => editDraft(current, { ...current.value, lockNote: value }))
+                setSavedAt(null)
+              }}
             />
           )}
-          <button className="dsh-swarm-btn primary" disabled={busy} onClick={() => { void save() }}>
+          <button className="dsh-swarm-btn primary" disabled={busy || state.conflict || board === null || !dirty} onClick={() => { void save() }}>
             {locked ? t('roster.saveClearsLock') : t('roster.save')}
           </button>
         </div>
       </div>
-      {saveError !== null && <p className="dsh-swarm-action-error">{saveError}</p>}
-      {savedAt !== null && saveError === null && <p className="dsh-swarm-dim">{t('roster.savedAt', { time: savedAt })}</p>}
+      {catalogError !== null && catalog !== null && <p role="alert" className="dsh-swarm-action-error">{t('roster.catalogStale', { error: catalogError })}</p>}
+      {saveError !== null && <p role="alert" className="dsh-swarm-action-error">{saveError}</p>}
+      {state.conflict && <p role="alert" className="dsh-swarm-action-error">{t('draft.conflict')}</p>}
+      {state.conflict && <div className="dsh-swarm-run-actions">
+        <button className="dsh-swarm-btn" onClick={() => { setState(reloadDraft); setSavedAt(null) }}>{t('draft.reload')}</button>
+        <button className="dsh-swarm-btn" onClick={() => { setState(keepDraft); setSavedAt(null) }}>{t('draft.keep')}</button>
+      </div>}
+      {dirty && !state.conflict && <p className="dsh-swarm-dim">{t('draft.unsaved')}</p>}
+      {savedAt !== null && savedAt.config === configKey(state.value) && !dirty && !state.conflict && saveError === null && <p role="status" className="dsh-swarm-dim">{t('roster.savedAt', { time: savedAt.time })}</p>}
 
       <div className="dsh-swarm-role-grid">
         {Object.values(draft).map((role) => (
@@ -331,7 +360,7 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
                 value={(role.toolFilter?.deny ?? []).join(', ')}
                 onChange={(event) => {
                   const deny = event.target.value.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
-                  updateRole(role.id, { toolFilter: deny.length > 0 ? { deny } : undefined })
+                  updateRole(role.id, { toolFilter: { ...role.toolFilter, deny: deny.length > 0 ? deny : undefined } })
                 }}
               />
             </div>
@@ -365,6 +394,7 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
         />
         <button className="dsh-swarm-btn" disabled={newRole.trim().length === 0} onClick={addRole}>{t('roster.addRole')}</button>
       </div>
+      </fieldset>
     </div>
   )
 }

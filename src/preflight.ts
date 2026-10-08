@@ -85,6 +85,12 @@ export interface EffortSupport {
    * map-less model (the live default) and stripped its other pins.
    */
   readonly declaredLevels: ReadonlyMap<string, ReadonlySet<string>>
+  /** Provider-qualified exclusion sets. Runtime checks NEVER borrow another provider's declaration. */
+  readonly qualifiedLevels?: ReadonlyMap<string, ReadonlySet<string>>
+}
+
+export function effortKey(provider: string, model: string): string {
+  return JSON.stringify([provider, model])
 }
 
 /**
@@ -97,6 +103,7 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
   const supported = new Set<string>()
   const declaredWithoutMap = new Set<string>()
   const declaredLevels = new Map<string, Set<string>>()
+  const qualifiedLevels = new Map<string, Set<string>>()
   try {
     const lines = settingsYaml.split(/\r?\n/)
     // Only models under a provider whose family VALIDATES reasoning efforts are
@@ -106,6 +113,8 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
     // not be flagged for their absence.
     const EFFORT_VALIDATING_ROOTS = new Set(['llm-pi-ai'])
     let insideValidatingRoot = false
+    let currentProvider: string | null = null
+    let defaultProvider: string | null = null
     let currentModel: string | null = null
     let sawEffortsForCurrent = false
     let currentLevels: Set<string> | null = null
@@ -123,6 +132,7 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
         flushCurrent()
         insideValidatingRoot = [...EFFORT_VALIDATING_ROOTS].some((r) => line.startsWith(r + ':'))
         insideDefaultModel = line.startsWith('agent-default-model:')
+        currentProvider = null
         currentModel = null
         sawEffortsForCurrent = false
         currentLevels = null
@@ -130,6 +140,8 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
         continue
       }
       if (insideDefaultModel) {
+        const provider = line.match(/^\s*provider:\s*(\S+)\s*$/)
+        if (provider) defaultProvider = provider[1]
         const id = line.match(/^\s*model:\s*(\S+)\s*$/)
         if (id) defaultModelId = id[1]
         const effort = line.match(/^\s*reasoningEffort:\s*(\S+)\s*$/)
@@ -137,6 +149,10 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
         continue
       }
       if (!insideValidatingRoot) continue
+      const provider = line.match(/^(\s{2,4})([^:#\s]+):\s*(?:#.*)?$/)
+      if (provider !== null && provider[2] !== 'providers' && provider[2] !== 'models') {
+        currentProvider = provider[2]
+      }
       const model = line.match(/^\s*-\s*id:\s*(\S+)\s*$/)
       if (model) {
         flushCurrent()
@@ -153,6 +169,7 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
           supported.add(currentModel)
           const levels = new Set<string>()
           declaredLevels.set(currentModel, levels)
+          if (currentProvider !== null) qualifiedLevels.set(effortKey(currentProvider, currentModel), levels)
           currentLevels = levels
           effortsIndent = effortsLine[1].length
         }
@@ -180,14 +197,18 @@ export function parseEffortSupport(settingsYaml: string): EffortSupport {
     // omits but the deployment demonstrably runs). It must never CREATE a level set: a
     // set excludes, and for a map-less model — the live `zai/glm-5.3` — that turned the
     // pair's own `max` into an invented `{max}` that stripped a legitimate `high`.
+    // Separate these sets before applying legacy bare-model proof, which must
+    // never leak a default pair across providers that happen to share an id.
+    for (const [key, levels] of qualifiedLevels) qualifiedLevels.set(key, new Set(levels))
     if (defaultModelId !== null && defaultEffort !== null) {
       supported.add(defaultModelId)
       declaredLevels.get(defaultModelId)?.add(defaultEffort)
+      if (defaultProvider !== null) qualifiedLevels.get(effortKey(defaultProvider, defaultModelId))?.add(defaultEffort)
     }
   } catch {
     // tolerant: an unreadable file simply yields no declarations
   }
-  return { supported, declaredWithoutMap, declaredLevels }
+  return { supported, declaredWithoutMap, declaredLevels, qualifiedLevels }
 }
 
 /**
@@ -271,7 +292,7 @@ function collectPiAiModels(
  */
 function collectDefaultPairs(
   value: unknown,
-  out: { supported: Set<string>; proven: Map<string, Set<string>> },
+  out: { supported: Set<string>; proven: Map<string, Set<string>>; qualifiedProven?: Map<string, Set<string>> },
   seen: Set<object>,
 ): void {
   if (value === null || typeof value !== 'object' || seen.has(value)) return
@@ -288,6 +309,12 @@ function collectDefaultPairs(
     const levels = out.proven.get(model) ?? new Set<string>()
     levels.add(effort)
     out.proven.set(model, levels)
+    if (typeof record.provider === 'string' && out.qualifiedProven !== undefined) {
+      const key = effortKey(record.provider, model)
+      const qualified = out.qualifiedProven.get(key) ?? new Set<string>()
+      qualified.add(effort)
+      out.qualifiedProven.set(key, qualified)
+    }
   }
   for (const nested of Object.values(record)) collectDefaultPairs(nested, out, seen)
 }
@@ -304,30 +331,41 @@ export function parseEffortSupportFromEntries(entries: readonly SettingsEntryVal
   const supported = new Set<string>()
   const declaredWithoutMap = new Set<string>()
   const declaredLevels = new Map<string, Set<string>>()
+  const qualifiedLevels = new Map<string, Set<string>>()
   const proven = new Map<string, Set<string>>()
+  const qualifiedProven = new Map<string, Set<string>>()
   try {
     for (const entry of entries) {
       if (entry === null || typeof entry !== 'object') continue
       const ns = typeof entry.ns === 'string' ? entry.ns : ''
       if (PI_AI_ENTRY.test(ns)) {
         collectPiAiModels(entry.value, { supported, declaredWithoutMap, declaredLevels }, new Set())
+        const providers = (entry.value as { providers?: unknown } | null)?.providers
+        if (providers !== null && typeof providers === 'object' && !Array.isArray(providers)) {
+          for (const [provider, value] of Object.entries(providers)) {
+            const local = { supported: new Set<string>(), declaredWithoutMap: new Set<string>(), declaredLevels: new Map<string, Set<string>>() }
+            collectPiAiModels(value, local, new Set())
+            for (const [model, levels] of local.declaredLevels) qualifiedLevels.set(effortKey(provider, model), levels)
+          }
+        }
       } else if (DEFAULT_MODEL_ENTRY.test(ns)) {
-        collectDefaultPairs(entry.value, { supported, proven }, new Set())
+        collectDefaultPairs(entry.value, { supported, proven, qualifiedProven }, new Set())
       }
     }
-    // Applied AFTER both entry kinds are read, so entry order cannot decide the outcome.
-    // The pair proves its own level for its model: that may WIDEN a declared map (the
-    // running pair is proof the map is incomplete), but it never creates one — a set
-    // excludes, and a map-less model's levels are unknown rather than `{default}`.
+    // Bare-id sets are retained for legacy callers only. Runtime exclusion uses
+    // provider-qualified sets; proving provider A's default NEVER widens provider B.
     for (const [id, levels] of proven) {
       const declared = declaredLevels.get(id)
-      if (declared === undefined) continue
-      for (const level of levels) declared.add(level)
+      if (declared !== undefined) for (const level of levels) declared.add(level)
+    }
+    for (const [key, levels] of qualifiedProven) {
+      const declared = qualifiedLevels.get(key)
+      if (declared !== undefined) for (const level of levels) declared.add(level)
     }
   } catch {
-    // tolerant: an unrecognized shape yields no declarations
+    // An unrecognized shape is unknown, never grounds for stripping a pin.
   }
-  return { supported, declaredWithoutMap, declaredLevels }
+  return { supported, declaredWithoutMap, declaredLevels, qualifiedLevels }
 }
 
 /** Whether a parse actually declared anything — an empty result judges no model. */
@@ -396,9 +434,9 @@ export interface EffortCheck {
  * A pin that is genuinely refused therefore surfaces as the loud ~41 ms death, which
  * the effort ladder recovers — fast, visible, recoverable.
  */
-export function checkEffortSupport(model: string, effort: string, support: EffortSupport | undefined): EffortCheck {
+export function checkEffortSupport(model: string, effort: string, support: EffortSupport | undefined, provider?: string): EffortCheck {
   if (support === undefined) return { incompatible: false }
-  const levels = support.declaredLevels.get(model)
+  const levels = provider === undefined ? support.declaredLevels.get(model) : support.qualifiedLevels?.get(effortKey(provider, model))
   if (levels !== undefined) {
     if (levels.has(effort)) return { incompatible: false }
     const declared = levels.size > 0 ? [...levels].sort().join(', ') : 'no parseable level'

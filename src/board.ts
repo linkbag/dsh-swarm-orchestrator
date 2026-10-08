@@ -45,7 +45,7 @@ export interface RemovedRun {
  * observed as a bare `unknown action "…"` with nothing happening. Add a capability
  * here whenever a release adds a dashboard action.
  */
-export const BOARD_CAPABILITIES: readonly string[] = ['run-curation']
+export const BOARD_CAPABILITIES: readonly string[] = ['run-curation', 'interrupt-task', 'complete-task']
 
 const MAX_RUNS = 50
 

@@ -80,6 +80,14 @@ describe('flow view: task nodes are interactive, decoration is not', () => {
     expect(markup).not.toContain('tabindex')
   })
 
+  it.each(['reviewUnavailable', 'reviewExhausted'] as const)('shows %s as not approved even on completed reviewed tasks', (flag) => {
+    const candidate = { ...tasks[1], reviewed: true, reviewBy: 'reviewer', [flag]: true }
+    const markup = render({ tasks: [candidate] })
+    expect(markup).toContain(flag === 'reviewUnavailable' ? 'review unavailable · not approved' : 'review rejected · retries exhausted · not approved')
+    expect(markup).not.toContain('review approved')
+    expect(markup).not.toContain('done · reviewed')
+  })
+
   it('the selected task is marked active and pressed, and only that one', () => {
     const markup = render({ onSelectTask: () => {}, selectedTaskId: 't2' })
     expect(markup.match(/aria-pressed="true"/g) ?? []).toHaveLength(1)

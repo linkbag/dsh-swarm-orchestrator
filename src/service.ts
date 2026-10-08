@@ -1,30 +1,29 @@
 import { randomUUID } from 'node:crypto'
-import { exec, execFile, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { promisify } from 'node:util'
 import { zstdDecompressSync } from 'node:zlib'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import type {} from '@deepseek-ai/dsh-subagent'
+import { appendDelegatedPolicyOverrides } from '@deepseek-ai/dsh-subagent'
+import { captureAuthority, validAuthority, type EvidenceShell } from './authority.js'
+import type { ExecutionAuthority } from './authority.js'
 import { PLUGIN_VERSION, type SwarmConfig } from './config.js'
 import { checkEffortSupport, resolveEffortSupport, type EffortSourceFile, type EffortSupport, type SettingsEntryValue } from './preflight.js'
 import { validateDag } from './domain/dag.js'
 import { DutyTableStore } from './domain/duty-table.js'
 import { EventStore } from './domain/event-store.js'
 import { RuntimeStore } from './domain/runtime-store.js'
-import { fold, isReady, newState, runningCount, taskKeyOf, type SwarmState } from './domain/projection.js'
+import { RUNTIME_LIMITS, validateRuntimeInteger } from './domain/limits.js'
+import { fold, isReady, newState, taskKeyOf, type SwarmState } from './domain/projection.js'
 import type { BoardSnapshot } from './board.js'
 import { buildBoardSnapshot } from './board.js'
 import { spawnTaskAgent, buildReviewPrompt, buildReviewReaskPrompt, parseVerdict, taskReportRelPath, type SpawnDeps } from './dispatch/spawn.js'
 import type { DispatchInput, DispatchResult, DutyTable, ModelRef, RoleConfig, Run, RunDispatchContext, Task, TaskSpec } from './domain/types.js'
 
-const execAsync = promisify(exec)
-const execFileAsync = promisify(execFile)
 
 /**
  * J15: drop tool names a host does not expose from a role's toolFilter.
@@ -46,8 +45,13 @@ export function sanitizeToolNames(
   known: ReadonlySet<string> | undefined,
 ): { filter?: { deny?: string[]; allow?: string[] }; dropped: string[]; refusal?: string } {
   if (requested === undefined) return { dropped: [] }
-  // Without a readable registry we cannot verify: pass the request through.
-  if (known === undefined) return { filter: requested, dropped: [] }
+  if (known === undefined) return { dropped: [], refusal: 'tool registry unavailable; cannot verify role restrictions' }
+  if ((requested.allow === undefined && requested.deny === undefined)
+    || requested.allow?.length === 0 || requested.deny?.length === 0) {
+    return { dropped: [], refusal: 'empty tool restrictions are ambiguous; launch refused' }
+  }
+  const unknownDenied = requested.deny?.filter((name) => !known.has(name)) ?? []
+  if (unknownDenied.length > 0) return { dropped: unknownDenied, refusal: 'deny-list contains unknown tools; launch refused rather than widening access' }
   const dropped: string[] = []
   const keep = (names: string[] | undefined): string[] | undefined => {
     if (names === undefined) return undefined
@@ -156,98 +160,57 @@ function evidenceRecord(outcome: EvidenceCommandOutcome): Record<string, unknown
  */
 const HUMAN_WAIT_NOTIFY_COALESCE_MS = 1500
 
-async function runEvidenceCommand(command: string, cwd: string, timeoutMs: number): Promise<EvidenceCommandOutcome> {
-  const shell = evidenceShell()
-  // A7: node's default `maxBuffer` is 1 MB, and a suite that prints per-test
-  // progress can exceed it — which node reports as a failure, turning a chatty
-  // green suite into a false gate failure. Only the buffer needs raising; the tail
-  // we keep is small.
-  const options = { cwd, timeout: timeoutMs, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }
+async function runEvidenceCommand(
+  shell: EvidenceShell | undefined,
+  authority: ExecutionAuthority | undefined,
+  command: string,
+  cwd: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+  onCleanupFailed?: (error: unknown) => void,
+): Promise<EvidenceCommandOutcome> {
   const startedAt = Date.now()
+  let handle: Awaited<ReturnType<EvidenceShell['execute']>> | undefined
+  // A kill failure must not escape an AbortSignal event listener. The holder
+  // remains counted until done acknowledges real cleanup (or fails closed).
+  const onAbort = (): void => { try { handle?.kill() } catch { /* await done below */ } }
   try {
-    if (shell === undefined || shell.length === 0) {
-      await execAsync(command, options)
-    } else {
-      const args = process.platform === 'win32'
-        ? ['-NoProfile', '-NonInteractive', '-Command', command]
-        : ['-c', command]
-      await execFileAsync(shell, args, options)
+    if (!validAuthority(authority)) throw new Error('missing captured dispatch authority; evidence was not executed')
+    if (shell === undefined || typeof shell.execute !== 'function') throw new Error('DSH Shell execute service unavailable; evidence was not executed')
+    if (authority.sandbox.mode !== 'danger-full-access' && shell.sandboxMode === undefined) {
+      throw new Error('Shell cannot enforce the captured sandbox; evidence was not executed')
     }
-    return { command, ok: true, exitCode: 0, timedOut: false, elapsedMs: Date.now() - startedAt, outputTail: '' }
-  } catch (err) {
-    const failure = err as {
-      code?: number | string
-      killed?: boolean
-      signal?: string
-      stdout?: string | Buffer
-      stderr?: string | Buffer
-    }
-    const text = (value: string | Buffer | undefined): string =>
-      typeof value === 'string' ? value : value === undefined ? '' : value.toString('utf8')
-    // node marks a ceiling kill with `killed` plus a signal and leaves no numeric
-    // code; a command that ran and failed carries a numeric `code`. That is exactly
-    // the distinction the log used to lose.
-    const timedOut = failure.killed === true || failure.signal === 'SIGTERM' || failure.signal === 'SIGKILL'
-    const exitCode = typeof failure.code === 'number' ? failure.code : undefined
-    // A spawn-level failure (ENOENT: the cwd or the interpreter does not exist) carries
-    // a STRING code and no exit status at all. Recording that as "exit code unknown"
-    // would hide the actual cause — the one thing this record exists to prevent.
-    const spawnError = typeof failure.code === 'string' ? failure.code : undefined
-    const combined = [text(failure.stdout), text(failure.stderr)].filter((part) => part.length > 0).join('\n')
+    if (signal.aborted) throw new Error('evidence cancelled before execution')
+    const spec = shell.resolve({
+      command, workdir: cwd, timeoutMs, onExpiry: 'kill', signal,
+      stdoutMaxBytes: 8 * 1024 * 1024,
+      sandboxPolicy: { ...authority.sandbox },
+    })
+    handle = await shell.execute(spec as never)
+    signal.addEventListener('abort', onAbort, { once: true })
+    if (signal.aborted) onAbort()
+    const result = await handle.result()
+    const sandboxFailed = result.sandbox?.denied === true || result.sandbox?.runnerFailed === true
+      || (authority.sandbox.mode !== 'danger-full-access' && result.sandbox?.mode !== authority.sandbox.mode)
     return {
       command,
-      ok: false,
-      ...(exitCode !== undefined ? { exitCode } : {}),
-      ...(spawnError !== undefined ? { spawnError } : {}),
-      timedOut,
+      ok: result.exitCode === 0 && !result.timedOut && !result.aborted && !sandboxFailed,
+      ...(result.exitCode !== null ? { exitCode: result.exitCode } : {}),
+      ...(sandboxFailed ? { spawnError: 'sandbox denied the command or could not enforce the captured policy' } : {}),
+      ...(result.aborted ? { spawnError: 'evidence command cancelled' } : {}),
+      timedOut: result.timedOut,
       elapsedMs: Date.now() - startedAt,
-      outputTail: boundedTail(combined, EVIDENCE_TAIL_LINES, 1600),
+      outputTail: boundedTail([result.stdout.text, result.stderr.text].filter(Boolean).join('\n'), EVIDENCE_TAIL_LINES, 1600),
+    }
+  } catch (err) {
+    return { command, ok: false, spawnError: String(err instanceof Error ? err.message : err), timedOut: false, elapsedMs: Date.now() - startedAt, outputTail: '' }
+  } finally {
+    signal.removeEventListener('abort', onAbort)
+    if (handle !== undefined) {
+      try { await handle.done }
+      catch (error) { onCleanupFailed?.(error); throw error }
     }
   }
-}
-
-/**
- * Resolve the shell used for evidence-contract commands, once per process.
- *
- * J3: this used to leave `shell` unset, so `exec` fell back to `cmd.exe` on
- * Windows. Agents naturally write PowerShell (`if (Test-Path …) { exit 0 }`,
- * `Set-Location`), which `cmd.exe` rejects with `'…') was unexpected at this
- * time.` — and because that failure was indistinguishable from a real gate
- * failure, the task was retried and eventually failed for a reason that had
- * nothing to do with the work. 59 of 184 recorded task failures (32%) across
- * every project trace to this one mismatch.
- *
- * Candidates are probed with an actual command, not just `where`: on the
- * machine this was diagnosed on, `pwsh` is NOT on PATH and no `Get-Command`
- * finds it, yet Windows PowerShell 5.1 sits at a fixed path. Preferring a
- * path over a name is what makes this reliable.
- */
-let cachedEvidenceShell: string | undefined
-function evidenceShell(): string | undefined {
-  if (cachedEvidenceShell !== undefined) return cachedEvidenceShell
-  const candidates: string[] = []
-  if (process.platform !== 'win32') {
-    candidates.push('/bin/bash', '/bin/sh')
-  } else {
-    if (typeof process.env.PWSH_PATH === 'string' && process.env.PWSH_PATH.length > 0) candidates.push(process.env.PWSH_PATH)
-    if (process.env.ProgramFiles !== undefined) candidates.push(join(process.env.ProgramFiles, 'PowerShell', '7', 'pwsh.exe'))
-    if (process.env.LOCALAPPDATA !== undefined) candidates.push(join(process.env.LOCALAPPDATA, 'Microsoft', 'WindowsApps', 'pwsh.exe'))
-    if (process.env.SystemRoot !== undefined) {
-      candidates.push(join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
-    }
-    candidates.push('pwsh.exe', 'pwsh', 'powershell.exe')
-  }
-  for (const candidate of candidates) {
-    // `echo ok` as the shell command exercises resolution AND execution.
-    const probe = spawnSync(candidate, ['-NoProfile', '-Command', 'exit 0'], { stdio: 'ignore', windowsHide: true, timeout: 5000 })
-    if (!probe.error && probe.status === 0) {
-      cachedEvidenceShell = candidate
-      return cachedEvidenceShell
-    }
-  }
-  // No usable shell: keep the platform default rather than failing every gate.
-  cachedEvidenceShell = ''
-  return undefined
 }
 
 /** Classify a spawn-failure reason for pause (A3) and adaptive-concurrency (K1) decisions. */
@@ -289,6 +252,12 @@ interface InFlight {
   childSessionId?: string
   /** J19: the attempt this flight represents, so a superseded one can be told apart. */
   attemptId?: string
+  roleId?: string
+  phase?: 'build' | 'review' | 'evidence'
+  done?: Promise<void>
+  cleanupFailed?: boolean
+  reclaimReason?: string
+  reclaim?: (reason: string) => void
   /**
    * Item 7: re-arms the spawn ceiling once the child has started. The ceiling is
    * then a sliding no-progress timer — every heartbeat re-arms it, so a working
@@ -304,7 +273,7 @@ interface AgentsLike {
     sessionId: SessionId
     meta?: { cwd?: string; delegationDepth?: number; agentPreset?: string }
     agentOptions?: { provider?: string; model?: string }
-    setup?: (anchorCtx: unknown) => void | Promise<void>
+    setup?: (anchorCtx: unknown, anchor: Agent) => void | Promise<void>
   }): Promise<{ agent: Agent; dispose(): Promise<void> }>
   /** Live-agent lookup by session id (workspace resolution + completion push). */
   get?(id: string): {
@@ -424,6 +393,14 @@ export class SwarmService extends Service {
   private readonly runParents = new Map<string, Agent>()
   /** Service-owned idle anchor agents every spawn of a run is routed through. */
   private readonly runAnchors = new Map<string, { agent: Agent; dispose(): Promise<void> }>()
+  private readonly anchorPromises = new Map<string, Promise<Agent | undefined>>()
+  /** Includes cancelled holders until their owned cleanup proves quiescence. */
+  private readonly holders = new Set<InFlight>()
+  private disposed = false
+  private deadlineTimer: ReturnType<typeof setTimeout> | undefined
+  private readonly recoveries = new Map<string, Promise<void>>()
+  private readonly recoveryQueue = new Map<string, { task: Task; summary: string }>()
+  private readonly reviewQueue = new Map<string, { runId: string; taskId: string; roleId: string; attemptId: string }>()
   /** K1: per-run adaptive launch capacity (shrinks on provider-class failures, recovers on completions). */
   private readonly adaptiveLimits = new Map<string, number>()
   /** Last silence-nudge timestamp per in-flight task (dedupes re-nudges). */
@@ -446,11 +423,34 @@ export class SwarmService extends Service {
   private tickScheduled = false
 
   constructor(ctx: Context, config: SwarmConfig) {
+    // Validate/load before Cordis publishes this Service. A refused store must
+    // degrade the plugin, never leave a discoverable half-initialized instance.
+    for (const key of Object.keys(RUNTIME_LIMITS) as Array<keyof typeof RUNTIME_LIMITS>) validateRuntimeInteger(key, config[key])
+    mkdirSync(config.storageDir, { recursive: true })
+    const events = new EventStore(join(config.storageDir, 'events.jsonl'))
+    const duty = new DutyTableStore(join(config.storageDir, 'duty-table.json'))
+    const runtime = new RuntimeStore(join(config.storageDir, 'runtime.json'))
+    // A valid envelope can still carry an unreplayable payload. Fold before
+    // publication too, and retain that validated initial projection.
+    const initialState = fold(events.all())
     super(ctx, 'swarm')
     this.swarmConfig = config
     this.startedAt = Date.now()
-    mkdirSync(config.storageDir, { recursive: true })
-    this.events = new EventStore(join(config.storageDir, 'events.jsonl'))
+    ctx.effect(() => () => {
+      this.disposed = true
+      if (this.deadlineTimer !== undefined) clearTimeout(this.deadlineTimer)
+      if (this.humanWaitTimer !== undefined) clearTimeout(this.humanWaitTimer)
+      this.recoveryQueue.clear()
+      this.reviewQueue.clear()
+      const holders = [...this.holders]
+      for (const flight of holders) flight.controller.abort()
+      void Promise.allSettled(holders.map((flight) => flight.done)).then(() => {
+        for (const runId of this.runAnchors.keys()) this.releaseAnchor(runId)
+      })
+    })
+    this.events = events
+    this.state = initialState
+    this.stateDirty = false
     // B2: record when each task's CURRENT wait episode began (the seq of the
     // task/blocked or task/review-started event that started it). A ping is
     // keyed to the episode it covered, so any NEW block event is by definition
@@ -464,8 +464,8 @@ export class SwarmService extends Service {
         }
       }
     })
-    this.duty = new DutyTableStore(join(config.storageDir, 'duty-table.json'))
-    this.runtime = new RuntimeStore(join(config.storageDir, 'runtime.json'))
+    this.duty = duty
+    this.runtime = runtime
     // H-4/J9 boot readiness: delay orphan recovery until the subagents spawn
     // provider has actually mounted. The original implementation waited a fixed
     // 3000ms, which is a guess: on a loaded host the plugin tree can take longer,
@@ -553,66 +553,37 @@ export class SwarmService extends Service {
    * indefinitely when a task cannot survive a restart.
    */
   private recoverOrphans(): void {
-    const state = fold(this.events.all())
-    let recovered = false
-    let skipped = 0
-    const runningRuns = new Set<string>()
-    let strandedRetrying = false
-    for (const task of state.tasks.values()) {
-      if (task.runId !== undefined) {
-        const ownerRun = state.runs.get(task.runId)
-        if (ownerRun?.status === 'running') runningRuns.add(task.runId)
+    const state = this.view()
+    for (const run of state.runs.values()) {
+      if (run.status !== 'running') continue
+      if (!validAuthority(run.dispatch?.authority)) {
+        const reason = 'legacy run has no captured caller authority — explicitly resume to capture a conservative read-only policy, or redispatch from the owning chat'
+        this.events.append('run/paused', { runId: run.id, data: { reason } })
+        this.notifyDispatchSession(run.id, 'paused', reason)
+        continue
       }
-      if (task.status !== 'running' && task.status !== 'dispatching' && task.status !== 'reviewing') continue
-      const run = state.runs.get(task.runId)
-      if (run?.status !== 'running') { skipped++; continue }
-      // J13/J19: never touch a task this process is actively running. Recovery runs
-      // asynchronously after boot, and in a one-shot/headless host the dispatching
-      // agent can already have launched a task by then — that task is not an orphan,
-      // and failing it kills live work (observed live: a smoke run showed
-      // task/started -> agent-started -> failed("host restarted mid-flight")
-      // -> heartbeat).
-      //
-      // A published attempt fence is the authoritative ownership signal: a launch
-      // records it synchronously, BEFORE the child is spawned, so it is already set
-      // for every task in the window where `inFlight` does not yet exist.
-      if (this.liveAttempts.has(taskKeyOf(task))) continue
-      if (this.inFlight.has(taskKeyOf(task))) continue
-      this.events.append('task/failed', {
-        runId: task.runId, taskId: task.id,
-        data: { retry: task.attempts <= this.swarmConfig.maxRetries, reason: 'host restarted mid-flight' },
-      })
-      recovered = true
-    }
-    if (recovered) this.ctx.logger('swarm').info('recovered orphaned running tasks after restart')
-    if (skipped > 0) {
-      this.ctx.logger('swarm').info('skipped %d orphaned task(s) whose run is not running (terminal runs stay frozen)', skipped)
-    }
-    // Item 3: `retrying` tasks lost their backoff timer to the restart. They are
-    // NOT re-failed here (appending a failure would flip them back to `retrying`
-    // and every boot would re-fail them in a loop — FM6); instead one dispatch
-    // tick relaunches them, since their backoff (measured from updatedAt) is
-    // long past by the time a restart happened.
-    for (const task of state.tasks.values()) {
-      if (task.status === 'retrying' && runningRuns.has(task.runId)) {
-        strandedRetrying = true
-        this.ctx.logger('swarm').info('retrying task %s/%s re-armed after restart', task.runId, task.id)
+      for (const id of run.taskIds) {
+        const task = this.view().tasks.get(run.id + '/' + id)
+        if (task === undefined || this.inFlight.has(taskKeyOf(task)) || this.recoveries.has(taskKeyOf(task))) continue
+        if (task.status === 'reviewing' && task.humanReview === true) { this.scheduleHumanWaitingNotify(run.id); continue }
+        if (task.status === 'completed' || task.status === 'reviewing') {
+          if (task.attemptProtocol === 2 && task.attemptId !== undefined && task.attemptRevoked !== true && task.reviewed !== true && task.reviewUnavailable !== true && task.reviewExhausted !== true) {
+            if (task.reviewGate === 'human') {
+              this.events.append('task/review-started', { runId: run.id, taskId: id, data: { attemptId: task.attemptId, reviewer: task.reviewBy ?? 'human', human: true } })
+              this.scheduleHumanWaitingNotify(run.id)
+            } else if (task.reviewBy !== undefined && task.reviewBy.length > 0) void this.runReview(run.id, id, task.reviewBy, task.attemptId)
+          }
+          continue
+        }
+        if (task.status !== 'running' && task.status !== 'dispatching') continue
+        const report = this.adoptTaskReport(run.id, task)
+        if (report !== undefined) { this.recoverReportedTask(task, report); continue }
+        this.events.append('task/failed', { runId: run.id, taskId: id, data: { source: 'operator', retry: task.attempts <= this.rt('maxRetries'), reason: 'host restarted mid-flight; no correlated report' } })
       }
     }
-    if (strandedRetrying) this.ctx.logger('swarm').info('re-armed stranded retrying task(s) after restart')
-    // Item 3: a boot with zero new events never dispatches — the tick loop is
-    // event-driven. Schedule one tick per surviving running run so pending and
-    // recovered tasks are re-evaluated instead of waiting for outside activity.
-    if (runningRuns.size > 0) this.scheduleTick()
+    this.scheduleTick()
   }
 
-  /**
-   * Watchdog sweep. Two tiers over a running task's silence:
-   * past `nudgeAfterMinutes` without a note → a `task/nudged` marker on the
-   * board (early warning, re-nudged per additional silent window); past
-   * `staleTimeoutSeconds` → the agent is aborted and the task requeued.
-   * `now` is injectable for tests.
-   */
   watchdog(now = Date.now()): void {
     const state = this.view()
     const staleMs = this.rt('staleTimeoutSeconds') * 1000
@@ -620,61 +591,23 @@ export class SwarmService extends Service {
     for (const [key, flight] of [...this.inFlight]) {
       const task = state.tasks.get(key)
       if (task === undefined) {
-        this.inFlight.delete(key)
-        this.nudgeCount.delete(key)
-        this.nudgedAt.delete(key)
-        continue
+        flight.controller.abort()
+        continue // Ownership lasts until the provider and Shell handles settle.
       }
       // A task that left the running state (completed, failed, blocked) while
       // still holding an inFlight slot (settle handler racing the sweep) —
       // clean the tracking Maps to avoid stale entries.
-      if (task.status !== 'running' && task.status !== 'dispatching' && task.status !== 'reviewing') {
-        this.inFlight.delete(key)
-        this.nudgeCount.delete(key)
-        this.nudgedAt.delete(key)
+      if (!this.currentFlight(task.runId, task.id, flight, flight.phase === 'review')) {
+        flight.controller.abort()
         continue
       }
-      if (this.view().runs.get(task.runId)?.status === 'aborted') continue
+      if (flight.phase === 'evidence' || flight.reclaimReason !== undefined) continue
       const reclaim = (reason: string): void => {
-        // Item 4: the child may have finished the work before going silent —
-        // adopt a fresh on-disk report instead of discarding it (same J10
-        // contract as the settle path; the J22 freshness check inside
-        // adoptTaskReport keeps a predecessor's report from counting).
-        this.inFlight.delete(key)
         this.nudgeCount.delete(key)
         this.nudgedAt.delete(key)
-        flight.controller.abort()
-        const adopted = this.adoptTaskReport(task.runId, task)
-        if (adopted !== undefined) {
-          this.events.append('task/completed', {
-            runId: task.runId, taskId: task.id,
-            data: { attemptId: flight.attemptId, summary: adopted },
-          })
-          if (task.reviewBy !== undefined && task.reviewBy.length > 0 && task.reviewGate !== 'human') {
-            void this.runReview(task.runId, task.id, task.reviewBy, flight.attemptId)
-          } else {
-            this.scheduleTick()
-          }
-          this.ctx.logger('swarm').info('watchdog reclaim adopted the on-disk report for %s', key)
-          return
-        }
-        const retry = task.attempts <= this.swarmConfig.maxRetries
-        this.events.append('task/failed', {
-          runId: task.runId, taskId: task.id,
-          data: { attemptId: flight.attemptId, retry, reason },
-        })
-        // Item 3 (H-1 parity): this path has no settle handler to arm the
-        // retry-backoff timer, and ticks are event-driven — without the timer
-        // the tick's "too soon" skip never gets its follow-up tick and the run
-        // strands (the overnight StockSelector stall: reclaimed 00:05:37,
-        // silence until a human resumed it at 07:15).
-        if (retry && this.rt('retryBackoffBaseMs') > 0) {
-          const backoffMs = Math.min(
-            this.rt('retryBackoffBaseMs') * Math.pow(2, Math.max(0, task.attempts - 1)),
-            60000,
-          )
-          setTimeout(() => this.scheduleTick(), backoffMs + 100)
-        }
+        // Cancel only the child. Its owned settle path validates any correlated
+        // report with the SAME evidence/review gates before releasing capacity.
+        flight.reclaim?.(reason)
       }
       if (now - task.updatedAt > staleMs) {
         reclaim(`stale: no progress for ${Math.round(staleMs / 1000)}s (watchdog)`)
@@ -701,7 +634,7 @@ export class SwarmService extends Service {
           }
           this.events.append('task/nudged', {
             runId: task.runId, taskId: task.id,
-            data: { silentMinutes: Math.round(silentMs / 60000) },
+            data: { attemptId: flight.attemptId, silentMinutes: Math.round(silentMs / 60000) },
           })
         }
         // Reset the nudge counter when the task heartbeats (is making progress).
@@ -845,6 +778,7 @@ export class SwarmService extends Service {
     if (unknownRoles.length > 0) throw new Error(`unknown roles ${unknownRoles.join(', ')} — known: ${known.join(', ')}`)
 
     const captured = captureDispatchContext(parent)
+    captured.authority = captureAuthority(this.ctx, parent, captured.cwd)
     const notices: string[] = []
 
     // P1: one-run-per-goal guard. A workspace with an active sibling run is a
@@ -1039,48 +973,45 @@ export class SwarmService extends Service {
   private adoptTaskReport(runId: string, task: Task): string | undefined {
     const cwd = this.view().runs.get(runId)?.dispatch?.cwd
     if (cwd === undefined) return undefined
-    const reportPath = join(cwd, taskReportRelPath(task.id))
+    const current = this.view().tasks.get(taskKeyOf(task)) ?? task
+    const strict = current.attemptProtocol === 2
+    if (strict && (current.attemptId === undefined || current.attemptRevoked === true)) return undefined
+    const reportPath = join(cwd, strict ? taskReportRelPath(task.id, runId, current.attemptId) : taskReportRelPath(task.id))
     let raw: string
+    let fd: number | undefined
     try {
-      const info = statSync(reportPath)
-      if (!info.isFile() || info.size === 0 || info.size > 256 * 1024) return undefined
-      // J22: the report must have been written DURING the live attempt. The path is
-      // keyed by task id, not by run, so a previous run that reused the id leaves a
-      // well-formed "completed" file behind; and an earlier attempt of this same run
-      // may have written one before its evidence gate failed. Crediting either would
-      // mark work complete that this attempt never did. Adoption exists to rescue a
-      // child that finished and died — that report is by definition newer than the
-      // `task/started` that launched it.
-      const startedAt = (this.view().tasks.get(taskKeyOf(task)) ?? task).attemptStartedAt
-      if (startedAt !== undefined && info.mtimeMs < startedAt) {
-        this.ctx.logger('swarm').warn(
-          'ignoring stale task report for %s: written %ss before the live attempt started',
-          task.id, ((startedAt - info.mtimeMs) / 1000).toFixed(1),
-        )
-        return undefined
+      fd = openSync(reportPath, 'r')
+      const info = fstatSync(fd)
+      const limit = 256 * 1024
+      if (!info.isFile() || info.size === 0 || info.size > limit) return undefined
+      // Legacy compatibility only. New reports use exact run/attempt/task identities.
+      if (!strict && current.attemptStartedAt !== undefined && info.mtimeMs < current.attemptStartedAt) return undefined
+      // Bound the READ too: an attacker can grow a file after the size check.
+      const buffer = Buffer.alloc(limit + 1)
+      let bytes = 0
+      while (bytes < buffer.length) {
+        const n = readSync(fd, buffer, bytes, buffer.length - bytes, bytes)
+        if (n === 0) break
+        bytes += n
       }
-      raw = readFileSync(reportPath, 'utf8')
-    } catch {
-      return undefined
-    }
+      if (bytes === 0 || bytes > limit) return undefined
+      raw = buffer.toString('utf8', 0, bytes)
+    } catch { return undefined }
+    finally { if (fd !== undefined) closeSync(fd) }
     let parsed: unknown
-    try {
-      parsed = JSON.parse(raw)
-    } catch {
-      return undefined
-    }
-    if (parsed === null || typeof parsed !== 'object') return undefined
+    try { parsed = JSON.parse(raw) } catch { return undefined }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
     const record = parsed as Record<string, unknown>
-    // Only an explicit completed status is proof; anything else is not adoption.
+    // A report is a recovery HINT. Evidence and review still run in finalizeTask.
     if (record.status !== 'completed') return undefined
-    if (typeof record.taskId === 'string' && record.taskId.length > 0 && record.taskId !== task.id) {
-      this.ctx.logger('swarm').warn('task report for %s declares a different taskId (%s) — ignoring', task.id, record.taskId)
-      return undefined
-    }
+    if (strict) {
+      if (record.runId !== runId || record.attemptId !== current.attemptId || record.taskId !== task.id) return undefined
+    } else if ((record.taskId !== undefined && record.taskId !== task.id)
+      || (record.runId !== undefined && record.runId !== runId)) return undefined
     const summary = typeof record.summary === 'string' && record.summary.trim().length > 0
-      ? record.summary.trim()
-      : 'completed (recovered from the on-disk task report after the child died)'
-    this.ctx.logger('swarm').info('adopted on-disk task report for %s — the work outlived its agent', task.id)
+      ? record.summary.trim().slice(0, 32768)
+      : 'finished work reported on disk; recovered through evidence and review gates'
+    this.ctx.logger('swarm').info('correlated recovery hint for %s/%s; checking evidence and review', runId, task.id)
     return summary
   }
 
@@ -1105,16 +1036,19 @@ export class SwarmService extends Service {
     // progress describes work that has been discarded, and the board would show it
     // as if the current attempt had done it.
     const mine = this.liveAttempts.get(entry.taskKey)
-    if (mine !== undefined && task.attemptId !== undefined && task.attemptId !== mine) {
+    const flight = this.inFlight.get(entry.taskKey)
+    if (task.attemptRevoked === true || task.attemptId !== entry.attemptId
+      || (mine !== undefined && task.attemptId !== undefined && task.attemptId !== mine)
+      || (task.attemptProtocol === 2 && (flight === undefined || flight.childSessionId !== childAgentId || !this.currentFlight(task.runId, task.id, flight, flight.phase === 'review')))) {
       throw new Error('this attempt has been superseded — the task was retried or reassigned, so your result is no longer accepted')
     }
+    if (typeof note !== 'string' || note.trim().length === 0 || note.length > 8192) throw new Error('progress note must contain 1–8192 characters')
     this.events.append('task/heartbeat', {
       runId: task.runId, taskId: task.id,
       data: { ...(entry.attemptId !== undefined ? { attemptId: entry.attemptId } : {}), note },
     })
     // Item 7: progress re-arms the child's no-progress window — a working child
     // is never reclaimed for elapsed time.
-    const flight = this.inFlight.get(entry.taskKey)
     if (flight !== undefined && flight.attemptId === entry.attemptId) flight.resetSpawnTimer?.()
     return 'ok'
   }
@@ -1225,9 +1159,9 @@ export class SwarmService extends Service {
    * short coalescing window so a burst produces ONE aggregated ping — the
    * production incident had eight tasks block at once, and eight pings would be
    * their own alarm fatigue. Items joining inside the window are picked up when
-   * it fires; a later join arms a fresh window. The run id captured here is the
-   * first trigger's — the ping still lists every waiting item across runs, it
-   * just rides that run's dispatching session.
+   * it fires; a later join arms a fresh window. Each owner's waits are delivered
+   * only to their captured dispatching session, never another owner's chat.
+   * Only successfully delivered episodes are deduplicated.
    *
    * A run merely awaiting endorsement does NOT ping: the creation-time tool
    * result already tells the dispatching agent "awaiting human endorsement on
@@ -1253,41 +1187,42 @@ export class SwarmService extends Service {
    * still `reviewing`, and a blocked task counts while it is still `blocked`.
    * Failures are contained exactly like the completion push.
    */
-  private flushHumanWaiting(triggerRunId: string): void {
+  private flushHumanWaiting(_triggerRunId: string): void {
     if (this.swarmConfig.notifyDispatchSession !== true) return
-    try {
-      const state = this.view()
-      const waiting = [...state.tasks.values()].filter(
-        (task) => task.status === 'blocked' || (task.humanReview === true && task.status === 'reviewing'),
-      )
-      const episodeOf = (key: string): number => this.humanWaitEpisode.get(key) ?? -1
-      const fresh = waiting.filter((task) => this.humanWaitPinged.get(`${task.runId}/${task.id}`) !== episodeOf(`${task.runId}/${task.id}`))
-      if (fresh.length === 0) return
-      for (const task of waiting) {
-        const key = `${task.runId}/${task.id}`
-        this.humanWaitPinged.set(key, episodeOf(key))
+    const state = this.view()
+    const owners = new Map<string, Array<{ task: Task; episode: number }>>()
+    for (const task of state.tasks.values()) {
+      if (task.status !== 'blocked' && !(task.humanReview === true && task.status === 'reviewing')) continue
+      const run = state.runs.get(task.runId)
+      if (run?.status === 'aborted' || run?.status === 'completed') continue
+      const owner = run?.dispatch?.sessionId
+      if (owner === undefined) continue
+      const items = owners.get(owner) ?? []
+      items.push({ task, episode: this.humanWaitEpisode.get(taskKeyOf(task)) ?? -1 })
+      owners.set(owner, items)
+    }
+    for (const [owner, items] of owners) {
+      if (!items.some(({ task, episode }) => this.humanWaitPinged.get(taskKeyOf(task)) !== episode)) continue
+      try {
+        const agents = this.ctx.get('agents') as AgentsLike | undefined
+        const live = typeof agents?.get === 'function' ? agents.get(owner) : undefined
+        if (live === undefined || typeof live.followup !== 'function') continue
+        const brief = (s: string): string => s.length <= 260 ? s : `${s.slice(0, 90)} … ${s.slice(-160)}`
+        const lines = items.map(({ task }) => task.status === 'blocked'
+          ? `- run ${task.runId} task "${task.id}": ${brief(String(task.blockedReason ?? 'blocked — a human decides'))}`
+          : `- run ${task.runId} task "${task.id}": awaiting your review verdict (reviewGate: human)`)
+        const text = `[swarm attention] ${items.length} item${items.length === 1 ? '' : 's'} waiting on a human decision:\n${lines.join('\n')}\n`
+          + 'Resolution: swarm_review (approve/reject — human review gates), swarm_retry (requeue a blocked task), '
+          + 'swarm_complete (accept finished work despite the evidence artefact), or the dashboard buttons. '
+          + 'You may surface this decision to the user as a multiple-choice prompt. '
+          + 'Do not start new work unless the user asks — the live board is on the Swarm tab.'
+        live.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
+        // Only acknowledge this owner's captured episodes AFTER successful delivery.
+        // Missing/throwing sessions and other owners retain their undelivered items.
+        for (const { task, episode } of items) this.humanWaitPinged.set(taskKeyOf(task), episode)
+      } catch (err) {
+        this.ctx.logger('swarm').warn('human-wait push to %s failed (contained): %s', owner, String(err))
       }
-
-      const sessionId = state.runs.get(triggerRunId)?.dispatch?.sessionId
-      if (sessionId === undefined) return
-      const agents = this.ctx.get('agents') as AgentsLike | undefined
-      const live = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
-      if (live === undefined || typeof live.followup !== 'function') return
-      // The reason is long; keep its head for context and its tail for the
-      // recorded detail (exit code, output tail) — the middle is preamble.
-      const brief = (s: string): string => (s.length <= 260 ? s : `${s.slice(0, 90)} … ${s.slice(-160)}`)
-      const lines = waiting.map((task) => task.status === 'blocked'
-        ? `- run ${task.runId} task "${task.id}": ${brief(String(task.blockedReason ?? 'blocked — a human decides'))}`
-        : `- run ${task.runId} task "${task.id}": awaiting your review verdict (reviewGate: human)`)
-      const n = waiting.length
-      const text = `[swarm attention] ${n} item${n === 1 ? '' : 's'} waiting on a human decision:\n${lines.join('\n')}\n`
-        + 'Resolution: swarm_review (approve/reject — human review gates), swarm_retry (requeue a blocked task), '
-        + 'swarm_complete (accept finished work despite the evidence artefact), or the dashboard buttons. '
-        + 'You may surface this decision to the user as a multiple-choice prompt. '
-        + 'Do not start new work unless the user asks — the live board is on the Swarm tab.'
-      live.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
-    } catch (err) {
-      this.ctx.logger('swarm').warn('human-wait push failed (contained): %s', String(err))
     }
   }
 
@@ -1394,35 +1329,47 @@ export class SwarmService extends Service {
   private async ensureAnchor(runId: string): Promise<Agent | undefined> {
     const existing = this.runAnchors.get(runId)
     if (existing !== undefined) return existing.agent
-    const agents = this.ctx.get('agents') as AgentsLike | undefined
-    if (agents === undefined) return this.runParents.get(runId)
+    const pending = this.anchorPromises.get(runId)
+    if (pending !== undefined) return pending
     const captured = this.view().runs.get(runId)?.dispatch
-    const handle = await agents.create({
-      sessionId: SessionId(randomUUID()),
-      meta: {
-        ...(captured?.cwd !== undefined ? { cwd: captured.cwd } : {}),
-        delegationDepth: 0,
-        ...(captured?.presetId !== undefined ? { agentPreset: captured.presetId } : {}),
-      },
-      ...(captured?.provider !== undefined && captured.model !== undefined
-        ? { agentOptions: { provider: captured.provider, model: captured.model } }
-        : {}),
-      setup: async (anchorCtx) => {
-        const presets = (anchorCtx as { get(name: string): unknown }).get('agentPresets') as PresetsLike | undefined
-        if (presets !== undefined) {
-          // undefined id = the deployment default preset (recovered runs).
-          await presets.mount(anchorCtx, captured?.presetId)
+    if (!validAuthority(captured?.authority)) throw new Error('run has no captured permissions; resume explicitly or redispatch from the owning session')
+    const authority = captured.authority
+    const create = async (): Promise<Agent | undefined> => {
+      const agents = this.ctx.get('agents') as AgentsLike | undefined
+      if (agents === undefined) return this.runParents.get(runId)
+      const handle = await agents.create({
+        sessionId: SessionId(randomUUID()),
+        meta: {
+          ...(captured.cwd !== undefined ? { cwd: captured.cwd } : {}),
+          delegationDepth: 0,
+          ...(captured.presetId !== undefined ? { agentPreset: captured.presetId } : {}),
+        },
+        ...(captured.provider !== undefined && captured.model !== undefined ? { agentOptions: { provider: captured.provider, model: captured.model } } : {}),
+        setup: async (anchorCtx, anchor) => {
+          // Factory setup runs before publication. Presets and the FIRST child
+          // therefore see the dispatcher's ceiling, never deployment defaults.
+          appendDelegatedPolicyOverrides(anchor.session, authority.delegated)
+          const presets = (anchorCtx as { get(name: string): unknown }).get('agentPresets') as PresetsLike | undefined
+          if (presets !== undefined) await presets.mount(anchorCtx, captured.presetId)
+        },
+      })
+      try {
+        if (this.disposed || this.view().runs.get(runId)?.status !== 'running') {
+          await handle.dispose()
+          return undefined
         }
-      },
-    })
-    // The run may have gone terminal (abort) while the factory was creating.
-    if (this.view().runs.get(runId)?.status !== 'running') {
-      void handle.dispose().catch(() => {})
-      return undefined
+        this.runAnchors.set(runId, handle)
+        this.ctx.logger('swarm').info('run %s anchored to idle agent %s', runId, String(handle.agent.id))
+        return handle.agent
+      } catch (err) {
+        await handle.dispose()
+        throw err
+      }
     }
-    this.runAnchors.set(runId, handle)
-    this.ctx.logger('swarm').info('run %s anchored to idle agent %s', runId, String(handle.agent.id))
-    return handle.agent
+    const promise = create()
+    this.anchorPromises.set(runId, promise)
+    try { return await promise }
+    finally { if (this.anchorPromises.get(runId) === promise) this.anchorPromises.delete(runId) }
   }
 
   /**
@@ -1508,6 +1455,7 @@ export class SwarmService extends Service {
 
   /** Dispose a run's anchor once the run reaches a terminal status. */
   private releaseAnchor(runId: string): void {
+    if (this.countRunHolders(runId) > 0) return
     const handle = this.runAnchors.get(runId)
     if (handle === undefined) return
     this.runAnchors.delete(runId)
@@ -1527,11 +1475,25 @@ export class SwarmService extends Service {
 
   /** Count all running/dispatching/reviewing tasks across ALL runs (the global agent footprint). */
   private countGlobalRunning(): number {
-    let count = 0
-    for (const task of this.view().tasks.values()) {
-      if (task.status === 'running' || task.status === 'dispatching' || task.status === 'reviewing') count += 1
-    }
-    return count
+    return this.holders.size
+  }
+
+  private countRunHolders(runId: string): number {
+    return [...this.holders].filter((flight) => flight.taskKey.startsWith(runId + '/')).length
+  }
+
+  private spawnToolFilter(role: RoleConfig): { allow?: string[]; deny?: string[] } | undefined {
+    const { filter, refusal, dropped } = sanitizeToolNames(role.toolFilter, this.restrictableToolNames())
+    if (refusal !== undefined) throw new Error(refusal)
+    if (dropped.length > 0) this.ctx.logger('swarm').warn('role %s allow list narrowed: unknown tools %s', role.id, dropped.join(', '))
+    return filter
+  }
+
+  private dependencyHandoffs(run: Run, task: Task): string[] {
+    return (task.blockedBy ?? []).slice(0, 64).map((id) => {
+      const dependency = this.view().tasks.get(run.id + '/' + id)
+      return `${id}: ${(dependency?.summary ?? dependency?.lastNote ?? '(no summary)').slice(0, 600)}`
+    })
   }
 
   private shrinkConcurrency(runId: string): void {
@@ -1705,7 +1667,7 @@ export class SwarmService extends Service {
     const support = this.effortSupport()
     if (support === undefined) return { candidates, effort }
     const primary = candidates[0]
-    const check = checkEffortSupport(primary.model, effort, support)
+    const check = checkEffortSupport(primary.model, effort, support, primary.provider)
     if (!check.incompatible) return { candidates, effort }
     this.ctx.logger('swarm').warn('preflight (%s): %s', roleId, check.warning ?? `effort "${effort}" is not accepted by ${primary.provider}/${primary.model}`)
     return { candidates, effort: undefined }
@@ -1716,76 +1678,184 @@ export class SwarmService extends Service {
    * the board as warnings); command failures are hard. Every command's structured
    * outcome travels back with the verdict so the caller can record WHY (A7).
    */
-  private async checkEvidence(task: Task): Promise<{
-    fileWarnings: string[]
-    commandFailures: string[]
-    commands: EvidenceCommandOutcome[]
+
+  private async checkEvidence(task: Task, signal: AbortSignal, onCleanupFailed?: (error: unknown) => void): Promise<{
+    fileWarnings: string[]; commandFailures: string[]; commands: EvidenceCommandOutcome[]
   }> {
-    const result = {
-      fileWarnings: [] as string[],
-      commandFailures: [] as string[],
-      commands: [] as EvidenceCommandOutcome[],
-    }
+    const result = { fileWarnings: [] as string[], commandFailures: [] as string[], commands: [] as EvidenceCommandOutcome[] }
     const evidence = task.evidence
     if (evidence === undefined) return result
-    const cwd = this.view().runs.get(task.runId)?.dispatch?.cwd ?? process.cwd()
+    const dispatch = this.view().runs.get(task.runId)?.dispatch
+    const cwd = dispatch?.cwd ?? process.cwd()
     for (const file of evidence.files ?? []) {
+      if (signal.aborted) break
       try {
         const info = statSync(join(cwd, file))
-        if (!info.isFile() || info.size === 0) result.fileWarnings.push(`required file "${file}" is missing or empty`)
-      } catch {
-        result.fileWarnings.push(`required file "${file}" is missing or empty`)
-      }
+        if (!info.isFile() || info.size === 0) result.fileWarnings.push('required file "' + file + '" is missing or empty')
+      } catch { result.fileWarnings.push('required file "' + file + '" is missing or empty') }
     }
-    const timeoutMs = this.swarmConfig.evidenceTimeoutMs
+    const shell = this.ctx.get('shell') as EvidenceShell | undefined
     for (const command of evidence.commands ?? []) {
-      const outcome = await runEvidenceCommand(command, cwd, timeoutMs)
+      const outcome = await runEvidenceCommand(shell, dispatch?.authority, command, cwd, this.rt('evidenceTimeoutMs'), signal, onCleanupFailed)
       result.commands.push(outcome)
       if (!outcome.ok) result.commandFailures.push(describeEvidenceFailure(outcome))
+      if (signal.aborted) break
     }
     return result
   }
 
-  /** A3: stop launching, abort in-flight children, and park the run for a human resume. */
-  private pauseRun(runId: string, cause: string): void {
-    for (const [key, flight] of this.inFlight) {
-      if (flight.taskKey.startsWith(runId + '/')) {
-        flight.controller.abort()
-        this.inFlight.delete(key)
-      }
+  /** Only the still-owned attempt may commit after ANY await. */
+  private currentFlight(runId: string, taskId: string, flight: InFlight, review = false): boolean {
+    const task = this.view().tasks.get(runId + '/' + taskId)
+    return !this.disposed && !flight.cleanupFailed && !flight.controller.signal.aborted
+      && this.inFlight.get(flight.taskKey) === flight
+      && this.view().runs.get(runId)?.status === 'running'
+      && task?.attemptId === flight.attemptId && task?.attemptRevoked !== true
+      && (review ? task?.status === 'reviewing' : task?.status === 'running' || task?.status === 'dispatching')
+  }
+
+  private ownFlight(key: string, flight: InFlight): void {
+    this.inFlight.set(key, flight)
+    this.holders.add(flight)
+  }
+
+  private markCleanupFailed(runId: string, taskId: string, flight: InFlight, error: unknown): void {
+    const current = this.currentFlight(runId, taskId, flight, flight.phase === 'review')
+    flight.cleanupFailed = true
+    if (flight.childSessionId !== undefined) this.forgetChildSession(flight.childSessionId)
+    const reason = 'child cleanup could not be confirmed; capacity retained: ' + String(error instanceof Error ? error.message : error)
+    this.ctx.logger('swarm').warn('%s/%s: %s', runId, taskId, reason)
+    if (current) {
+      this.events.append('task/blocked', { runId, taskId, data: { attemptId: flight.attemptId, phase: flight.phase, human: true, reason } })
+      this.scheduleHumanWaitingNotify(runId)
     }
-    this.events.append('run/paused', { runId, data: { reason: `provider quota exhausted — resume from the Swarm dashboard after topping up (${cause})` } })
+    this.scheduleTick()
+  }
+
+  private finishFlight(key: string, flight: InFlight): void {
+    if (flight.cleanupFailed) return
+    this.holders.delete(flight)
+    if (this.inFlight.get(key) === flight) this.inFlight.delete(key)
+    if (flight.childSessionId !== undefined) this.forgetChildSession(flight.childSessionId)
+    if (this.liveAttempts.get(key) === flight.attemptId && !this.inFlight.has(key)) this.liveAttempts.delete(key)
+    const runId = key.slice(0, key.indexOf('/'))
+    const status = this.view().runs.get(runId)?.status
+    if (status === 'aborted' || status === 'failed' || status === 'completed') this.releaseAnchor(runId)
+    this.scheduleTick()
+  }
+
+  /** Every automatic completion, including reports recovered after failure/restart, uses this gate. */
+  private async finalizeTask(runId: string, taskId: string, flight: InFlight, summary: string, recovered = false): Promise<void> {
+    if (!this.currentFlight(runId, taskId, flight)) return
+    const key = flight.taskKey
+    const task = this.view().tasks.get(key)!
+    flight.phase = 'evidence'
+    const d = (fields: Record<string, unknown>): Record<string, unknown> => ({ ...fields, attemptId: flight.attemptId })
+    let evidence = await this.checkEvidence(task, flight.controller.signal, (error) => this.markCleanupFailed(runId, taskId, flight, error))
+    if (!this.currentFlight(runId, taskId, flight)) return
+    let firstRun: Record<string, unknown>[] | undefined
+    if (evidence.commandFailures.length > 0 && this.evidenceRecheckedAttempt.get(key) !== flight.attemptId) {
+      this.evidenceRecheckedAttempt.set(key, flight.attemptId!)
+      firstRun = evidence.commands.filter((c) => !c.ok).slice(0, 10).map(evidenceRecord)
+      this.events.append('task/heartbeat', { runId, taskId, data: d({ note: '⚠ evidence command failed — rechecking once without respawning the child: ' + evidence.commandFailures[0].slice(0, 300), evidence: { recheck: true, commands: firstRun } }) })
+      evidence = await this.checkEvidence(task, flight.controller.signal, (error) => this.markCleanupFailed(runId, taskId, flight, error))
+      if (!this.currentFlight(runId, taskId, flight)) return
+      if (evidence.commandFailures.length === 0) this.events.append('task/heartbeat', { runId, taskId, data: d({ note: '✓ evidence commands passed on recheck — the finished work stands' }) })
+    }
+    if (evidence.commandFailures.length > 0) {
+      this.events.append('task/blocked', { runId, taskId, data: d({ human: true, reason: 'evidence contract failed twice — automatic retrying stops here. A human decides: accept the work (swarm_complete / dashboard), fix the command, or requeue (swarm_retry). ' + evidence.commandFailures[0], evidence: { commands: evidence.commands.filter((c) => !c.ok).slice(0, 10).map(evidenceRecord), firstRun } }) })
+      this.scheduleHumanWaitingNotify(runId)
+      return
+    }
+    if (evidence.fileWarnings.length > 0) this.events.append('task/heartbeat', { runId, taskId, data: d({ note: '⚠ evidence warning: ' + evidence.fileWarnings[0] }) })
+    // Commands are quiescent now. Release this phase BEFORE queuing any reviewer.
+    this.finishFlight(key, flight)
+    this.evidenceRecheckedAttempt.delete(key)
+    this.growConcurrency(runId)
+    this.events.append('task/completed', { runId, taskId, data: d({ summary, recovered, fileWarnings: evidence.fileWarnings, evidence: evidence.commands.slice(0, 10).map(evidenceRecord) }) })
+    if (task.reviewGate === 'human') {
+      this.events.append('task/review-started', { runId, taskId, data: d({ reviewer: task.reviewBy ?? 'human', human: true }) })
+      this.scheduleHumanWaitingNotify(runId)
+    } else if (task.reviewBy !== undefined && task.reviewBy.length > 0) {
+      void this.runReview(runId, taskId, task.reviewBy, flight.attemptId!)
+    }
+    this.scheduleTick()
+  }
+
+  /** Recovery waits for a cancelled holder's owned cleanup; the report remains only a hint. */
+  private recoverReportedTask(task: Task, summary: string): void {
+    const key = taskKeyOf(task)
+    if (this.recoveries.has(key) || task.attemptId === undefined) return
+    const old = this.inFlight.get(key)
+    old?.controller.abort()
+    const attemptId = task.attemptId
+    const work = Promise.resolve(old?.done).then(async () => {
+      const fresh = this.view().tasks.get(key)
+      if (this.disposed || this.view().runs.get(task.runId)?.status !== 'running' || fresh?.attemptId !== attemptId || fresh.attemptRevoked === true) return
+      if (fresh.status !== 'running' && fresh.status !== 'dispatching' && fresh.status !== 'reviewing') return
+      if (this.inFlight.has(key)) return
+      if (this.countGlobalRunning() >= this.rt('maxTotalConcurrentAgents') || this.countRunHolders(task.runId) >= this.effectiveConcurrency(task.runId)) { this.recoveryQueue.set(key, { task: fresh, summary }); return }
+      this.recoveryQueue.delete(key)
+      if (fresh.status === 'reviewing') this.events.append('task/recovery-started', { runId: task.runId, taskId: task.id, data: { attemptId } })
+      const flight: InFlight = { controller: new AbortController(), taskKey: key, attemptId, roleId: task.role, phase: 'evidence' }
+      this.liveAttempts.set(key, attemptId)
+      this.ownFlight(key, flight)
+      flight.done = this.finalizeTask(task.runId, task.id, flight, summary, true).catch((err: unknown) => {
+        if (this.currentFlight(task.runId, task.id, flight)) this.events.append('task/blocked', { runId: task.runId, taskId: task.id, data: { attemptId, human: true, reason: 'recovery gate failed: ' + String(err) } })
+      }).finally(() => this.finishFlight(key, flight))
+      await flight.done
+    }).catch((err: unknown) => this.ctx.logger('swarm').warn('report recovery failed: %s', String(err))).finally(() => { if (this.recoveries.get(key) === work) this.recoveries.delete(key) })
+    this.recoveries.set(key, work)
+  }
+
+  private pauseRun(runId: string, cause: string): void {
+    const state = this.view()
+    const run = state.runs.get(runId)
+    if (run === undefined || run.status !== 'running') return
+    for (const flight of this.holders) if (flight.taskKey.startsWith(runId + '/')) flight.controller.abort()
+    for (const id of run.taskIds) {
+      const task = state.tasks.get(runId + '/' + id)
+      if (task?.status === 'running' || task?.status === 'dispatching' || task?.status === 'reviewing' && task.humanReview !== true) {
+        this.events.append('task/failed', { runId, taskId: id, data: { source: 'operator', retry: true, reason: 'run paused — cancelled sibling will be requeued after cleanup' } })
+      }
+      this.reviewQueue.delete(runId + '/' + id)
+      this.recoveryQueue.delete(runId + '/' + id)
+    }
+    this.events.append('run/paused', { runId, data: { reason: cause } })
     this.notifyDispatchSession(runId, 'paused', cause)
   }
 
-  /** A3/K2: resume a paused (or requeue a terminally failed) run, keeping completed tasks. */
+  /** Explicit operator action; missing legacy authority never widens to deployment defaults. */
   resumeRun(runId: string): void {
     const run = this.view().runs.get(runId)
-    if (run === undefined) throw new Error(`unknown run ${runId}`)
-    if (run.status !== 'paused' && run.status !== 'failed' && run.status !== 'aborted') {
-      throw new Error(`run ${runId} is ${run.status}; only paused or failed runs can be resumed`)
-    }
-    this.events.append('run/resumed', { runId })
+    if (run === undefined) throw new Error('unknown run ' + runId)
+    if (run.status !== 'paused' && run.status !== 'failed' && run.status !== 'aborted') throw new Error('run ' + runId + ' is ' + run.status + '; only paused or failed runs can be resumed')
+    const authority = validAuthority(run.dispatch?.authority) ? run.dispatch!.authority! : captureAuthority(this.ctx, this.runParents.get(runId), run.dispatch?.cwd)
+    this.events.append('run/resumed', { runId, data: { authority } })
     for (const id of run.taskIds) {
-      const task = this.view().tasks.get(`${runId}/${id}`)
-      if (task?.status === 'failed') {
-        this.events.append('task/failed', { runId, taskId: id, data: { retry: true, reason: 'run resumed — requeued' } })
+      const task = this.view().tasks.get(runId + '/' + id)
+      if (task?.status === 'failed' || task?.status === 'running' || task?.status === 'dispatching' || task?.status === 'reviewing' && task.humanReview !== true) {
+        this.events.append('task/failed', { runId, taskId: id, data: { source: 'operator', retry: true, reason: 'run resumed — requeued after previous holder cleanup' } })
       }
     }
     this.scheduleTick()
   }
 
-  /** J7: the human verdict on a human-gated review, from the dashboard. */
+  /** Human verdict on an exact currently-waiting attempt. */
+
   review(runId: string, taskId: string, verdict: 'approve' | 'reject'): void {
     const task = this.view().tasks.get(`${runId}/${taskId}`)
     if (task === undefined) throw new Error(`unknown task ${runId}/${taskId}`)
     if (task.status !== 'reviewing' || task.humanReview !== true) {
       throw new Error(`task ${taskId} is not awaiting a human review`)
     }
+    const run = this.view().runs.get(runId)
+    if (run?.status !== 'running' && run?.status !== 'paused') throw new Error(`run ${runId} is inactive; cannot review its task`)
+    if (task.attemptProtocol === 2 && (task.attemptId === undefined || task.attemptRevoked === true)) throw new Error(`task ${taskId} has no live human review attempt`)
     const reviews = (task.reviews ?? 0) + 1
     // J19: pin the verdict to the attempt it judges, so a human decision about an
     // old attempt cannot close a task that has since been retried.
-    const fence = task.attemptId !== undefined ? { attemptId: task.attemptId } : {}
+    const fence = { source: 'operator', ...(task.attemptId !== undefined ? { attemptId: task.attemptId } : {}) }
     if (verdict === 'approve') {
       this.events.append('task/reviewed', { runId, taskId, data: { ...fence, verdict: 'approve', feedback: 'approved by human review' } })
     } else {
@@ -1818,7 +1888,7 @@ export class SwarmService extends Service {
   }
 
   private scheduleTick(): void {
-    if (this.tickScheduled) return
+    if (this.disposed || this.tickScheduled) return
     this.tickScheduled = true
     queueMicrotask(() => {
       this.tickScheduled = false
@@ -1852,7 +1922,7 @@ export class SwarmService extends Service {
         runId, stamps.length, cooldown,
       )
       // Schedule a tick after the cooldown so the run resumes automatically.
-      setTimeout(() => this.scheduleTick(), cooldown + 100)
+      this.scheduleTick()
     }
   }
 
@@ -1870,106 +1940,74 @@ export class SwarmService extends Service {
 
   /** Launch ready tasks up to the concurrency caps. Sync planning; spawns are staggered + fire-and-track. */
   private tick(): void {
+    if (this.disposed) return
     const state = this.view()
+    let deadline: number | undefined
+    const later = (at: number): void => { if (at > Date.now() && (deadline === undefined || at < deadline)) deadline = at }
     for (const run of state.runs.values()) {
       if (run.status !== 'running') continue
-      const tasks = run.taskIds
-        .map((id) => state.tasks.get(`${run.id}/${id}`))
-        .filter((t): t is Task => t !== undefined)
-      // Cascade: a task whose blocker terminally failed/blocked can never
-      // become ready — block it now so the run can reach a terminal status
-      // instead of hanging in 'running' with a pending task forever.
+      if (!validAuthority(run.dispatch?.authority)) { this.pauseRun(run.id, 'legacy run has no captured caller authority — explicitly resume with conservative permissions or redispatch'); continue }
+      const tasks = run.taskIds.map((id) => state.tasks.get(run.id + '/' + id)).filter((task): task is Task => task !== undefined)
       for (const task of tasks) {
         if (task.status === 'blocked') {
-          // A5 auto-unblock: every blocker reached completed after a rescue/retry.
-          const blockers = (task.blockedBy ?? []).map((b) => state.tasks.get(`${run.id}/${b}`)?.status)
-          if (blockers.length > 0 && blockers.every((s) => s === 'completed')) {
-            this.events.append('task/unblocked', { runId: run.id, taskId: task.id })
-          }
+          if (task.humanReview !== true && task.blockedReason?.startsWith('upstream task ') === true && (task.blockedBy?.length ?? 0) > 0 && task.blockedBy!.every((id) => state.tasks.get(run.id + '/' + id)?.status === 'completed')) this.events.append('task/unblocked', { runId: run.id, taskId: task.id, data: { source: 'operator' } })
           continue
         }
         if (task.status !== 'pending' && task.status !== 'retrying') continue
-        const dead = (task.blockedBy ?? []).find((blocker) => {
-          const status = state.tasks.get(`${run.id}/${blocker}`)?.status
-          return status === 'failed' || status === 'blocked'
-        })
-        if (dead !== undefined) {
-          this.events.append('task/blocked', {
-            runId: run.id, taskId: task.id,
-            data: { reason: `upstream task ${dead} did not complete` },
-          })
-        }
+        const dead = (task.blockedBy ?? []).find((id) => { const status = state.tasks.get(run.id + '/' + id)?.status; return status === 'failed' || status === 'blocked' })
+        if (dead !== undefined) this.events.append('task/blocked', { runId: run.id, taskId: task.id, data: { source: 'operator', reason: 'upstream task ' + dead + ' did not complete' } })
+        if (task.status === 'retrying') later(task.updatedAt + Math.min(this.rt('retryBackoffBaseMs') * 2 ** Math.max(0, task.attempts - 1), 60000))
       }
-      // A5: refresh — the appends above may have unblocked tasks just now.
+      if (this.isCircuitOpen(run.id)) { later(this.circuitBreakerUntil.get(run.id)!); this.checkRunCompletion(run.id); continue }
+      for (const [key, request] of this.recoveryQueue) {
+        if (request.task.runId === run.id && !this.recoveries.has(key) && !this.inFlight.has(key) && this.countGlobalRunning() < this.rt('maxTotalConcurrentAgents') && this.countRunHolders(run.id) < this.effectiveConcurrency(run.id)) this.recoverReportedTask(request.task, request.summary)
+      }
+      this.launchQueuedReviews(run.id)
       const fresh = this.view()
-      const runTasks = run.taskIds
-        .map((id) => fresh.tasks.get(`${run.id}/${id}`))
-        .filter((t): t is Task => t !== undefined)
-      // H-2 circuit breaker: when ≥3 tasks failed within 30s (provider outage),
-      // pause retries for the cooldown period instead of launching into a dead
-      // provider. The breaker auto-clears when the cooldown expires.
-      if (this.isCircuitOpen(run.id)) {
-        this.checkRunCompletion(run.id)
-        continue
-      }
+      const runTasks = run.taskIds.map((id) => fresh.tasks.get(run.id + '/' + id)).filter((task): task is Task => task !== undefined)
       const roleRunning = new Map<string, number>()
-      for (const task of runTasks) {
-        if (task.status === 'running' || task.status === 'dispatching' || task.status === 'reviewing') {
-          roleRunning.set(task.role, (roleRunning.get(task.role) ?? 0) + 1)
-        }
-      }
-      let capacity = this.effectiveConcurrency(run.id) - runningCount(fresh, run.id)
-      // Global agent cap: swarm agents are in-process on the DSH host, sharing
-      // its Node.js heap. Without a global cap, two concurrent runs × 5 agents
-      // each = 10 heap-resident sessions → potential OOM crash. The cap is
-      // shared across all runs: concurrent runs split the budget (3+2, not 5+5).
-      const globalCap = this.rt('maxTotalConcurrentAgents')
-      const globalRunning = this.countGlobalRunning()
-      if (globalRunning + capacity > globalCap) {
-        capacity = Math.max(0, globalCap - globalRunning)
-      }
+      for (const flight of this.holders) if (flight.taskKey.startsWith(run.id + '/') && flight.roleId !== undefined) roleRunning.set(flight.roleId, (roleRunning.get(flight.roleId) ?? 0) + 1)
+      let capacity = Math.max(0, Math.min(this.effectiveConcurrency(run.id) - this.countRunHolders(run.id), this.rt('maxTotalConcurrentAgents') - this.countGlobalRunning()))
       let wave = 0
       for (const task of runTasks) {
         if (capacity <= 0) break
-        if (!isReady(fresh, task)) continue
-        if (this.inFlight.has(taskKeyOf(task))) continue
-        // H-1 retry backoff: a retrying task waits base × 2^(attempt-1) from
-        // its failure timestamp (updatedAt) before relaunching — prevents
-        // synchronized retry cascades when a provider outage kills all tasks
-        // at once. First-attempt tasks launch immediately.
-        if (task.status === 'retrying' && this.rt('retryBackoffBaseMs') > 0) {
-          const backoffMs = Math.min(
-            this.rt('retryBackoffBaseMs') * Math.pow(2, Math.max(0, task.attempts - 1)),
-            60000,
-          )
-          if (Date.now() - task.updatedAt < backoffMs) continue // too soon — next tick will retry
+        if (!isReady(fresh, task) || this.inFlight.has(taskKeyOf(task)) || this.recoveries.has(taskKeyOf(task)) || this.recoveryQueue.has(taskKeyOf(task))) continue
+        if (task.status === 'retrying') {
+          const at = task.updatedAt + Math.min(this.rt('retryBackoffBaseMs') * 2 ** Math.max(0, task.attempts - 1), 60000)
+          if (Date.now() < at) { later(at); continue }
         }
-        const role = this.duty.role(task.role)
-        const roleCap = role?.maxConcurrent
-        if (roleCap !== undefined && (roleRunning.get(task.role) ?? 0) >= roleCap) continue
-        const delayMs = wave === 0 ? 0 : this.rt('spawnStaggerMs') * wave
-        this.launchTask(run.id, task, delayMs)
+        const cap = this.duty.role(task.role)?.maxConcurrent
+        if (cap !== undefined && (roleRunning.get(task.role) ?? 0) >= cap) continue
+        this.launchTask(run.id, task, wave === 0 ? 0 : this.rt('spawnStaggerMs') * wave)
         capacity -= 1
         wave += 1
         roleRunning.set(task.role, (roleRunning.get(task.role) ?? 0) + 1)
-        fresh.tasks.get(taskKeyOf(task))!.status = 'dispatching'
       }
       this.checkRunCompletion(run.id)
     }
+    if (this.deadlineTimer !== undefined) clearTimeout(this.deadlineTimer)
+    this.deadlineTimer = deadline === undefined ? undefined : setTimeout(() => { this.deadlineTimer = undefined; this.scheduleTick() }, Math.max(1, deadline - Date.now()))
+    this.deadlineTimer?.unref?.()
   }
 
-  /** P-C: mark a task completed from outside the swarm (dispatcher rescue path). */
+  /** Explicit authenticated operator override, not automatic proof. */
+
   completeTaskExternally(runId: string, taskId: string, actorSessionId: string | undefined, summary: string): void {
     const run = this.view().runs.get(runId)
     if (run === undefined) throw new Error(`unknown run ${runId}`)
     // Gated to the dispatching session; the dashboard bypasses via its own action.
     const owner = run.dispatch?.sessionId
-    if (actorSessionId !== undefined && owner !== undefined && actorSessionId !== owner) {
+    if (actorSessionId !== undefined && actorSessionId !== owner) {
       throw new Error('swarm_complete is gated to the dispatching session; use the Swarm dashboard instead')
     }
     const task = this.view().tasks.get(`${runId}/${taskId}`)
     if (task === undefined) throw new Error(`unknown task ${runId}/${taskId}`)
+    if (run.status !== 'running' && run.status !== 'paused' && run.status !== 'failed') throw new Error(`run ${runId} is ${run.status}; cannot complete an inactive run's task`)
     if (task.status === 'completed') throw new Error(`task ${taskId} is already completed`)
+    if (run.status === 'failed') {
+      const authority = validAuthority(run.dispatch?.authority) ? run.dispatch!.authority! : captureAuthority(this.ctx, this.runParents.get(runId), run.dispatch?.cwd)
+      this.events.append('run/resumed', { runId, data: { authority } })
+    }
     for (const [key, flight] of this.inFlight) {
       if (flight.taskKey === `${runId}/${taskId}`) {
         flight.controller.abort()
@@ -1978,7 +2016,7 @@ export class SwarmService extends Service {
     }
     this.events.append('task/completed', {
       runId, taskId,
-      data: { summary: (summary.length > 0 ? summary : `task ${taskId} completed outside the swarm (dispatcher rescue)`) },
+      data: { source: 'operator', revokeAttempt: true, summary: (summary.length > 0 ? summary : `task ${taskId} completed outside the swarm (dispatcher rescue)`) },
     })
     this.scheduleTick()
   }
@@ -1993,7 +2031,7 @@ export class SwarmService extends Service {
     if (run === undefined) throw new Error(`unknown run ${runId}`)
     // Gated to the dispatching session (same rule as swarm_complete).
     const owner = run.dispatch?.sessionId
-    if (actorSessionId !== undefined && owner !== undefined && actorSessionId !== owner) {
+    if (actorSessionId !== undefined && actorSessionId !== owner) {
       throw new Error('swarm_interrupt is gated to the dispatching session; use the Swarm dashboard instead')
     }
     const task = this.view().tasks.get(`${runId}/${taskId}`)
@@ -2013,539 +2051,259 @@ export class SwarmService extends Service {
     // Mark the task as failed-with-retry: the dispatcher requeues it in the same run.
     this.events.append('task/failed', {
       runId, taskId,
-      data: { retry: true, reason: 'interrupted by the dispatching session (stalled child)' },
+      data: { source: 'operator', retry: true, reason: 'interrupted by the dispatching session (stalled child)' },
     })
     this.scheduleTick()
   }
 
+
   private launchTask(runId: string, task: Task, delayMs = 0): void {
-    const role: RoleConfig | undefined = this.duty.role(task.role)
     const run = this.view().runs.get(runId)
+    const role = this.duty.role(task.role)
+    const key = taskKeyOf(task)
     if (run === undefined || role === undefined) {
-      this.events.append('task/blocked', { runId, taskId: task.id, data: { reason: 'run context unavailable' } })
+      this.events.append('task/blocked', { runId, taskId: task.id, data: { source: 'operator', reason: 'run context unavailable' } })
       return
     }
-    // K4: per-task model override wins; A1: per-attempt effort comes from the ladder.
+    let toolFilter: { allow?: string[]; deny?: string[] } | undefined
+    try { toolFilter = this.spawnToolFilter(role) }
+    catch (err) {
+      this.events.append('task/blocked', { runId, taskId: task.id, data: { source: 'operator', human: true, reason: String(err instanceof Error ? err.message : err) } })
+      this.scheduleHumanWaitingNotify(runId)
+      return
+    }
     let candidates = this.resolveCandidates(run, task.role, task)
     if (candidates === undefined) {
-      // No route and nothing to inherit — retrying cannot fix this.
-      this.events.append('task/failed', {
-        runId, taskId: task.id,
-        data: {
-          retry: false,
-          reason: `no model route for role "${task.role}": pin a provider/model in the Swarm Roster, or dispatch from a session with a configured model`,
-        },
-      })
+      this.events.append('task/failed', { runId, taskId: task.id, data: { source: 'operator', retry: false, reason: 'no model route for role "' + task.role + '": pin a provider/model in the Swarm Roster, or dispatch from a session with a configured model' } })
       return
     }
-    // A6: from the second attempt on, rotate the chain so a persistently failing
-    // primary gets a different model even when its error is not classed as
-    // "model unavailable".
     if (task.attempts >= 1 && candidates.length > 1) {
       const offset = task.attempts % candidates.length
       candidates = [...candidates.slice(offset), ...candidates.slice(0, offset)]
     }
-    // A1: the effort ladder for this attempt. Its head is the pin this attempt
-    // uses; the remaining rungs travel to the spawn call so an effort-suspect
-    // failure can retry the SAME model at the next rung before the task rotates
-    // models — and without consuming the task's retry budget.
     const rungs = this.effortRungs(role, task.attempts + 1)
-    // J21: strip an effort pin the primary model cannot accept BEFORE spawning, so
-    // the failure mode that killed a child 41 ms in never wastes one. The chain is
-    // returned unchanged — a pin is a preference, a candidate is a capability.
-    const preflight = this.preflightEffort(task.role, candidates, rungs[0])
-    candidates = preflight.candidates
-    const effort = preflight.effort
-    // A1: the rungs follow the EFFECTIVE pin. A stripped attempt carries none: every
-    // rung would be refused by the same model for the same reason.
-    const ladder = effort === undefined ? [] : rungs.slice(1)
+    const effort = this.preflightEffort(task.role, candidates, rungs[0]).effort
     const controller = new AbortController()
-    const key = taskKeyOf(task)
-    // J19: fence this attempt. The id is published with `task/started` and every
-    // terminal write for it carries the same id; the fold discards writes whose id
-    // is not the task's current attempt. This is what stops a superseded (or zombie)
-    // child from overwriting the work of the retry that replaced it — the guard
-    // below could previously only compare *status*, not *identity*.
-    const attemptId = `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    const childController = new AbortController()
+    const attemptId = 'att-' + randomUUID()
+    const flight: InFlight = { controller, taskKey: key, attemptId, roleId: task.role, phase: 'build' }
     this.liveAttempts.set(key, attemptId)
-    // Item 7: the ceiling is a SLIDING no-progress timer (re-armed by every
-    // heartbeat once the child has started) — a working child is never killed
-    // for elapsed time; a silent one is reclaimed after the window.
-    const spawnTimeoutMs = (role.spawnTimeoutSeconds ?? this.rt('spawnTimeoutSeconds')) * 1000
-    this.inFlight.set(key, { controller, taskKey: key, attemptId })
-    // A relaunch starts a fresh silence clock: the dead attempt's nudge history
-    // must not reclaim the new one (it killed a healthy 7-minute-old retry that
-    // inherited "3 nudges over 61 min" from its predecessor).
+    this.ownFlight(key, flight)
     this.nudgeCount.delete(key)
     this.nudgedAt.delete(key)
-
-    const startSpawn = (): void => {
-      const deps = this.spawnDeps()
-      // J8: a hard ceiling on the whole task run. The heartbeat watchdog only
-      // reclaims tasks in `running`, so a task whose child never publishes
-      // `agent-started` sits in `dispatching` holding its concurrency slot
-      // forever (observed: 14 tasks across 9 runs). This timeout is the only
-      // cover for that state. 0 disables.
-      const spawnSignal = new AbortController()
-      const onLaunchAbort = (): void => spawnSignal.abort()
-      let spawnTimer: ReturnType<typeof setTimeout> | undefined
-      // Item 7: re-armable — every heartbeat re-arms it (sliding no-progress
-      // window via InFlight.resetSpawnTimer, wired at onStarted).
-      const armSpawnCeiling = (): void => {
-        if (spawnTimeoutMs <= 0) return
-        if (spawnTimer !== undefined) clearTimeout(spawnTimer)
-        spawnTimer = setTimeout(() => {
-          this.ctx.logger('swarm').warn('task %s exceeded the %ds no-progress window — aborting child', key, Math.round(spawnTimeoutMs / 1000))
-          spawnSignal.abort()
-        }, spawnTimeoutMs)
-        spawnTimer.unref?.()
+    const d = (fields: Record<string, unknown>): Record<string, unknown> => ({ ...fields, attemptId, phase: 'build' })
+    this.events.append('task/started', { runId, taskId: task.id, data: d({ attemptProtocol: 2, label: 'swarm:' + task.id, provider: candidates[0]?.provider, model: candidates[0]?.model, effort, requestedEffort: rungs[0] }) })
+    let spawnTimer: ReturnType<typeof setTimeout> | undefined
+    let delayTimer: ReturnType<typeof setTimeout> | undefined
+    const timeoutMs = (role.spawnTimeoutSeconds ?? this.rt('spawnTimeoutSeconds')) * 1000
+    const arm = (): void => {
+      if (timeoutMs <= 0) return
+      if (spawnTimer !== undefined) clearTimeout(spawnTimer)
+      spawnTimer = setTimeout(() => flight.reclaim?.('spawn timeout: no task progress'), timeoutMs)
+      spawnTimer.unref?.()
+    }
+    const abortChild = (): void => childController.abort()
+    controller.signal.addEventListener('abort', abortChild, { once: true })
+    flight.resetSpawnTimer = arm
+    flight.reclaim = (reason) => {
+      if (!this.currentFlight(runId, task.id, flight) || flight.phase !== 'build') return
+      flight.reclaimReason = reason
+      childController.abort()
+    }
+    const changeEffort = (id: string, pin: string | undefined): void => {
+      if (!this.currentFlight(runId, task.id, flight)) return
+      this.trackChildSession(id, key, pin, attemptId)
+      this.events.append('task/effort-changed', { runId, taskId: task.id, data: d({ effort: pin }) })
+    }
+    flight.done = Promise.resolve().then(async () => {
+      if (delayMs > 0 && !controller.signal.aborted) await new Promise<void>((resolve) => {
+        const cancel = (): void => { if (delayTimer !== undefined) clearTimeout(delayTimer); controller.signal.removeEventListener('abort', cancel); resolve() }
+        controller.signal.addEventListener('abort', cancel, { once: true })
+        delayTimer = setTimeout(cancel, delayMs)
+        delayTimer.unref?.()
+        if (controller.signal.aborted) cancel()
+      })
+      if (!this.currentFlight(runId, task.id, flight)) return
+      arm()
+      const parent = await this.ensureAnchor(runId)
+      if (!this.currentFlight(runId, task.id, flight)) return
+      if (parent === undefined) throw new Error('no spawn anchor available (agents service absent and the dispatching session is gone)')
+      const priorNotes = task.attempts > 0 ? this.events.all().filter((e) => e.runId === runId && e.taskId === task.id && e.kind === 'task/heartbeat' && typeof e.data?.note === 'string').slice(-6).map((e) => String(e.data?.note)) : undefined
+      const currentTask = this.view().tasks.get(key)!
+      const outcome = await spawnTaskAgent(this.spawnDeps(), {
+        parent, run, task: { ...task, attemptId }, role, candidates: candidates!, signal: childController.signal,
+        ...(this.swarmConfig.maxSubagentDepth > 0 ? { maxDepth: this.swarmConfig.maxSubagentDepth } : {}),
+        workspace: run.dispatch?.cwd, toolFilter, priorNotes, evidence: task.evidence,
+        initialEffort: rungs[0], effortRungs: rungs.slice(1),
+        preflightEffort: (candidate, pin) => this.preflightEffort(task.role, [candidate], pin).effort,
+        dependencyHandoffs: this.dependencyHandoffs(run, currentTask), planPath: run.planPath,
+        onFallback: (failed, next) => {
+          if (this.currentFlight(runId, task.id, flight)) this.events.append('task/model-fallback', { runId, taskId: task.id, data: d({ from: failed.provider + '/' + failed.model, ...(next === undefined ? {} : next), reason: 'unavailable' }) })
+        },
+        onCandidateStarted: (id, candidate, pin) => {
+          if (!this.currentFlight(runId, task.id, flight)) return
+          flight.childSessionId = id
+          this.trackChildSession(id, key, pin, attemptId)
+          this.events.append('task/agent-started', { runId, taskId: task.id, data: d({ sessionId: id, ...candidate, effort: pin }) })
+        },
+        onDropEffort: (id) => changeEffort(id, undefined), onEffortRung: changeEffort,
+        onSettled: (id) => this.forgetChildSession(id),
+        onCleanupFailed: (_id, error) => this.markCleanupFailed(runId, task.id, flight, error),
+      })
+      if (spawnTimer !== undefined) { clearTimeout(spawnTimer); spawnTimer = undefined }
+      if (!this.currentFlight(runId, task.id, flight)) return
+      if (outcome.ok) {
+        await this.finalizeTask(runId, task.id, flight, outcome.summary ?? '')
+        return
       }
-      armSpawnCeiling()
-      controller.signal.addEventListener('abort', onLaunchAbort, { once: true })
-      if (controller.signal.aborted) spawnSignal.abort()
-      const clearSpawnTimeout = (): void => {
-        if (spawnTimer !== undefined) clearTimeout(spawnTimer)
-        controller.signal.removeEventListener('abort', onLaunchAbort)
+      const adopted = this.adoptTaskReport(runId, this.view().tasks.get(key)!)
+      if (adopted !== undefined) {
+        await this.finalizeTask(runId, task.id, flight, adopted, true)
+        return
       }
-      void this.ensureAnchor(runId).then(async (parent) => {
-        if (parent === undefined) {
-          clearSpawnTimeout()
-          this.inFlight.delete(key)
-          this.events.append('task/failed', {
-            runId, taskId: task.id,
-            data: {
-              retry: task.attempts <= this.swarmConfig.maxRetries,
-              reason: 'no spawn anchor available (agents service absent and the dispatching session is gone)',
-            },
-          })
-          return
-        }
-        // A4: feed the retry its own history so it resumes instead of restarting.
-        const priorNotes = task.attempts > 0
-          ? this.events.all()
-            .filter((e) => e.taskId === task.id && e.runId === runId && e.kind === 'task/heartbeat' && typeof e.data?.note === 'string')
-            .slice(-6)
-            .map((e) => String(e.data?.note))
-          : undefined
-        // J15: drop tool names this host does not actually expose. `tools.restrict()`
-        // THROWS on an unknown name, and that throw happens during child creation, so
-        // one typo in a role's toolFilter fails EVERY task agent in the run. That is
-        // exactly what happened in production: a filter naming "modlens" (the tool is
-        // really `modlens_read_image`) took out all 10 tasks across 3 waves and failed
-        // the whole run. A bad name is now a warning on that role, not an outage.
-        const roleFilter = this.sanitizeToolFilter(role)
-        const outcome = await spawnTaskAgent(deps, {
-          parent, run, task, role, candidates, signal: spawnSignal.signal,
-          // J14: bound delegation depth so task agents cannot spawn hidden
-          // descendants the dispatcher cannot see or account for.
-          ...(this.swarmConfig.maxSubagentDepth > 0 ? { maxDepth: this.swarmConfig.maxSubagentDepth } : {}),
-          // J16: state the workspace root in the prompt so the agent writes where the
-          // dispatcher will look. Observed live: agents split the same run's artifacts
-          // between the run root and a subdirectory named in the spec, because nothing
-          // in the brief said which directory "the workspace" meant.
-          ...(run.dispatch?.cwd !== undefined ? { workspace: run.dispatch.cwd } : {}),
-          ...(roleFilter !== undefined ? { toolFilter: roleFilter } : {}),
-          ...(priorNotes !== undefined && priorNotes.length > 0 ? { priorNotes } : {}),
-          ...(task.evidence !== undefined ? { evidence: task.evidence } : {}),
-          // A1: the rungs after this attempt's pin. The spawn layer retries them
-          // on the SAME model when a failure is effort-suspect (a fast, output-less
-          // death, or the provider's explicit rejection), so effort varies faster
-          // than the model chain and the internal retry never consumes the task's
-          // retry budget or advances A6's rotation.
-          effortRungs: ladder,
-          onFallback: (failed, next) => {
-            this.events.append('task/model-fallback', {
-              runId, taskId: task.id,
-              data: {
-                from: `${failed.provider}/${failed.model}`,
-                ...(next !== undefined ? { provider: next.provider, model: next.model } : {}),
-                reason: 'unavailable',
-              },
-            })
-          },
-          onStarted: (childSessionId) => {
-            this.trackChildSession(childSessionId, key, effort, attemptId)
-            // Item 7: wire the sliding re-arm so every heartbeat extends the
-            // child's no-progress window. The window keeps running from creation
-            // for a child that never heartbeats at all.
-            const flight = this.inFlight.get(key)
-            if (flight !== undefined) flight.resetSpawnTimer = (): void => armSpawnCeiling()
-            this.events.append('task/agent-started', { runId, taskId: task.id, data: { sessionId: childSessionId } })
-          },
-          // J18: the child rejected the pinned reasoning effort (the fallback model
-          // does not support it). Clear the pin so the retry makes an unconstrained
-          // request instead of dying on the same mismatch.
-          onDropEffort: (childSessionId) => {
-            this.trackChildSession(childSessionId, key, undefined, attemptId)
-            this.ctx.logger('swarm').warn(
-              'task %s: model rejected reasoning effort %s — retrying without an effort pin',
-              task.id, String(effort),
-            )
-          },
-          // A1: the ladder moved to the next rung. Re-register the child so its
-          // next request goes out at the new effort instead of the refused one —
-          // the same bookkeeping onDropEffort does, with a value rather than none.
-          onEffortRung: (childSessionId, rung) => {
-            this.trackChildSession(childSessionId, key, rung, attemptId)
-            this.ctx.logger('swarm').warn(
-              'task %s: effort %s failed on this model — retrying the same model at effort %s',
-              task.id, String(effort), rung,
-            )
-          },
-        })
-        this.inFlight.delete(key)
-        clearSpawnTimeout()
-        if (outcome.childSessionId !== undefined) this.forgetChildSession(outcome.childSessionId)
-        const fresh = this.view().tasks.get(key)
-        if (fresh === undefined) return
-        if (this.view().runs.get(runId)?.status === 'aborted' || this.view().runs.get(runId)?.status === 'paused') return
-        // J19 attempt fence. Two checks, and both are needed:
-        //  - this.liveAttempts still names MY attempt (a retry/takeover has not
-        //    replaced me since I launched), and
-        //  - the folded task agrees (the watchdog or an abort path may already have
-        //    recorded a terminal transition).
-        // The old guard could only test status, so a late result from a superseded
-        // attempt was indistinguishable from the live one's.
-        if (this.liveAttempts.get(key) !== attemptId) {
-          this.ctx.logger('swarm').warn(
-            'task %s: discarding result from superseded attempt %s — a newer attempt owns the task',
-            task.id, attemptId,
-          )
-          // J19: do NOT touch the fence here. `liveAttempts` names the attempt that
-          // replaced this one; clearing it would make the live attempt's own settle
-          // look superseded too, and its result would be discarded (task stranded
-          // `running`/`failed` while the work actually succeeded). The fence is
-          // released by whoever aborts it (abort/pause/resume) or by the attempt
-          // that owns it once it settles. Just re-tick so the task still moves on
-          // if the watchdog had already requeued it.
-          this.scheduleTick()
-          return
-        }
-        if (fresh.status !== 'running' && fresh.status !== 'dispatching') {
-          // J19: another authority (watchdog, boot orphan recovery, pause) has already
-          // reclaimed this task while our child was still settling. Release the fence
-          // so the retry path is not blocked by an attempt that can no longer commit.
-          if (this.liveAttempts.get(key) === attemptId) this.liveAttempts.delete(key)
-          return
-        }
-        if (outcome.ok) {
-          this.growConcurrency(runId)
-          // J2/P5: the evidence contract gates completion. File warnings are advisory
-          // (surfaced on the board for the reviewer); command failures are hard.
-          if (task.evidence !== undefined) {
-            const evidence = await this.checkEvidence(task)
-            if (evidence.commandFailures.length > 0) {
-              // A7: the child reported DONE — its deliverable is on disk — and the only
-              // failing check is a declared command. Respawning the child to redo that
-              // work is pure waste, and looping on it burned a real run: c5-revalidate's
-              // suite printed `191 passed in 4.50s` and then exited 1 from a documented
-              // pytest-asyncio teardown artefact, so the task retried until a human
-              // force-completed it. Re-run just the commands ONCE for this attempt; a
-              // second failure goes to a human instead of back through the child.
-              const failing = evidence.commands.filter((command) => !command.ok)
-              const firstRun = failing.slice(0, 10).map(evidenceRecord)
-              if (this.evidenceRecheckedAttempt.get(key) !== attemptId) {
-                this.evidenceRecheckedAttempt.set(key, attemptId)
-                this.events.append('task/heartbeat', {
-                  runId, taskId: task.id,
-                  data: {
-                    note: `⚠ evidence command failed — rechecking the contract once, without respawning the child: `
-                      + evidence.commandFailures[0].slice(0, 300),
-                    evidence: { recheck: true, commands: firstRun },
-                  },
-                })
-                const recheck = await this.checkEvidence(task)
-                if (recheck.commandFailures.length === 0) {
-                  this.events.append('task/heartbeat', {
-                    runId, taskId: task.id,
-                    data: { note: '✓ evidence commands passed on recheck — the first run failed transiently; the finished work stands' },
-                  })
-                  this.evidenceRecheckedAttempt.delete(key)
-                  // fall through: the task completes below
-                } else {
-                  const reFailing = recheck.commands.filter((command) => !command.ok).slice(0, 10).map(evidenceRecord)
-                  this.events.append('task/blocked', {
-                    runId, taskId: task.id,
-                    data: {
-                      // J7's human flag, reused: `task/blocked` with `human: true` sets
-                      // humanReview, so the board shows this as waiting on a person.
-                      human: true,
-                      reason: 'evidence contract failed twice — the child reported the work done and its '
-                        + `declared command${recheck.commandFailures.length === 1 ? '' : 's'} keep failing, so automatic retrying stops here. `
-                        + `A human decides: accept the work (swarm_complete / dashboard), fix the command, or requeue (swarm_retry). `
-                        + recheck.commandFailures[0],
-                      evidence: { commands: reFailing, firstRun },
-                    },
-                  })
-                  this.ctx.logger('swarm').warn(
-                    'task %s blocked for a human: the child reported done but its evidence commands keep failing',
-                    key,
-                  )
-                  this.scheduleHumanWaitingNotify(runId)
-                  this.evidenceRecheckedAttempt.delete(key)
-                  this.scheduleTick()
-                  return
-                }
-              } else {
-                // Defensive: an attempt that already spent its recheck must never loop.
-                this.events.append('task/blocked', {
-                  runId, taskId: task.id,
-                  data: {
-                    human: true,
-                    reason: `evidence contract failed — ${evidence.commandFailures[0]}`,
-                    evidence: { commands: firstRun },
-                  },
-                })
-                this.scheduleHumanWaitingNotify(runId)
-                this.evidenceRecheckedAttempt.delete(key)
-                this.scheduleTick()
-                return
-              }
-            }
-            if (evidence.fileWarnings.length > 0) {
-              this.events.append('task/heartbeat', {
-                runId, taskId: task.id,
-                data: { note: `⚠ evidence warning: ${evidence.fileWarnings[0]}` },
-              })
-            }
-          }
-          this.events.append('task/completed', {
-            runId, taskId: task.id,
-            data: { attemptId, summary: outcome.summary ?? '' },
-          })
-          if (task.reviewBy !== undefined && task.reviewBy.length > 0) {
-            if (task.reviewGate === 'human') {
-              // J7: park the task for a human verdict on the dashboard.
-              this.events.append('task/review-started', { runId, taskId: task.id, data: { reviewer: task.reviewBy, human: true } })
-              this.scheduleHumanWaitingNotify(runId)
-              this.scheduleTick()
-            } else {
-              void this.runReview(runId, task.id, task.reviewBy)
-            }
-          }
-        } else {
-          const reason = outcome.reason ?? `stop: ${outcome.stopReason ?? 'unknown'}`
-          // J10: before charging a failure, check whether the child finished the
-          // work but died before the dispatcher could record it. A valid on-disk
-          // task report means the deliverable is real — adopt it instead of
-          // requeueing a task that has nothing left to do.
-          const adopted = this.adoptTaskReport(runId, task)
-          if (adopted !== undefined) {
-            this.events.append('task/completed', {
-              runId, taskId: task.id,
-              data: { attemptId, summary: adopted },
-            })
-            if (task.reviewBy !== undefined && task.reviewBy.length > 0 && task.reviewGate !== 'human') {
-              void this.runReview(runId, task.id, task.reviewBy)
-            } else {
-              this.scheduleTick()
-            }
-            return
-          }
-          const failureClass = classifyFailure(reason)
-          if (failureClass !== 'other') this.shrinkConcurrency(runId)
-          if (failureClass === 'quota') {
-            // A3: park the whole run — more attempts would just burn quota.
-            this.events.append('task/failed', {
-              runId, taskId: task.id,
-              data: { retry: false, reason: `provider quota exhausted (before this failure: ${reason})` },
-            })
-            this.pauseRun(runId, reason)
-            return
-          }
-          const retry = fresh.attempts <= this.swarmConfig.maxRetries
-          this.events.append('task/failed', {
-            runId, taskId: task.id,
-            data: { attemptId, retry, reason },
-          })
-          // H-2: record for the circuit breaker (trips when threshold reached).
-          this.recordFailure(runId)
-          // H-1: schedule a tick after the retry backoff window so the task
-          // relaunches when the delay expires (the event append alone doesn't
-          // schedule a future tick — only an immediate microtask).
-          if (retry && this.rt('retryBackoffBaseMs') > 0) {
-            const backoffMs = Math.min(
-              this.rt('retryBackoffBaseMs') * Math.pow(2, Math.max(0, fresh.attempts - 1)),
-              60000,
-            )
-            setTimeout(() => this.scheduleTick(), backoffMs + 100)
-          }
-        }
-      }).catch((err: unknown) => {
-        this.inFlight.delete(key)
-        clearSpawnTimeout()
-        // J19: only the attempt that still owns the fence may release it — deleting
-        // unconditionally would strip the fence from a newer attempt and make its
-        // own result look superseded.
-        if (this.liveAttempts.get(key) === attemptId) this.liveAttempts.delete(key)
-        this.ctx.logger('swarm').warn('task %s crashed dispatcher bookkeeping: %s', key, String(err))
-        // J10: bookkeeping failed, but the child may have finished and written its
-        // report. Adopt it so a dispatcher fault does not discard finished work.
-        try {
-          const adopted = this.adoptTaskReport(runId, task)
-          if (adopted !== undefined && this.view().tasks.get(key)?.status === 'running') {
-            this.events.append('task/completed', { runId, taskId: task.id, data: { attemptId, summary: adopted } })
-            this.scheduleTick()
-          }
-        } catch {
-          // Adoption is best-effort: never mask the original bookkeeping failure.
-        }
-      })    }
-
-    this.events.append('task/started', {
-      runId, taskId: task.id,
-      data: {
-        attemptId,
-        label: `swarm:${task.id}`,
-        provider: candidates[0]?.provider,
-        model: candidates[0]?.model,
-        // A1: record the pinned effort. Without it the 42 ms death above was
-        // diagnosable only from the provider's own logs — the board showed the
-        // route but not the pin that the route refused.
-        ...(effort !== undefined ? { effort } : {}),
-      },
+      const reason = flight.reclaimReason ?? outcome.reason ?? 'child stopped: ' + (outcome.stopReason ?? 'unknown')
+      const failureClass = classifyFailure(reason)
+      if (failureClass !== 'other') this.shrinkConcurrency(runId)
+      const retry = this.view().tasks.get(key)!.attempts <= this.rt('maxRetries')
+      this.events.append('task/failed', { runId, taskId: task.id, data: d({ retry: failureClass === 'quota' ? false : retry, reason: failureClass === 'quota' ? 'provider quota exhausted (before this failure: ' + reason + ')' : reason }) })
+      if (failureClass === 'quota') this.pauseRun(runId, reason)
+      else this.recordFailure(runId)
+    }).catch(async (err: unknown) => {
+      if (!this.currentFlight(runId, task.id, flight)) return
+      // Bookkeeping errors are not proof of completion, even when a report exists.
+      const adopted = this.adoptTaskReport(runId, this.view().tasks.get(key)!)
+      if (adopted !== undefined) await this.finalizeTask(runId, task.id, flight, adopted, true)
+      else this.events.append('task/blocked', { runId, taskId: task.id, data: d({ human: true, reason: 'dispatcher bookkeeping failed: ' + String(err instanceof Error ? err.message : err) }) })
+      this.scheduleHumanWaitingNotify(runId)
+    }).catch((err: unknown) => this.ctx.logger('swarm').warn('task completion gate failed: %s', String(err))).finally(() => {
+      if (spawnTimer !== undefined) clearTimeout(spawnTimer)
+      if (delayTimer !== undefined) clearTimeout(delayTimer)
+      controller.signal.removeEventListener('abort', abortChild)
+      this.finishFlight(key, flight)
     })
-    if (delayMs > 0) setTimeout(startSpawn, delayMs)
-    else startSpawn()
   }
 
-  /**
-   * Review loop: a reviewer-role agent judges the completed task's output.
-   * Approve → task stands; reject → requeue with feedback (capped at reviewLoops,
-   * then fail-open with reviewExhausted); reviewer unavailable → fail-open.
-   */
-  private async runReview(runId: string, taskId: string, reviewerRoleId: string, attemptId?: string): Promise<void> {
-    const key = `${runId}/${taskId}`
-    // J19: pin the verdict to the attempt it judges. A verdict arriving after the
-    // task was retried describes a superseded attempt and must not close the new one.
-    const d = (fields: Record<string, unknown>): Record<string, unknown> =>
-      attemptId !== undefined ? { attemptId, ...fields } : fields
-    const reviewerRole = this.duty.role(reviewerRoleId)
-    const run = this.view().runs.get(runId)
-    if (reviewerRole === undefined || run === undefined) {
-      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: `reviewer role "${reviewerRoleId}" or run context unavailable` }) })
-      this.checkRunCompletion(runId)
-      return
-    }
-    const candidates = this.resolveCandidates(run, reviewerRoleId)
-    if (candidates === undefined) {
-      // No reviewer route — fail-open per the review contract.
-      this.events.append('task/reviewed', {
-        runId, taskId,
-        data: d({ verdict: 'error', feedback: `no model route for reviewer role "${reviewerRoleId}": pin a provider/model in the Swarm Roster` }),
-      })
-      this.checkRunCompletion(runId)
-      return
-    }
-    // J21 (review paths): resolve the reviewer's pin through the same preflight the
-    // dispatch site applies. The review spawns below used to pin `reasoningEffort`
-    // raw, bypassing the strip entirely — so a role with a pin whose reviewer ran on
-    // a pi-ai model declared without a reasoningEfforts map died the exact 41 ms
-    // death the preflight prevents, with no strip and no ladder to catch it. An
-    // empty/inherit primary (no provider/model resolved) cannot be judged, so the raw
-    // field stands — matching dispatch semantics, where an unmentioned model is never
-    // judged. No rung ladder here: the review path already degrades via the 0.6.9
-    // re-ask, and the strip removes the wasted child entirely.
-    const reviewerEffort = candidates[0] !== undefined && candidates[0].model.length > 0
-      ? this.preflightEffort(`review ${reviewerRoleId}`, candidates, reviewerRole.reasoningEffort).effort
-      : reviewerRole.reasoningEffort
-    const controller = new AbortController()
-    this.inFlight.set(key, { controller, taskKey: key })
-    // task/review-started must land in the SAME synchronous block as the
-    // task/completed append that scheduled this review: if an await separated
-    // them, an interleaving dispatcher tick would see every task completed and
-    // end the run before the review (let alone a reject-requeue) could run.
-    this.events.append('task/review-started', { runId, taskId, data: { reviewer: reviewerRoleId } })
-    const parent = await this.ensureAnchor(runId)
-    if (parent === undefined) {
-      this.inFlight.delete(key)
-      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: 'no spawn anchor available (agents service absent and the dispatching session is gone)' }) })
-      this.checkRunCompletion(runId)
-      return
-    }
 
-    const deps = this.spawnDeps()
+  private async runReview(runId: string, taskId: string, reviewerRoleId: string, attemptId: string): Promise<void> {
+    const key = runId + '/' + taskId
     const task = this.view().tasks.get(key)
-    if (task === undefined) { this.inFlight.delete(key); return }
-    let outcome
-    try {
-      outcome = await spawnTaskAgent(deps, {
-        parent, run, task, role: reviewerRole, candidates, signal: controller.signal,
-        prompt: buildReviewPrompt(run, task, reviewerRole),
-        onFallback: (failed, next) => {
-          this.events.append('task/model-fallback', {
-            runId, taskId,
-            data: {
-              from: `${failed.provider}/${failed.model}`,
-              ...(next !== undefined ? { provider: next.provider, model: next.model } : {}),
-              reason: 'unavailable',
-            },
-          })
-        },
-        onStarted: (childSessionId) => {
-          this.trackChildSession(childSessionId, key, reviewerEffort)
-          this.events.append('task/agent-started', { runId, taskId, data: { sessionId: childSessionId } })
-        },
-      })
-    } catch (err) {
-      this.inFlight.delete(key)
-      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: String(err instanceof Error ? err.message : err) }) })
-      this.checkRunCompletion(runId)
-      return
-    }
-    this.inFlight.delete(key)
-    if (outcome.childSessionId !== undefined) this.forgetChildSession(outcome.childSessionId)
-    if (this.view().runs.get(runId)?.status === 'aborted') return
-    if (this.view().tasks.get(key)?.status !== 'reviewing') return // watchdog/abort raced us
+    if (task?.attemptId !== attemptId || task.status !== 'completed' || this.view().runs.get(runId)?.status !== 'running') return
+    // Same synchronous block as completion: the run must not end before a review is queued.
+    this.events.append('task/review-started', { runId, taskId, data: { attemptId, reviewer: reviewerRoleId } })
+    this.reviewQueue.set(key, { runId, taskId, roleId: reviewerRoleId, attemptId })
+    this.scheduleTick()
+  }
 
-    if (!outcome.ok) {
-      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: outcome.reason ?? `reviewer stopped: ${outcome.stopReason ?? 'unknown'}` }) })
-      this.checkRunCompletion(runId)
+  private launchQueuedReviews(runId: string): void {
+    for (const [key, request] of this.reviewQueue) {
+      if (request.runId !== runId) continue
+      const task = this.view().tasks.get(key)
+      if (task?.attemptId !== request.attemptId || task.status !== 'reviewing' || task.humanReview || task.attemptRevoked) { this.reviewQueue.delete(key); continue }
+      if (this.inFlight.has(key)) continue
+      const role = this.duty.role(request.roleId)
+      const roleCount = [...this.holders].filter((f) => f.roleId === request.roleId && f.taskKey.startsWith(runId + '/')).length
+      if (this.countGlobalRunning() >= this.rt('maxTotalConcurrentAgents') || this.countRunHolders(runId) >= this.effectiveConcurrency(runId) || (role?.maxConcurrent !== undefined && roleCount >= role.maxConcurrent)) continue
+      this.reviewQueue.delete(key)
+      this.launchReview(request)
+    }
+  }
+
+  private launchReview(request: { runId: string; taskId: string; roleId: string; attemptId: string }): void {
+    const { runId, taskId, roleId, attemptId } = request
+    const key = runId + '/' + taskId
+    const run = this.view().runs.get(runId)!
+    const role = this.duty.role(roleId)
+    const candidates = role === undefined ? undefined : this.resolveCandidates(run, roleId)
+    const d = (fields: Record<string, unknown>): Record<string, unknown> => ({ ...fields, attemptId, phase: 'review' })
+    if (role === undefined || candidates === undefined) {
+      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: role === undefined ? 'reviewer role "' + roleId + '" unavailable' : 'no model route for reviewer role "' + roleId + '"' }) })
+      this.scheduleTick()
       return
     }
-    // Item 1: parse the COMPLETE final message. The prompt places the verdict
-    // line at the end, but `summary` is truncated at 2000 chars — parsing it
-    // silently failed every review thorough enough to exceed the cap (the W00
-    // reviewer ran 11 minutes and failed open exactly this way).
-    const fullText = outcome.finalText ?? outcome.summary ?? ''
-    let verdict = parseVerdict(fullText)
-    let feedback = fullText.trim()
-    // Item 8: one explicit re-ask before failing open — a reviewer that forgot
-    // the line gets its own assessment back and is asked for the exact verdict.
-    if (verdict === undefined && this.view().tasks.get(key)?.status === 'reviewing') {
-      const reaskController = new AbortController()
-      this.inFlight.set(key, { controller: reaskController, taskKey: key })
-      try {
-        const reask = await spawnTaskAgent(deps, {
-          parent, run, task, role: reviewerRole, candidates, signal: reaskController.signal,
-          prompt: buildReviewReaskPrompt(feedback),
-          onFallback: () => {},
-          onStarted: (childSessionId) => {
-            this.trackChildSession(childSessionId, key, reviewerEffort)
-            this.events.append('task/agent-started', { runId, taskId, data: { sessionId: childSessionId } })
-          },
-        })
-        if (reask.ok && this.view().tasks.get(key)?.status === 'reviewing') {
-          const text = reask.finalText ?? reask.summary ?? ''
-          const retried = parseVerdict(text)
-          if (retried !== undefined) {
-            verdict = retried
-            feedback = text.trim()
-          }
-        }
-      } catch { /* fall through to fail-open */ }
-      this.inFlight.delete(key)
-    }
-    if (verdict === 'reject') {
-      const reviews = (this.view().tasks.get(key)?.reviews ?? 0) + 1
-      const exhausted = reviews >= this.swarmConfig.reviewLoops
-      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'reject', reviews, ...(exhausted ? { exhausted: true } : {}), feedback }) })
-      if (exhausted) this.checkRunCompletion(runId)
-      else this.scheduleTick()
+    let toolFilter: { allow?: string[]; deny?: string[] } | undefined
+    try { toolFilter = this.spawnToolFilter(role) }
+    catch (err) {
+      this.events.append('task/blocked', { runId, taskId, data: d({ human: true, reason: 'review restrictions cannot be enforced: ' + String(err) }) })
+      this.scheduleHumanWaitingNotify(runId)
       return
     }
-    this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: verdict === 'approve' ? 'approve' : 'error', feedback: verdict === 'approve' ? feedback : 'reviewer gave no explicit verdict (fail-open)' }) })
-    this.checkRunCompletion(runId)
+    const controller = new AbortController()
+    const childController = new AbortController()
+    const abortChild = (): void => childController.abort()
+    controller.signal.addEventListener('abort', abortChild, { once: true })
+    const flight: InFlight = { controller, taskKey: key, attemptId, roleId, phase: 'review' }
+    this.ownFlight(key, flight)
+    const rungs = this.effortRungs(role, 1)
+    const effort = this.preflightEffort('review ' + roleId, candidates, rungs[0]).effort
+    this.events.append('task/review-agent', { runId, taskId, data: d({ provider: candidates[0]?.provider, model: candidates[0]?.model, effort, requestedEffort: rungs[0] }) })
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeoutMs = (role.spawnTimeoutSeconds ?? this.rt('spawnTimeoutSeconds')) * 1000
+    const arm = (): void => {
+      if (timeoutMs <= 0) return
+      if (timer !== undefined) clearTimeout(timer)
+      timer = setTimeout(() => flight.reclaim?.('reviewer exceeded the no-progress window'), timeoutMs)
+      timer.unref?.()
+    }
+    flight.resetSpawnTimer = arm
+    const current = (): boolean => this.currentFlight(runId, taskId, flight, true)
+    flight.reclaim = (reason) => {
+      if (!current()) return
+      flight.reclaimReason = reason
+      childController.abort()
+    }
+    const changeEffort = (id: string, pin: string | undefined): void => {
+      if (!current()) return
+      this.trackChildSession(id, key, pin, attemptId)
+      this.events.append('task/effort-changed', { runId, taskId, data: d({ effort: pin }) })
+    }
+    flight.done = Promise.resolve().then(async () => {
+      arm()
+      const parent = await this.ensureAnchor(runId)
+      if (!current()) return
+      if (parent === undefined) throw new Error('no spawn anchor available for reviewer')
+      const task = this.view().tasks.get(key)!
+      const spawn = (prompt: string) => spawnTaskAgent(this.spawnDeps(), {
+        parent, run, task, role, candidates, signal: childController.signal, prompt, toolFilter,
+        workspace: run.dispatch?.cwd,
+        ...(this.swarmConfig.maxSubagentDepth > 0 ? { maxDepth: this.swarmConfig.maxSubagentDepth } : {}),
+        initialEffort: rungs[0], effortRungs: rungs.slice(1),
+        preflightEffort: (candidate, pin) => this.preflightEffort('review ' + roleId, [candidate], pin).effort,
+        onCandidateStarted: (id, candidate, pin) => {
+          if (!current()) return
+          flight.childSessionId = id
+          this.trackChildSession(id, key, pin, attemptId)
+          this.events.append('task/agent-started', { runId, taskId, data: d({ sessionId: id, ...candidate, effort: pin }) })
+        },
+        onFallback: (failed, next) => {
+          if (current()) this.events.append('task/model-fallback', { runId, taskId, data: d({ from: failed.provider + '/' + failed.model, ...(next === undefined ? {} : next), reason: 'unavailable' }) })
+        },
+        onDropEffort: (id) => changeEffort(id, undefined), onEffortRung: changeEffort, onSettled: (id) => this.forgetChildSession(id),
+        onCleanupFailed: (_id, error) => this.markCleanupFailed(runId, taskId, flight, error),
+      })
+      let outcome = await spawn(buildReviewPrompt(run, task, role))
+      if (!current()) return
+      let text = outcome.finalText ?? outcome.summary ?? ''
+      let verdict = outcome.ok ? parseVerdict(text) : undefined
+      if (outcome.ok && verdict === undefined) {
+        outcome = await spawn(buildReviewReaskPrompt(text))
+        if (!current()) return
+        text = outcome.finalText ?? outcome.summary ?? ''
+        verdict = outcome.ok ? parseVerdict(text) : undefined
+      }
+      if (!current()) return
+      if (verdict === 'reject') {
+        const reviews = (this.view().tasks.get(key)?.reviews ?? 0) + 1
+        this.events.append('task/reviewed', { runId, taskId, data: d({ verdict, reviews, exhausted: reviews >= this.rt('reviewLoops'), feedback: text }) })
+      } else {
+        this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: verdict ?? 'error', feedback: verdict === 'approve' ? text : flight.reclaimReason ?? outcome.reason ?? 'reviewer gave no explicit verdict (fail-open; not approved)' }) })
+      }
+    }).catch((err: unknown) => {
+      if (current()) this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: String(err instanceof Error ? err.message : err) }) })
+    }).finally(() => {
+      if (timer !== undefined) clearTimeout(timer)
+      controller.signal.removeEventListener('abort', abortChild)
+      this.finishFlight(key, flight)
+    })
   }
 
   private checkRunCompletion(runId: string): void {
@@ -2599,7 +2357,7 @@ export class SwarmService extends Service {
     if (run === undefined) throw new Error(`unknown run ${runId}`)
     // A5: the recovery tool is for the dispatching session; the dashboard bypasses the gate.
     const owner = run.dispatch?.sessionId
-    if (actorSessionId !== undefined && owner !== undefined && actorSessionId !== owner) {
+    if (actorSessionId !== undefined && actorSessionId !== owner) {
       throw new Error(`swarm_retry is gated to the dispatching session (${owner}); use the Swarm dashboard instead`)
     }
     const task = this.view().tasks.get(`${runId}/${taskId}`)
@@ -2609,9 +2367,10 @@ export class SwarmService extends Service {
     }
     // A5: a terminal run comes back to life when one of its tasks is retried.
     if (run.status === 'failed' || run.status === 'aborted' || run.status === 'completed') {
-      this.events.append('run/resumed', { runId })
+      const authority = validAuthority(run.dispatch?.authority) ? run.dispatch!.authority! : captureAuthority(this.ctx, this.runParents.get(runId), run.dispatch?.cwd)
+      this.events.append('run/resumed', { runId, data: { authority } })
     }
-    this.events.append('task/failed', { runId, taskId, data: { retry: true, reason: 'manual retry' } })
+    this.events.append('task/failed', { runId, taskId, data: { source: 'operator', retry: true, reason: 'manual retry' } })
     // Observed live (run-mujadjk9-d7zr): the retry left the task in `retrying` and the
     // revived run then sat idle for 62 minutes, because a terminal run's tick loop has
     // stopped and appending the event does not restart it. Kick it explicitly —
@@ -2632,9 +2391,21 @@ export class SwarmService extends Service {
     this.sessionTasks.delete(childSessionId)
   }
 
-  /** Per-request reasoning effort for a tracked child (undefined = leave untouched). */
+  /** Compatibility accessor; use effortOverrideFor to distinguish an explicit no-pin. */
   effortFor(agentId: string): string | undefined {
     return this.sessionTasks.get(agentId)?.effort
+  }
+
+  /** Undefined means untracked; a tracked empty object explicitly removes inherited effort. */
+  effortOverrideFor(agentId: string): { effort?: string } | undefined {
+    const entry = this.sessionTasks.get(agentId)
+    if (entry === undefined) return undefined
+    const task = this.view().tasks.get(entry.taskKey)
+    if (task?.attemptProtocol === 2) {
+      const flight = this.inFlight.get(entry.taskKey)
+      if (flight === undefined || flight.childSessionId !== agentId || entry.attemptId !== task.attemptId || !this.currentFlight(task.runId, task.id, flight, flight.phase === 'review')) return undefined
+    }
+    return entry.effort === undefined ? {} : { effort: entry.effort }
   }
 
   /**

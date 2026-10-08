@@ -3,8 +3,9 @@
 // and the created run id. Structural typing only: the tool block shape is
 // mirrored locally so the bundle keeps its externals table unchanged.
 import { useEffect, useState } from 'react'
-import { boardStore } from './board-store'
+import { boardStore, type BoardTask, type BoardSyncState } from './board-store'
 import { statusT, useT } from './locale'
+import { agentIdentity, reviewLabel, reviewState } from './review-state'
 
 interface TaskSpecView {
   id?: string
@@ -23,6 +24,7 @@ interface DispatchArgs {
 interface LiveTask {
   id: string
   status: string
+  review?: BoardTask
 }
 
 /** Mirrored subset of the runtime's RunningToolCall | ToolResultNode. */
@@ -73,8 +75,8 @@ type Translate = (key: string, vars?: Record<string, string | number>) => string
 
 function statusLabel(tasks: LiveTask[], t: Translate): { text: string; live: boolean } {
   if (tasks.length === 0) return { text: t('card.queued'), live: false }
-  if (tasks.every((t) => t.status === 'completed')) return { text: t('card.allDone'), live: false }
-  if (tasks.some((t) => t.status === 'failed' || t.status === 'blocked')) return { text: t('card.needsAttention'), live: true }
+  if (tasks.some((task) => task.status === 'failed' || task.status === 'blocked' || (task.review !== undefined && ['exhausted', 'unavailable', 'invalidated'].includes(reviewState(task.review))))) return { text: t('card.needsAttention'), live: false }
+  if (tasks.every((task) => task.status === 'completed')) return { text: t('card.allDone'), live: false }
   const running = tasks.filter((t) => t.status === 'running' || t.status === 'dispatching' || t.status === 'reviewing').length
   return { text: t('card.progress', { running, queued: tasks.length - running }), live: running > 0 }
 }
@@ -96,28 +98,27 @@ export function SwarmDispatchCard({ block }: { block: ToolBlock }): JSX.Element 
   // every other request on the page forever (chat history, other plugins) while
   // the host stays perfectly healthy. The shared store owns the single stream
   // and one debounced refetch for the whole plugin.
-  const [live, setLive] = useState<LiveTask[] | null>(null)
-  const [runStatus, setRunStatus] = useState<string | null>(null)
+  const [snapshot, setSnapshot] = useState<{ runId: string; tasks: LiveTask[] | null; status: string | null; error: string | null; sync: BoardSyncState } | null>(null)
   useEffect(() => {
     if (runId === null) return
     const store = boardStore()
     const release = store.retain()
-    const unsubscribe = store.subscribe((board) => {
-      if (board === null) return
-      const liveTasks = board.tasks
-        .filter((t) => t.runId === runId)
-        .map((t) => ({ id: t.id, status: t.status }))
-      const run = board.runs.find((r) => r.id === runId)
-      if (liveTasks.length > 0) setLive(liveTasks)
-      if (run !== undefined) setRunStatus(run.status)
+    const unsubscribe = store.subscribe((board, error, sync) => {
+      const liveTasks = board?.tasks
+        .filter((task) => task.runId === runId)
+        .map((task) => ({ id: task.id, status: task.status, review: task })) ?? null
+      const run = board?.runs.find((candidate) => candidate.id === runId)
+      setSnapshot({ runId, tasks: liveTasks, status: run?.status ?? null, error, sync: sync ?? 'snapshot' })
     })
     return () => {
       unsubscribe()
       release()
     }
-  }, [runId])
+  }, [runId, t])
 
-  const dotTasks: LiveTask[] = live ?? tasks.map((t) => ({ id: t.id ?? '?', status: 'pending' }))
+  const current = snapshot?.runId === runId ? snapshot : null
+  const runStatus = current?.status ?? null
+  const dotTasks: LiveTask[] = current?.tasks ?? tasks.map((task) => ({ id: task.id ?? '?', status: 'pending' }))
   const progress = statusLabel(dotTasks, t)
 
   return (
@@ -133,6 +134,8 @@ export function SwarmDispatchCard({ block }: { block: ToolBlock }): JSX.Element 
           {runId !== null ? <>{t('card.live', { runId, status: runStatus !== null ? statusT(runStatus) : '' })}</> : output}
         </div>
       )}
+      {runId !== null && <p role="status" className="dsh-swarm-dim">{t(`sync.${current?.sync ?? 'connecting'}`)}</p>}
+      {current?.error != null && <p role="alert" className="dsh-swarm-action-error">{t('board.refreshError', { error: current.error })}</p>}
       {state === 'error' && output !== null && <div className="dsh-swarm-tvc-error">{output}</div>}
       {dotTasks.length > 0 && (
         <ul className="dsh-swarm-tvc-tasks">
@@ -150,7 +153,10 @@ export function SwarmDispatchCard({ block }: { block: ToolBlock }): JSX.Element 
                 <span>{spec?.subject ?? ''}</span>
                 <span className="dsh-swarm-tvc-meta">
                   {spec?.role ?? 'builder'}
-                  {spec?.reviewBy !== undefined ? t('card.reviewedBy', { role: spec.reviewBy }) : ''}
+                  {spec?.reviewBy !== undefined ? t('card.reviewBy', { role: spec.reviewBy }) : ''}
+                   {task.review !== undefined && <>{' · '}{reviewLabel(task.review, t)}</>}
+                   {task.review?.agent !== undefined && <>{' · '}{t('field.builder')}: {agentIdentity(task.review.agent, '')}</>}
+                   {task.review?.reviewerAgent !== undefined && <>{' · '}{t('field.reviewer')}: {agentIdentity(task.review.reviewerAgent, '')}</>}
                   {spec?.blockedBy !== undefined && spec.blockedBy.length > 0 ? t('card.after', { list: spec.blockedBy.join(', ') }) : ''}
                 </span>
               </li>

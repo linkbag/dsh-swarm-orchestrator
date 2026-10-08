@@ -1,8 +1,14 @@
 import Schema from '@deepseek-ai/schemastery'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { RUNTIME_LIMITS, type RuntimeKey } from './domain/limits.js'
 
-export const PLUGIN_VERSION = '0.6.30'
+export const PLUGIN_VERSION = '0.6.31'
+
+function runtimeNumber(key: RuntimeKey) {
+  const bounds = RUNTIME_LIMITS[key]
+  return Schema.natural().default(bounds.default).min(bounds.min).max(bounds.max)
+}
 
 function defaultStorageDir(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -20,7 +26,6 @@ export interface SwarmConfig {
   spawnStaggerMs: number
   adaptiveConcurrency: boolean
   nudgeAfterMinutes: number
-  /** 'warn' (default) | 'block' | 'off' — normalized at use; any other value behaves as 'warn'. */
   workspaceRunPolicy: string
   requireArchitectReview: boolean
   notifyDispatchSession: boolean
@@ -30,7 +35,6 @@ export interface SwarmConfig {
   spawnTimeoutSeconds: number
   bootGraceSeconds: number
   maxSubagentDepth: number
-  /** A7: hard ceiling for ONE evidence-contract command (ms). */
   evidenceTimeoutMs: number
 }
 
@@ -38,95 +42,63 @@ export const Config = Schema.object({
   storageDir: Schema.string().default(defaultStorageDir()).description(
     'Directory for the swarm event log and duty table ($DSH_HOME/storages/swarm by default).',
   ),
-  maxConcurrent: Schema.number().default(50).min(1).max(64).description(
-    'Maximum simultaneously running task agents PER RUN (default 50).',
+  maxConcurrent: runtimeNumber('maxConcurrent').description(
+    'Maximum task, reviewer and evidence holders PER RUN. Cancelled work counts until cleanup finishes.',
   ),
-  maxTotalConcurrentAgents: Schema.number().default(100).min(1).max(128).description(
-    'Global cap on concurrently running swarm agents across ALL runs (default 100). '
-    + 'Swarm agents run IN-PROCESS on the DSH host, sharing its Node.js heap — '
-    + 'the default is sized for a large host: LOWER IT on a constrained machine, '
-    + 'because too many concurrent agents can exhaust memory and crash the host. '
-    + 'Two parallel runs SHARE this budget (e.g. cap=100 means 60+40, not 100+100).',
+  maxTotalConcurrentAgents: runtimeNumber('maxTotalConcurrentAgents').description(
+    'Global cap across ALL runs, including reviewers and cancelled holders awaiting cleanup. '
+    + 'Agents share the host heap: lower this on a constrained machine.',
   ),
-  staleTimeoutSeconds: Schema.number().default(14400).min(60).description(
-    'Heartbeat timeout in seconds before a running task with no progress is reclaimed.',
+  staleTimeoutSeconds: runtimeNumber('staleTimeoutSeconds').description(
+    'Heartbeat timeout in seconds before a task with no progress is reclaimed.',
   ),
-  maxRetries: Schema.number().default(2).min(0).max(5).description(
-    'Failure retries per task before the task blocks for human intervention.',
+  maxRetries: runtimeNumber('maxRetries').description(
+    'Failure retries per task before it blocks for human intervention.',
   ),
-  evidenceTimeoutMs: Schema.number().default(120000).min(1000).max(600000).description(
-    'A7: hard ceiling for ONE evidence-contract command, in milliseconds (default 120000). '
-    + 'A command killed at this ceiling is recorded as TIMED OUT with no exit code — '
-    + 'distinct from a command that ran and exited non-zero. Raise it for suites that '
-    + 'legitimately run long, or lower it so a hung command fails fast in tests.',
+  evidenceTimeoutMs: runtimeNumber('evidenceTimeoutMs').description(
+    'Hard ceiling for ONE sandboxed evidence command, in milliseconds. Timeout is not a verdict on the work.',
   ),
-  reviewLoops: Schema.number().default(3).min(0).max(5).description(
-    'Maximum reviewer fix loops per task before review gives up and blocks.',
+  reviewLoops: runtimeNumber('reviewLoops').description(
+    'Maximum reviewer fix loops. Exhaustion accepts the work under the fallback policy, NOT as reviewed approval.',
   ),
   requireManualEndorsement: Schema.boolean().default(false).description(
-    'Hard endorsement gate: every run waits for a human Endorse on the Swarm dashboard, '
-    + 'even when swarm_dispatch is called with endorse=true. Set true to make the gate '
-    + 'impossible to bypass from chat.',
+    'Hard endorsement gate: every run waits for a human on the dashboard, even with endorse=true.',
   ),
-  spawnStaggerMs: Schema.number().default(750).min(0).max(60000).description(
-    'Delay between consecutive task-agent launches in one dispatch wave (C2 spawn stagger; '
-    + 'softens simultaneous provider load).',
+  spawnStaggerMs: runtimeNumber('spawnStaggerMs').description(
+    'Delay between task-agent launches in one wave, in milliseconds.',
   ),
   adaptiveConcurrency: Schema.boolean().default(true).description(
-    'K1 adaptive concurrency: shrink the per-run launch capacity on provider-class failures '
-    + '(timeouts/quota) and recover it on completions, within the maxConcurrent ceiling.',
+    'Shrink per-run launch capacity on provider failures and recover it on successful completions.',
   ),
-  nudgeAfterMinutes: Schema.number().default(20).min(0).max(240).description(
-    'Watchdog early-warning tier: a running task with no progress note for this many minutes '
-    + 'gets a nudged marker on the board (0 = off). The full stale timeout still applies after.',
+  nudgeAfterMinutes: runtimeNumber('nudgeAfterMinutes').description(
+    'Watchdog early warning after this many minutes without progress (0 disables nudges).',
   ),
   workspaceRunPolicy: Schema.string().default('warn').description(
-    'One-run-per-goal guard for a workspace that already has an active (planning/running/paused) run: '
-    + "'warn' (default) — dispatch succeeds, the run banner names the sibling; 'block' — reject the "
-    + 'dispatch; \'off\' — no guard. Parallel workstreams belong in ONE DAG, not in sibling runs.',
+    "Active-workspace run guard: 'warn', 'block', or 'off'. Unknown values act as 'warn'. Parallel workstreams belong in ONE DAG.",
   ),
   requireArchitectReview: Schema.boolean().default(true).description(
-    "Inject an architect-review task as the mandatory first step of every run whose DAG has no "
-    + 'architect task: it deep-reviews the dispatching agent\'s plan against the repo, consolidates '
-    + 'workstreams into one DAG, and must produce PLAN.md before any builder starts. '
-    + 'Per-dispatch opt-out: architectReview: false.',
+    'Inject a mandatory architect review before builders when no architect task exists. '
+    + 'Writes a run-specific plan; invalid or oversized injected DAGs are rejected. Per-dispatch opt-out: architectReview=false.',
   ),
   notifyDispatchSession: Schema.boolean().default(true).description(
-    'Push a completion notification into the dispatching chat when a run finishes (completed, '
-    + 'failed, or paused) — the chat agent wakes once to relay the result, so it never has to '
-    + 'poll or guess. Only live sessions are woken; closed chats are never disturbed.',
+    'Notify only the owning live chat when its run finishes, pauses or needs a human decision. Closed chats are not woken.',
   ),
-  retryBackoffBaseMs: Schema.number().default(5000).min(0).max(120000).description(
-    'Retry backoff: a failed task waits base × 2^(attempt-1) before retrying (5s → 10s → 20s). '
-    + 'Prevents synchronized retry cascades when a provider outage kills all tasks at once.',
+  retryBackoffBaseMs: runtimeNumber('retryBackoffBaseMs').description(
+    'Retry delay: base × 2^(attempt-1), capped at 60 seconds. Retries wake autonomously.',
   ),
-  circuitBreakerThreshold: Schema.number().default(3).min(0).max(10).description(
-    'Circuit breaker: when this many tasks fail within a 30-second window, the run pauses '
-    + 'retries for the cooldown period (provider outage detected). 0 disables.',
+  circuitBreakerThreshold: runtimeNumber('circuitBreakerThreshold').description(
+    'Failures within 30 seconds that pause retries for the cooldown (0 disables).',
   ),
-  circuitBreakerCooldownMs: Schema.number().default(60000).min(1000).max(600000).description(
-    'How long the circuit breaker pauses retries before resuming (default 60 seconds).',
+  circuitBreakerCooldownMs: runtimeNumber('circuitBreakerCooldownMs').description(
+    'Circuit-breaker retry cooldown in milliseconds.',
   ),
-  spawnTimeoutSeconds: Schema.number().default(3600).min(0).max(86400).description(
-    'Hard ceiling on a single task-agent run (default 3600 = 1 hour). Guards the '
-    + "'dispatching' state, which the heartbeat watchdog cannot see: a task whose child "
-    + 'never publishes an agent-started event holds its concurrency slot indefinitely. '
-    + 'On expiry the child is aborted and the task is retried like any other failure. 0 disables.',
+  spawnTimeoutSeconds: runtimeNumber('spawnTimeoutSeconds').description(
+    'Sliding no-progress timeout while a child starts or runs, in seconds (0 disables). Heartbeats rearm it.',
   ),
-  bootGraceSeconds: Schema.number().default(3).min(3).max(3600).description(
-    'After plugin load, wait this long before running orphan recovery (default 3s), and use '
-    + 'the wait to let the subagents spawn provider mount. Recovery requeues tasks that were '
-    + 'running when the host died; a requeue that fires before the provider exists fails with '
-    + '"subagents service unavailable" and burns a retry for no reason. Raise this on a host '
-    + 'with a slow plugin tree.',
+  bootGraceSeconds: Schema.natural().default(3).min(3).max(3600).description(
+    'After plugin load, wait this many seconds for the spawn provider before orphan recovery.',
   ),
-  maxSubagentDepth: Schema.number().default(1).min(0).max(8).description(
-    'Absolute delegation-depth cap for every swarm task agent (default 1). A task agent '
-    + 'runs at depth 1, so 1 permits the agent itself and rejects any subagents IT tries '
-    + 'to spawn. Without this bound a task agent can delegate freely, and those '
-    + 'descendants are invisible to the dispatcher: not counted by the global agent cap, '
-    + 'not tracked by the watchdog, not shown on the board, and each one resident on the '
-    + 'same Node heap. One production task spawned 12 hidden subagents while the '
-    + 'orchestrator saw a single task. 0 disables the bound.',
+  maxSubagentDepth: Schema.natural().default(1).min(0).max(8).description(
+    'Absolute delegation-depth cap. 1 permits task agents but no grandchildren; 0 disables the bound.',
   ),
 })

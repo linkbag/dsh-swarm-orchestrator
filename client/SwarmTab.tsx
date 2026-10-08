@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { boardStore, type Board, type BoardRun, type BoardRunState, type BoardTask } from './board-store'
+import { boardStore, type Board, type BoardRun, type BoardRunState, type BoardSyncState, type BoardTask } from './board-store'
 import { DutyTableEditor } from './DutyTableEditor'
 import { FlowChart } from './FlowChart'
 import { RuntimeSettings } from './RuntimeSettings'
 import { statusT, useT, t as translate } from './locale'
 import { isCurationAction, isHostStale, isUnknownActionError } from './version'
 import { formatWriteScope } from './write-scope'
+import { resolveBoardSelection, selectionAfterSuccessfulAction, toggleTask, visibleRuns, type TaskKey, type WorkspaceState } from './board-selection'
+import { agentIdentity, reviewLabel, reviewState } from './review-state'
+import { useRequestOwner } from './use-request-owner'
 
 type T = (key: string, vars?: Record<string, string | number>) => string
 
@@ -40,20 +43,26 @@ function timeAgo(at: number, t: T): string {
 // The optional initial* props are a TEST SEAM for renderToStaticMarkup: the board,
 // the tab and the selected task are otherwise only reachable through effects or a
 // click, which a DOM-less render cannot produce. Production passes none of them.
-export function SwarmTab({ sessionId, initialBoard, initialView, initialSelectedTask }: {
+export function SwarmTab({ sessionId, initialBoard, initialView, initialSelectedTask, initialError, initialActionError, initialSync }: {
   sessionId?: string
   initialBoard?: Board
   initialView?: 'board' | 'flow' | 'roster'
   initialSelectedTask?: BoardTask
+  initialError?: string
+  initialActionError?: string
+  initialSync?: BoardSyncState
 } = {}): JSX.Element {
   const t = useT()
   const [board, setBoard] = useState<Board | null>(initialBoard ?? null)
-  const [error, setError] = useState<string | null>(null)
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
-  const [selectedTask, setSelectedTask] = useState<BoardTask | null>(initialSelectedTask ?? null)
+  const [error, setError] = useState<string | null>(initialError ?? null)
+  const [sync, setSync] = useState<BoardSyncState>(initialSync ?? (initialBoard === undefined ? 'connecting' : 'snapshot'))
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(initialSelectedTask?.runId ?? null)
+  const [selectedTaskKey, setSelectedTaskKey] = useState<TaskKey | null>(initialSelectedTask === undefined ? null : { runId: initialSelectedTask.runId, id: initialSelectedTask.id })
+  const workspaceOwner = useRequestOwner()
+  const actionOwner = useRequestOwner()
   const [view, setView] = useState<'board' | 'flow' | 'roster'>(initialView ?? 'board')
   const [busy, setBusy] = useState(false)
-  const [actionError, setActionError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(initialActionError ?? null)
 
   // A8: soft run management — a ⋯ menu per row (also on right-click), inline
   // rename, a two-step Remove from board, and a stronger two-step Delete
@@ -68,36 +77,67 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
   const [showRemoved, setShowRemoved] = useState(false)
 
   // Workspace scoping (v0.4.0): default to this chat's workspace; "All" is one click away.
-  const [scope, setScope] = useState<'workspace' | 'all'>(() =>
-    localStorage.getItem('dsh-swarm-workspace-scope') === 'all' ? 'all' : 'workspace')
-  const [chatCwd, setChatCwd] = useState<string | null>(null)
-  const [cwdUnresolvable, setCwdUnresolvable] = useState(false)
+  const [scope, setScope] = useState<'workspace' | 'all'>(() => {
+    try { return localStorage.getItem('dsh-swarm-workspace-scope') === 'all' ? 'all' : 'workspace' } catch { return 'workspace' }
+  })
+  const [workspace, setWorkspace] = useState<WorkspaceState>({ sessionId, cwd: null, loading: !!sessionId, error: null })
+  const workspaceLoading = !!sessionId && (workspace.sessionId !== sessionId || workspace.loading)
+  const cwdUnresolvable = !!sessionId && !workspaceLoading && workspace.cwd === null
+
+  const resetActions = useCallback(() => {
+    actionOwner.cancel()
+    setBusy(false)
+    setActionError(null)
+    setMenuRunId(null)
+    setConfirmRemoveId(null)
+    setConfirmPurgeId(null)
+    setRenamingRunId(null)
+  }, [actionOwner])
 
   const switchScope = useCallback((next: 'workspace' | 'all') => {
+    resetActions()
     setScope(next)
-    localStorage.setItem('dsh-swarm-workspace-scope', next)
-  }, [])
+    setSelectedRunId(null)
+    setSelectedTaskKey(null)
+    try { localStorage.setItem('dsh-swarm-workspace-scope', next) } catch { /* storage may be disabled */ }
+  }, [resetActions])
 
   useEffect(() => {
-    if (sessionId === undefined || sessionId.length === 0) { setCwdUnresolvable(true); return }
-    let cancelled = false
-    void fetch(`/swarm/workspace?session=${encodeURIComponent(sessionId)}`)
-      .then((r) => r.json() as Promise<{ cwd?: string; unresolvable?: boolean }>)
-      .then((info) => {
-        if (cancelled) return
-        if (typeof info.cwd === 'string' && info.cwd.length > 0) setChatCwd(info.cwd)
-        else setCwdUnresolvable(true)
+    setSelectedRunId(null)
+    setSelectedTaskKey(null)
+    setMenuRunId(null)
+    setConfirmRemoveId(null)
+    setConfirmPurgeId(null)
+    setRenamingRunId(null)
+    setActionError(null)
+    setBusy(false)
+    actionOwner.cancel()
+    const request = workspaceOwner.begin()
+    setWorkspace({ sessionId, cwd: null, loading: !!sessionId, error: null })
+    if (!sessionId) return () => { workspaceOwner.cancel() }
+    void fetch(`/swarm/workspace?session=${encodeURIComponent(sessionId)}`, { signal: request.signal, cache: 'no-store' })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        return response.json() as Promise<{ cwd?: string; unresolvable?: boolean }>
       })
-      .catch(() => { if (!cancelled) setCwdUnresolvable(true) })
-    return () => { cancelled = true }
-  }, [sessionId])
+      .then((info) => {
+        if (!request.owns()) return
+        const cwd = typeof info.cwd === 'string' && info.cwd.length > 0 ? info.cwd : null
+        setWorkspace({ sessionId, cwd, loading: false, error: cwd === null ? translate('scope.unresolvableTitle') : null })
+      })
+      .catch((err: unknown) => {
+        if (request.owns()) setWorkspace({ sessionId, cwd: null, loading: false, error: String(err instanceof Error ? err.message : err) })
+      })
+    return () => { workspaceOwner.cancel() }
+  }, [sessionId, workspaceOwner, actionOwner])
 
   useEffect(() => {
     const store = boardStore()
     const release = store.retain()
-    const unsubscribe = store.subscribe((next, err) => {
+    const unsubscribe = store.subscribe((next, err, state) => {
       setBoard(next)
       setError(err)
+      setSync(state ?? (err === null ? 'snapshot' : 'reconnecting'))
     })
     return () => {
       unsubscribe()
@@ -105,27 +145,25 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
     }
   }, [])
 
-  const normalizeWorkspace = (p: string): string => p.replace(/[\\/]+$/, '').replace(/\\/g, '/').toLowerCase()
-  const workspaceOf = (r: { dispatch?: { cwd?: string } }): string | null => r.dispatch?.cwd ?? null
+  const runs = useMemo(() => visibleRuns(board, scope, sessionId, workspace), [board, scope, sessionId, workspace])
+  const { run, task: selectedTask } = useMemo(
+    () => resolveBoardSelection(board, runs, selectedRunId, selectedTaskKey),
+    [board, runs, selectedRunId, selectedTaskKey],
+  )
 
-  const runs = useMemo(() => {
-    const all = board?.runs ?? []
-    if (scope !== 'workspace' || chatCwd === null) return all
-    const norm = normalizeWorkspace(chatCwd)
-    return all.filter((r) => {
-      const cwd = r.dispatch?.cwd
-      return cwd !== undefined && normalizeWorkspace(cwd) === norm
-    })
-  }, [board, scope, chatCwd])
+  useEffect(() => { resetActions() }, [sessionId, scope, run?.id, resetActions])
 
-  const run = useMemo(() => {
-    if (selectedRunId !== null) {
-      const found = runs.find((r) => r.id === selectedRunId)
-      if (found !== undefined) return found
-    }
-    const active = runs.find((r) => r.status === 'running' || r.status === 'planning')
-    return active ?? runs[0] ?? null
-  }, [runs, selectedRunId])
+  // Keys, never stored task snapshots: a live update replaces drawer contents,
+  // and removed/filtered tasks cannot leave stale actions or resurrect later.
+  useEffect(() => {
+    const visible = (id: string | null): boolean => id !== null && runs.some((candidate) => candidate.id === id)
+    if (selectedRunId !== null && !visible(selectedRunId)) setSelectedRunId(null)
+    if (selectedTaskKey !== null && selectedTask === null) setSelectedTaskKey(null)
+    if (menuRunId !== null && !visible(menuRunId)) setMenuRunId(null)
+    if (renamingRunId !== null && !visible(renamingRunId)) setRenamingRunId(null)
+    if (confirmRemoveId !== null && !visible(confirmRemoveId)) setConfirmRemoveId(null)
+    if (confirmPurgeId !== null && !visible(confirmPurgeId) && !board?.removedRuns?.some((candidate) => candidate.id === confirmPurgeId)) setConfirmPurgeId(null)
+  }, [runs, board, selectedRunId, selectedTaskKey, selectedTask, menuRunId, renamingRunId, confirmRemoveId, confirmPurgeId])
 
   const tasks = useMemo(
     () => (board !== null && run !== null ? board.tasks.filter((t) => t.runId === run.id) : []),
@@ -140,19 +178,25 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
   // — see client/version.ts.
   const hostVersion = board?.version ?? '?'
   const hostStale = board !== null && isHostStale(board.version, board.capabilities)
+  const hostStaleTitle = t(Array.isArray(board?.capabilities) ? 'run.hostCapabilityMissing' : 'run.hostStaleTitle', { version: hostVersion })
 
   const runAction = useCallback(async (body: { action: string; runId?: string; taskId?: string; verdict?: string; title?: string; state?: BoardRunState }) => {
     // Refuse the actions only a restarted host serves, so a stale host is never sent
     // a request it must reject. Every other action exists on every host.
     if (isCurationAction(body.action) && hostStale) {
-      setActionError(translate('run.actionUnknown', { version: boardStore().get()?.version ?? '?' }))
+      setActionError(hostStaleTitle)
       return
     }
+    if (busy) return
+    const request = actionOwner.begin()
     setBusy(true)
     setActionError(null)
     try {
-      await boardStore().action(body)
+      await boardStore().action(body, request.signal)
+      if (!request.owns()) return
+      setSelectedTaskKey((current) => selectionAfterSuccessfulAction(current, body))
     } catch (err) {
+      if (!request.owns()) return
       const message = String(err instanceof Error ? err.message : err)
       // Last-resort net for any action a FUTURE release adds: a raw
       // `unknown action "…"` means the host has not registered it, which calls for a
@@ -161,9 +205,9 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
         ? translate('run.actionUnknown', { version: boardStore().get()?.version ?? '?' })
         : message)
     } finally {
-      setBusy(false)
+      if (request.owns()) setBusy(false)
     }
-  }, [hostStale])
+  }, [hostStale, hostStaleTitle, busy, actionOwner])
 
   // A8: close the row menu on any outside click. The menu itself stops
   // propagation, so its own items — including the two-step confirms — never
@@ -213,22 +257,24 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
     <aside className="dsh-swarm-drawer">
       <header>
         <h3>{selectedTask.subject}</h3>
-        <button className="dsh-swarm-btn ghost" onClick={() => { setSelectedTask(null) }}>✕</button>
+        <button className="dsh-swarm-btn ghost" onClick={() => { setSelectedTaskKey(null) }}>✕</button>
       </header>
       <dl>
         <dt>{t('field.task')}</dt><dd><code>{selectedTask.id}</code></dd>
         <dt>{t('field.status')}</dt><dd style={{ color: statusColor(selectedTask.status) }}>{statusT(selectedTask.status)}{selectedTask.blockedReason !== undefined ? ` — ${selectedTask.blockedReason}` : ''}</dd>
         <dt>{t('field.role')}</dt><dd><kbd>{selectedTask.role}</kbd></dd>
-        <dt>{t('field.model')}</dt>
-        <dd>{selectedTask.agent?.model !== undefined ? `${selectedTask.agent.provider ?? ''} / ${selectedTask.agent.model}` : t('field.deploymentDefault')}</dd>
+        <dt>{t('field.builder')}</dt>
+        <dd>{agentIdentity(selectedTask.agent, t('field.identityUnknown'))}</dd>
+        <dt>{t('field.reviewStatus')}</dt><dd>{reviewLabel(selectedTask, t)}</dd>
         {selectedTask.blockedBy !== undefined && selectedTask.blockedBy.length > 0 && (
           <>
             <dt>{t('field.dependsOn')}</dt><dd>{selectedTask.blockedBy.map((b) => <code key={b}>{b}</code>)}</dd>
           </>
         )}
-        {selectedTask.reviewBy !== undefined && (
+        {(selectedTask.reviewBy !== undefined || selectedTask.reviewerAgent !== undefined || selectedTask.humanReview === true || selectedTask.reviewGate === 'human') && (
           <>
-            <dt>{t('field.reviewedBy')}</dt><dd><kbd>{selectedTask.reviewBy}</kbd>{selectedTask.reviewed === true ? ' ✓' : ''}{(selectedTask.reviews ?? 0) > 0 ? ` ${t('field.rounds', { count: selectedTask.reviews ?? 0, plural: (selectedTask.reviews ?? 0) === 1 ? '' : 's' })}` : ''}{selectedTask.reviewExhausted === true ? t('field.loopExhausted') : ''}</dd>
+            <dt>{t('field.reviewer')}</dt>
+            <dd><kbd>{selectedTask.reviewBy ?? (selectedTask.humanReview === true || selectedTask.reviewGate === 'human' ? t('field.human') : '')}</kbd>{' '}{agentIdentity(selectedTask.reviewerAgent, selectedTask.humanReview === true || selectedTask.reviewGate === 'human' ? t('field.human') : t('field.identityUnknown'))}{(selectedTask.reviews ?? 0) > 0 ? ` ${t('field.rounds', { count: selectedTask.reviews ?? 0, plural: (selectedTask.reviews ?? 0) === 1 ? '' : 's' })}` : ''}</dd>
           </>
         )}
         {Array.isArray(selectedTask.writes) && selectedTask.writes.length > 0 && (
@@ -255,6 +301,14 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
           <p className="dsh-swarm-brief">{selectedTask.summary}</p>
         </>
       )}
+      {(selectedTask.fileWarnings?.length ?? 0) > 0 && <div role="alert" className="dsh-swarm-action-error">
+        <h4>{t('field.fileWarnings')}</h4>
+        <ul>{selectedTask.fileWarnings?.map((warning, index) => <li key={index}>{warning}</li>)}</ul>
+      </div>}
+      {(selectedTask.evidenceOutcomes?.length ?? 0) > 0 && <details>
+        <summary>{t('field.evidenceOutcomes')}</summary>
+        <pre className="dsh-swarm-brief">{JSON.stringify(selectedTask.evidenceOutcomes, null, 2)}</pre>
+      </details>}
       {selectedTask.reviewFeedback !== undefined && selectedTask.reviewFeedback.length > 0 && (
         <>
           <h4>{t('field.reviewerFeedback')}</h4>
@@ -267,14 +321,14 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
           <p className="dsh-swarm-brief">{selectedTask.lastNote}</p>
         </>
       )}
-      {(selectedTask.humanReview === true && selectedTask.status === 'reviewing') && (
+      {((selectedTask.humanReview === true || selectedTask.reviewGate === 'human') && selectedTask.status === 'reviewing') && (
         <>
           <h4>{t('review.pending')}</h4>
           <div className="dsh-swarm-tvc-actions">
             <button
               className="dsh-swarm-btn primary"
               disabled={busy}
-              onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'approve' }).then(() => setSelectedTask(null)) }}
+              onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'approve' }) }}
             >
               {t('review.approve')}
             </button>
@@ -308,13 +362,13 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
           <button className={view === 'flow' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('flow') }}>{t('tab.flow')}</button>
           <button className={view === 'roster' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'} onClick={() => { setView('roster') }}>{t('tab.roster')}</button>
         </div>
-  // Workspace scope switch: visible whenever the tab knows which chat it is in.
+  {/* Workspace scope switch: visible whenever the tab knows which chat it is in. */}
   {sessionId !== undefined && (
     <div className="dsh-swarm-segments" role="tablist" title={t('scope.title')}>
       <button
         className={scope === 'workspace' ? 'dsh-swarm-segment active' : 'dsh-swarm-segment'}
-        disabled={cwdUnresolvable}
-        title={cwdUnresolvable ? t('scope.unresolvableTitle') : t('scope.showWorkspace')}
+        disabled={cwdUnresolvable || workspaceLoading}
+        title={workspaceLoading ? t('scope.resolving') : cwdUnresolvable ? t('scope.unresolvableTitle') : t('scope.showWorkspace')}
         onClick={() => { switchScope('workspace') }}
       >{t('scope.workspace')}</button>
       <button
@@ -323,10 +377,13 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
       >{t('scope.all')}</button>
     </div>
   )}
-        <span className={error !== null ? 'dsh-swarm-pill warn' : 'dsh-swarm-pill'}>
-          {error !== null ? t('pill.offline') : board !== null ? t('pill.info', { version: board.version, seq: board.seq, count: runs.length, plural: runs.length === 1 ? '' : 's' }) : t('pill.connecting')}
+        <span role="status" className={error !== null ? 'dsh-swarm-pill warn' : 'dsh-swarm-pill'} title={error ?? undefined}>
+          {t(`sync.${sync}`)}{board !== null ? ` · ${t('pill.info', { version: board.version, seq: board.seq, count: runs.length, plural: runs.length === 1 ? '' : 's' })}` : ''}
         </span>
       </header>
+      {error !== null && <p role="alert" className="dsh-swarm-action-error">{t('board.refreshError', { error })}{' '}<button className="dsh-swarm-btn ghost" onClick={() => { boardStore().refresh() }}>{t('board.refresh')}</button></p>}
+      {actionError !== null && <p role="alert" className="dsh-swarm-action-error">{actionError}</p>}
+      {workspace.error !== null && workspace.sessionId === sessionId && scope === 'workspace' && <p role="alert" className="dsh-swarm-action-error">{t('scope.fallback', { error: workspace.error })}</p>}
 
       {view === 'roster' ? (
         <>
@@ -338,6 +395,8 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
           <DutyTableEditor board={board} onSaved={() => {}} />
           <RuntimeSettings board={board} />
         </>
+      ) : scope === 'workspace' && workspaceLoading ? (
+        <div className="dsh-swarm-placeholder"><p>{t('scope.resolving')}</p></div>
       ) : view === 'flow' ? (
         // The canvas sits in the same two-column body the board uses, so the task
         // drawer has a real column: the canvas shrinks/scrolls inside <main> instead of
@@ -355,7 +414,7 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
                 run={run}
                 tasks={tasks}
                 selectedTaskId={selectedTask?.id ?? null}
-                onSelectTask={(task) => { setSelectedTask(selectedTask !== null && selectedTask.id === task.id ? null : task) }}
+                onSelectTask={(task) => { setSelectedTaskKey((current) => toggleTask(current, task)) }}
               />
             )}
           </main>
@@ -363,6 +422,8 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
         </div>
       ) : board === null && error === null ? (
         <div className="dsh-swarm-placeholder"><p>{t('board.connecting')}</p></div>
+      ) : board === null ? (
+        <div className="dsh-swarm-placeholder"><p>{t('board.unavailable')}</p></div>
       ) : runs.length === 0 ? (
         <div className="dsh-swarm-placeholder">
           <p>{t('board.emptyTitle')}</p>
@@ -372,8 +433,8 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
         <div className="dsh-swarm-body">
           <aside className="dsh-swarm-runs">
             {hostStale && (
-              <p className="dsh-swarm-run-notice" title={t('run.hostStaleTitle', { version: hostVersion })}>
-                {t('run.hostStaleNotice', { version: hostVersion })}
+              <p className="dsh-swarm-run-notice" title={hostStaleTitle}>
+                {Array.isArray(board?.capabilities) ? hostStaleTitle : t('run.hostStaleNotice', { version: hostVersion })}
               </p>
             )}
             {(board?.removedRuns?.length ?? 0) > 0 && (
@@ -389,13 +450,13 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
                 <span className="dsh-swarm-run-title">{r.title}</span>
                 <span className="dsh-swarm-run-meta">{statusT(r.status)} · {timeAgo(r.createdAt, t)}</span>
                 <span className="dsh-swarm-run-removed-actions">
-                  <button className="dsh-swarm-btn ghost dsh-swarm-run-restore" disabled={hostStale} title={hostStale ? t('run.hostStaleTitle', { version: hostVersion }) : undefined} onClick={() => { setBoardState(r.id, 'visible') }}>
+                  <button className="dsh-swarm-btn ghost dsh-swarm-run-restore" disabled={hostStale} title={hostStale ? hostStaleTitle : undefined} onClick={() => { setBoardState(r.id, 'visible') }}>
                     {t('run.restore')}
                   </button>
                   <button
                     className={confirmPurgeId === r.id ? 'dsh-swarm-btn ghost dsh-swarm-run-purge confirm' : 'dsh-swarm-btn ghost dsh-swarm-run-purge'}
                     disabled={hostStale}
-                    title={hostStale ? t('run.hostStaleTitle', { version: hostVersion }) : t('run.purgeHint')}
+                    title={hostStale ? hostStaleTitle : t('run.purgeHint')}
                     onClick={() => {
                       // Same two-step as the menu, and the same stronger wording:
                       // permanent is never one stray click from a recoverable list.
@@ -415,15 +476,16 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
                   role="button"
                   tabIndex={0}
                   className={selected ? 'dsh-swarm-run active' : 'dsh-swarm-run'}
-                  onClick={() => { setSelectedRunId(r.id); setSelectedTask(null) }}
+                  onClick={() => { resetActions(); setSelectedRunId(r.id); setSelectedTaskKey(null) }}
                   onKeyDown={(event) => {
                     // Only the row itself: keys typed in the ⋯ button or the rename
                     // input must not also select the run through bubbling.
                     if (event.target !== event.currentTarget) return
                     if (event.key !== 'Enter' && event.key !== ' ') return
                     event.preventDefault()
+                    resetActions()
                     setSelectedRunId(r.id)
-                    setSelectedTask(null)
+                    setSelectedTaskKey(null)
                   }}
                   onContextMenu={(event) => {
                     event.preventDefault()
@@ -456,7 +518,7 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
                     <button
                       className="dsh-swarm-run-menu-btn"
                       disabled={hostStale}
-                      title={hostStale ? t('run.hostStaleTitle', { version: hostVersion }) : t('run.menu')}
+                      title={hostStale ? hostStaleTitle : t('run.menu')}
                       aria-label={t('run.menu')}
                       onClick={(event) => {
                         event.stopPropagation()
@@ -541,7 +603,6 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
               {run.status === 'failed' && (
                 <p className="dsh-swarm-run-banner">{t('run.failedBanner')}</p>
               )}
-              {actionError !== null && <p className="dsh-swarm-action-error">{actionError}</p>}
 
               {run.report !== undefined && (
                 <details className="dsh-swarm-report" open>
@@ -553,8 +614,9 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
                       plural: run.report.stats.fallbacks === 1 ? '' : 's',
                       retries: run.report.stats.retries,
                       passed: run.report.stats.reviewsPassed,
-                      total: run.report.stats.reviewsPassed + run.report.stats.reviewsRejected,
+                      total: run.report.stats.reviewsPassed + run.report.stats.reviewsRejected + (run.report.stats.reviewsUnavailable ?? 0),
                     })}
+                    {(run.report.stats.reviewsUnavailable ?? 0) > 0 && <>{' '}{t('run.reviewsUnavailable', { count: run.report.stats.reviewsUnavailable ?? 0 })}</>}
                   </summary>
                   <ul>
                     {run.report.tasks.map((t) => (
@@ -579,7 +641,7 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
                         <button
                           key={task.id}
                           className="dsh-swarm-task"
-                          onClick={() => { setSelectedTask(selectedTask !== null && selectedTask.id === task.id ? null : task) }}
+                          onClick={() => { setSelectedTaskKey((current) => toggleTask(current, task)) }}
                         >
                           <span className="dsh-swarm-task-status" style={{ background: statusColor(task.status) }} />
                           <span className="dsh-swarm-task-subject">{task.subject}</span>
@@ -587,11 +649,11 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
                             <kbd>{task.role}</kbd>
                             {task.agent?.model !== undefined && <code>{task.agent.provider ?? ''}/{task.agent.model}</code>}
                             {task.attempts > 1 && <em>×{task.attempts}</em>}
-                            {task.reviewBy !== undefined && (task.reviewed === true
-                              ? <em title={translate('task.reviewedByTitle', { role: task.reviewBy })}>✓✓</em>
-                              : task.humanReview === true
-                                ? <em title={translate('task.humanReviewTitle')}>👤</em>
-                                : <em title={translate('task.reviewLoopTitle', { role: task.reviewBy })}>↻{task.reviews ?? 0}</em>)}
+                            {reviewState(task) !== 'not-requested' && (
+                              <em title={reviewLabel(task, t)} aria-label={reviewLabel(task, t)}>
+                                {reviewState(task) === 'approved' ? '✓✓' : ['unavailable', 'exhausted', 'skipped', 'invalidated'].includes(reviewState(task)) ? '!' : reviewState(task) === 'human-pending' ? '👤' : `↻${task.reviews ?? 0}`}
+                              </em>
+                            )}
                             {task.nudgedAt !== undefined && (
                               <em title={translate('task.noNoteTitle')} style={{ color: 'rgb(227, 148, 36)' }}>🔕</em>
                             )}

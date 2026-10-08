@@ -1,18 +1,81 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest'
+import { existsSync, mkdirSync, mkdtempSync as nativeMkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import * as swarmPlugin from '../src/index.js'
 import { SwarmService, sanitizeToolNames } from '../src/service.js'
-import { FAST_FAILURE_MS, isUnsupportedEffortError } from '../src/dispatch/spawn.js'
+import { FAST_FAILURE_MS, isUnsupportedEffortError, taskReportRelPath } from '../src/dispatch/spawn.js'
+import { captureAuthority, type EvidenceShell } from '../src/authority.js'
+
+type EvidenceRequest = Parameters<EvidenceShell['resolve']>[0]
+
+/** Canned Shell contract: records policy and never evaluates a host command. */
+class FakeEvidenceShell implements EvidenceShell {
+  readonly sandboxMode = 'workspace-write' as const
+  readonly calls: EvidenceRequest[] = []
+  onResult?: (request: EvidenceRequest) => void
+
+  resolve(request: EvidenceRequest): EvidenceRequest {
+    if (!existsSync(request.workdir)) throw new Error(`ENOENT: evidence workspace ${request.workdir}`)
+    return request
+  }
+
+  async execute(request: EvidenceRequest): Promise<Awaited<ReturnType<EvidenceShell['execute']>>> {
+    this.calls.push(request)
+    if (request.command.includes('no_such_swarm_evidence_cmd_')) throw new Error('command is not recognized')
+    const timedOut = request.command.includes('sleep 30')
+    const exitCode = timedOut ? null
+      : request.command.includes('Test-Path package.json') ? (existsSync(join(request.workdir, 'package.json')) ? 0 : 1)
+      : request.command.includes('exit 7') ? 7
+      : /throw |exit 1|process\.exit\(1\)/.test(request.command) ? 1 : 0
+    const stdout = request.command.includes('contract assertion failed') ? 'contract assertion failed\n'
+      : request.command.includes('191 passed in 4.50s') ? '191 passed in 4.50s\n'
+      : timedOut ? 'before the kill\n' : ''
+    const stderr = request.command.includes('the contract script is broken') ? 'the contract script is broken\n' : ''
+    return {
+      kill: () => true,
+      done: Promise.resolve(),
+      result: async () => {
+        this.onResult?.(request)
+        return { exitCode, timedOut, aborted: request.signal.aborted, stdout: { text: stdout }, stderr: { text: stderr }, sandbox: { mode: request.sandboxPolicy.mode, denied: false } }
+      },
+    }
+  }
+}
+
+/** Write the report at the identity actually advertised to this child. */
+function writeReport(call: StartCall, cwd: string, report: Record<string, unknown>): string {
+  const prompt = call.prompt.map((block) => block.text).join('\n')
+  const json = prompt.match(/```json\n([^\n]+)\n```/)?.[1]
+  if (json === undefined) throw new Error('spawn prompt omitted its report identity')
+  const identity = JSON.parse(json) as { runId: string; taskId: string; attemptId: string }
+  const relative = taskReportRelPath(identity.taskId, identity.runId, identity.attemptId)
+  const path = join(cwd, relative)
+  mkdirSync(join(cwd, relative, '..'), { recursive: true })
+  writeFileSync(path, JSON.stringify({ ...identity, ...report }))
+  return path
+}
+
+const ownedTempDirs = new Set<string>()
+function mkdtempSync(prefix: string): string {
+  const directory = nativeMkdtempSync(prefix)
+  ownedTempDirs.add(directory)
+  return directory
+}
+afterAll(() => {
+  for (const directory of ownedTempDirs) rmSync(directory, { recursive: true, force: true })
+  ownedTempDirs.clear()
+})
 
 interface StartCall {
   label?: string
   prompt: Array<{ type: string; text: string }>
-  agentOptions?: { provider?: string; model?: string; maxTokens?: number }
+  agentOptions?: { provider?: string; model?: string; maxTokens?: number; reasoningEffort?: string }
   persona?: string
   parent?: unknown
+  toolFilter?: { deny?: string[]; allow?: string[] }
+  maxDepth?: number
 }
 
 /** Fake spawn-provider subagents service with scriptable outcomes. */
@@ -165,7 +228,7 @@ class FakeAgents {
     sessionId: string
     meta?: { cwd?: string; agentPreset?: string }
     agentOptions?: { provider?: string; model?: string }
-    setup?: (anchorCtx: unknown) => void | Promise<void>
+    setup?: (anchorCtx: unknown, anchor: unknown) => void | Promise<void>
   }): Promise<{ agent: unknown; dispose(): Promise<void> }> {
     this.created.push({
       sessionId: options.sessionId,
@@ -177,7 +240,7 @@ class FakeAgents {
     const agent = {
       id: `anchor-${this.n}`,
       options: { ...options.agentOptions },
-      session: { header: { id: `anchor-${this.n}`, delegationDepth: 0 } },
+      session: { header: { id: `anchor-${this.n}`, delegationDepth: 0 }, append: vi.fn() },
     }
     this.anchors.push(agent)
     // The real factory awaits setup inside the creation window; mirror that
@@ -185,7 +248,7 @@ class FakeAgents {
     const setupPromise = (async () => {
       if (options.setup !== undefined) {
         this.setupCalls += 1
-        await options.setup({ get: () => undefined })
+        await options.setup({ get: () => undefined }, agent)
       }
     })()
     return setupPromise.then(() => ({
@@ -276,7 +339,7 @@ async function pumpUntil(
   throw new Error(`unreachable after ${turns} dispatcher turns: ${what}`)
 }
 
-async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx: Context; service: SwarmService; fake: FakeSubagents; dir: string }> {
+async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx: Context; service: SwarmService; fake: FakeSubagents; shell: FakeEvidenceShell; dir: string }> {
   const dir = mkdtempSync(join(tmpdir(), 'swarm-service-'))
   // J21: the effort preflight reads `$DSH_HOME/settings.yaml`. Point it at a fixture
   // deployment for every boot, so these tests neither depend on (nor are fooled by)
@@ -286,7 +349,10 @@ async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx
   process.env.DSH_HOME = effortSettingsHome ?? makeSettingsHome(DECLARING_SETTINGS)
   const ctx = new Context()
   const fake = new FakeSubagents()
+  const shell = new FakeEvidenceShell()
   ctx.reflect.provide('subagents', fake as never)
+  ctx.reflect.provide('shell', shell as never)
+  ctx.reflect.provide('sandboxPolicy', { resolve: () => ({ mode: 'workspace-write', workspaceRoot: dir }) } as never)
   await ctx.plugin(swarmPlugin, {
     storageDir: dir,
     maxConcurrent: 5,
@@ -308,11 +374,26 @@ async function bootSwarm(overrides: Record<string, unknown> = {}): Promise<{ ctx
   if (traced === undefined) throw new Error('swarm service not registered after plugin load')
   const service = traced[Symbol.for('cordis.original')] as SwarmService | undefined
   if (service === undefined) throw new Error('swarm service could not be unwrapped from trace proxy')
-  return { ctx, service, fake, dir }
+  return { ctx, service, fake, shell, dir }
 }
 
 const dirs: string[] = []
 const contexts: Context[] = []
+
+afterEach(async () => {
+  const closing: Promise<unknown>[] = []
+  for (const ctx of contexts.splice(0)) {
+    const trace = ctx.get('swarm') as Record<symbol, unknown> | undefined
+    const service = trace?.[Symbol.for('cordis.original')] as { holders: Set<{ done?: Promise<void> }> } | undefined
+    for (const flight of service?.holders ?? []) if (flight.done !== undefined) closing.push(flight.done)
+    ctx.registry.delete(swarmPlugin)
+  }
+  await Promise.allSettled(closing)
+  for (const dir of dirs.splice(0)) {
+    if (!ownedTempDirs.has(dir)) throw new Error(`refusing to remove an unowned fixture directory: ${dir}`)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 /**
  * The settings.yaml fixture a booted service reads for its J21 effort preflight
@@ -371,11 +452,6 @@ function makeSettingsHome(settingsYaml: string): string {
 }
 
 describe('swarm service (integration, fake subagents)', () => {
-
-  afterEach(() => {
-    for (const ctx of contexts.splice(0)) ctx.registry.delete(swarmPlugin)
-    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
-  })
 
   it('dispatch → endorse → spawn with role model → review approve → completed run with report', async () => {
     const { ctx, service, fake, dir } = await bootSwarm()
@@ -656,7 +732,12 @@ describe('swarm service (integration, fake subagents)', () => {
 
     await waitFor(() => fake.calls.length === 2, 5000, 'the ladder retried without rotating models')
     // Same route as the first child, and the retry carries no pin.
-    expect(fake.calls[1].agentOptions).toEqual(fake.calls[0].agentOptions)
+    expect(fake.calls[0].agentOptions?.reasoningEffort).toBe('max')
+    expect(fake.calls[1].agentOptions).toEqual({
+      provider: fake.calls[0].agentOptions?.provider,
+      model: fake.calls[0].agentOptions?.model,
+    })
+    expect(fake.calls[1].agentOptions?.reasoningEffort).toBeUndefined()
     expect(service.effortFor('sess-2')).toBeUndefined()
 
     fake.release()
@@ -1800,6 +1881,8 @@ describe('swarm service (integration, fake subagents)', () => {
 
     service.watchdog(Date.now() + 63 * 60 * 1000)  // nudge 3 → escalation (reclaim)
     expect(service.events.all().filter((e) => e.kind === 'task/nudged').length).toBe(2) // no new nudge — reclaimed instead
+    // Reclaim now records failure only after the aborted child's disposal boundary.
+    await waitFor(() => service.events.all().some((e) => e.kind === 'task/failed'), 5000, 'watchdog reclaim settled')
     const failed = service.events.all().filter((e) => e.kind === 'task/failed')
     expect(failed.length).toBeGreaterThanOrEqual(1)
     expect((failed[failed.length - 1]?.data as { reason?: string })?.reason).toMatch(/watchdog escalation/)
@@ -1907,6 +1990,8 @@ describe('swarm service (integration, fake subagents)', () => {
     const { ctx, service, fake, dir } = await bootSwarm({
       circuitBreakerThreshold: 3,
       circuitBreakerCooldownMs: 1500,
+      // Exercise breaker wakeups without pre-reserved staggered launches.
+      spawnStaggerMs: 0,
       retryBackoffBaseMs: 200, // small backoff: gives the breaker time to trip
       maxRetries: 3,
     })
@@ -1948,14 +2033,14 @@ describe('swarm service (integration, fake subagents)', () => {
    * Mirrors the setup used by the core dispatch test; without a pinned role (or
    * a captured run route) `resolveCandidates` returns undefined and nothing runs.
    */
-  async function bootRunnable(overrides: Record<string, unknown> = {}): Promise<{ service: SwarmService; fake: FakeSubagents; dir: string }> {
+  async function bootRunnable(overrides: Record<string, unknown> = {}): Promise<{ ctx: Context; service: SwarmService; fake: FakeSubagents; dir: string }> {
     const { ctx, service, fake, dir } = await bootSwarm(overrides)
     contexts.push(ctx)
     dirs.push(dir)
     const table = structuredClone(service.duty.get())
     table.roles.builder = { ...table.roles.builder, provider: 'zai', model: 'glm-5.3' }
     service.setDutyTable(table, 'test')
-    return { service, fake, dir }
+    return { ctx, service, fake, dir }
   }
 
   /**
@@ -2029,7 +2114,7 @@ describe('swarm service (integration, fake subagents)', () => {
     // A genuine orphan is a task the fold reports as running while NOTHING in this
     // process owns it — i.e. exactly what a fresh host sees after a crash. Append
     // those events directly so no live flight exists (J13 ignores live tasks).
-    const { service } = await bootRunnable()
+    const { ctx, service, dir } = await bootRunnable()
 
     const runId = 'run-orphan-control'
     service.events.append('run/created', {
@@ -2037,6 +2122,7 @@ describe('swarm service (integration, fake subagents)', () => {
       data: {
         title: 'orphan control',
         spec: 's',
+        dispatch: { cwd: dir, authority: captureAuthority(ctx, makeDispatcher(dir) as never, dir) },
         tasks: [{ id: 'z2', subject: 'Z', description: 'd', role: 'builder' }],
       },
     })
@@ -2240,12 +2326,8 @@ describe('swarm service (integration, fake subagents)', () => {
     // The agent finished the work and wrote its report, then died before the
     // dispatcher could record it — exactly the production "landed on disk" case.
     // Written from the spawn-time hook so it lands during the attempt (J22).
-    fake.beforeFail = () => {
-      mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
-      writeFileSync(
-        join(dir, '.dsh-swarm', 'task-hand.json'),
-        JSON.stringify({ taskId: 'hand', status: 'completed', summary: 'work landed before the crash' }),
-      )
+    fake.beforeFail = (call) => {
+      writeReport(call, dir, { status: 'completed', summary: 'work landed before the crash' })
     }
 
     const result = service.dispatch({
@@ -2268,12 +2350,8 @@ describe('swarm service (integration, fake subagents)', () => {
     const { service, fake, dir } = await bootRunnable({ maxRetries: 0 })
     fake.failOnce = true
     // Fresh (written during the attempt), so the ONLY reason to refuse is the status.
-    fake.beforeFail = () => {
-      mkdirSync(join(dir, '.dsh-swarm'), { recursive: true })
-      writeFileSync(
-        join(dir, '.dsh-swarm', 'task-half.json'),
-        JSON.stringify({ taskId: 'half', status: 'in-progress', summary: 'still going' }),
-      )
+    fake.beforeFail = (call) => {
+      writeReport(call, dir, { status: 'in-progress', summary: 'still going' })
     }
 
     const result = service.dispatch({
@@ -2337,7 +2415,10 @@ describe('swarm service (integration, fake subagents)', () => {
 
     await waitFor(() => fake.calls.length >= 1, 5000, 'spawn')
     const prompt = fake.calls[0]?.prompt?.[0]?.text ?? ''
-    expect(prompt).toContain('.dsh-swarm/task-p1.json')
+    const task = service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'p1')!
+    expect(prompt).toContain(taskReportRelPath('p1', result.runId, task.attemptId))
+    expect(prompt).toContain(`"runId":"${result.runId}"`)
+    expect(prompt).toContain(`"attemptId":"${task.attemptId}"`)
     expect(prompt).toMatch(/LAST thing you do/)
     service.abort(result.runId)
   }, 15000)
@@ -2439,9 +2520,10 @@ describe('swarm service (integration, fake subagents)', () => {
 
   // ── J12: role toolFilter reaches the spawn provider ──────────────────────
   it('J12: a role toolFilter is passed through to the spawn provider', async () => {
-    const { service, fake, dir } = await bootRunnable()
+    const { ctx, service, fake, dir } = await bootRunnable()
+    ctx.reflect.provide('tools', { restrictableNames: new Set(['read', 'write', 'modlens_read_image']) } as never)
     const table = structuredClone(service.duty.get())
-    table.roles.builder = { ...table.roles.builder, toolFilter: { deny: ['modlens'] } }
+    table.roles.builder = { ...table.roles.builder, toolFilter: { deny: ['modlens_read_image'] } }
     service.setDutyTable(table, 'test')
 
     const result = service.dispatch({
@@ -2453,7 +2535,7 @@ describe('swarm service (integration, fake subagents)', () => {
 
     await waitFor(() => fake.calls.length >= 1, 5000, 'spawn')
     const sent = (fake.calls[0] as unknown as { toolFilter?: { deny?: string[] } }).toolFilter
-    expect(sent?.deny).toEqual(['modlens'])
+    expect(sent?.deny).toEqual(['modlens_read_image'])
     service.abort(result.runId)
   }, 15000)
 
@@ -2469,12 +2551,12 @@ describe('swarm service (integration, fake subagents)', () => {
   // Production: a role toolFilter naming "modlens" (the real tool is
   // `modlens_read_image`) made tools.restrict() throw during child creation, so
   // all 10 tasks failed across 3 waves and the run failed.
-  it('J15: unknown tool names are dropped and reported, not fatal', () => {
+  it('J15: an unknown deny name refuses launch instead of weakening the restriction', () => {
     const known = new Set(['read', 'write', 'modlens_read_image', 'pwsh'])
     const r = sanitizeToolNames({ deny: ['modlens', 'write'] }, known)
-    expect(r.filter?.deny).toEqual(['write'])
+    expect(r.filter).toBeUndefined()
     expect(r.dropped).toEqual(['modlens'])
-    expect(r.refusal).toBeUndefined()
+    expect(r.refusal).toMatch(/deny-list/)
   })
 
   it('J15: an allow-list that loses every name refuses the filter rather than widening access', () => {
@@ -2493,11 +2575,17 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(r.dropped).toEqual(['nope'])
   })
 
-  it('J15: an unverifiable registry passes the filter through untouched', () => {
-    // Without a readable registry we must not silently strip a legitimate filter.
+  it('J15: an unverifiable registry refuses restricted launch', () => {
     const r = sanitizeToolNames({ deny: ['anything'] }, undefined)
-    expect(r.filter?.deny).toEqual(['anything'])
+    expect(r.filter).toBeUndefined()
+    expect(r.refusal).toMatch(/registry unavailable/)
     expect(r.dropped).toEqual([])
+  })
+
+  it.each([{ allow: [] }, { deny: [] }, {}])('J15: refuses ambiguous empty restrictions %j', (filter) => {
+    const result = sanitizeToolNames(filter, new Set(['read', 'write']))
+    expect(result.filter).toBeUndefined()
+    expect(result.refusal).toMatch(/empty/)
   })
 
   it('J15: no filter means no work', () => {
@@ -2506,7 +2594,7 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(r.dropped).toEqual([])
   })
 
-  it('J15 END-TO-END: the exact production misconfiguration no longer kills the run', async () => {
+  it('J15 END-TO-END: a persisted unknown deny name parks visibly without unrestricted spawn', async () => {
     // Reproduces run-mtxidssw-4bky, which failed 10/10 tasks in 3 waves because a
     // role toolFilter named "modlens" while the real tool is `modlens_read_image`.
     const { ctx, service, fake, dir } = await bootSwarm()
@@ -2526,7 +2614,8 @@ describe('swarm service (integration, fake subagents)', () => {
     // hand-edited duty-table.json is exactly how the production typo persisted.
     service.duty.save(table)
 
-    // The bad name is sanitised away rather than passed through to restrict().
+    // The display accessor has no filter to show; the launch path must still
+    // refuse execution rather than interpreting that as unrestricted permission.
     expect(service.toolFilterFor('builder')).toBeUndefined()
 
     const result = service.dispatch({
@@ -2536,15 +2625,15 @@ describe('swarm service (integration, fake subagents)', () => {
     }, makeDispatcher(dir) as never)
     service.endorse(result.runId)
 
-    // Before the fix this threw during child creation and failed every task.
     await waitFor(
-      () => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed',
+      () => service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'p1')?.status === 'blocked',
       8000,
-      'run survived the bad tool name',
-      () => 'tasks=' + JSON.stringify(service.snapshot().tasks.map((t) => [t.id, t.status, String(t.lastNote ?? '').slice(0, 70)])),
+      'invalid restrictions parked for correction',
     )
-    expect(fake.calls.length).toBeGreaterThan(0)
-    expect((fake.calls[0] as unknown as { toolFilter?: unknown }).toolFilter).toBeUndefined()
+    const task = service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'p1')!
+    expect(task.humanReview).toBe(true)
+    expect(task.blockedReason).toMatch(/deny-list/)
+    expect(fake.calls).toHaveLength(0)
   }, 15000)
 
   it('J15 END-TO-END: a valid tool name still reaches the spawn provider', async () => {
@@ -2556,7 +2645,7 @@ describe('swarm service (integration, fake subagents)', () => {
     const table = structuredClone(service.duty.get())
     table.roles.builder = {
       ...table.roles.builder, provider: 'zai', model: 'glm-5.3',
-      toolFilter: { deny: ['modlens_read_image', 'typo'] },
+      toolFilter: { deny: ['modlens_read_image'] }
     }
     // Store save, not the dashboard path — see the misconfiguration test above.
     service.duty.save(table)
@@ -2641,17 +2730,9 @@ describe('A7: evidence-contract failure path', () => {
   const taskOf = (service: SwarmService, runId: string) =>
     service.snapshot().tasks.find((t) => t.runId === runId && t.id === 'a')!
 
-  /**
-   * How many times a command actually executed, read off a marker file it appends to.
-   * PowerShell 5.1 writes `>>` redirection as UTF-16LE, so the raw bytes interleave
-   * NULs and a line count is not an execution count; strip them and count the marker.
-   */
-  const markerCount = (path: string, marker: string): number =>
-    existsSync(path) ? (readFileSync(path, 'utf8').replace(/\0/g, '').match(new RegExp(marker, 'g')) ?? []).length : 0
-
   /** One builder task whose child SUCCEEDS and whose evidence contract is `commands`. */
   async function dispatchWithCommands(commands: string[], overrides: Record<string, unknown> = {}) {
-    const { ctx, service, fake, dir } = await bootSwarm(overrides)
+    const { ctx, service, fake, shell, dir } = await bootSwarm(overrides)
     contexts.push(ctx)
     dirs.push(dir)
     const dispatched = service.dispatch({
@@ -2660,21 +2741,22 @@ describe('A7: evidence-contract failure path', () => {
       tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { commands } }],
     }, makeDispatcher(dir) as never)
     service.endorse(dispatched.runId)
-    return { service, fake, dir, runId: dispatched.runId }
+    return { service, fake, shell, dir, runId: dispatched.runId }
   }
 
   it('re-runs only the declared commands, once, and never respawns the finished child', async () => {
-    // The incident's shape: a green summary, then a non-zero exit from a teardown
-    // artefact. The command counts its own executions by appending a marker, so
-    // "exactly one recheck" is measured rather than inferred from timing.
-    const { service, fake, dir, runId } = await dispatchWithCommands(["echo '191 passed in 4.50s'; echo run >> runs.txt; exit 1"])
+    // A green output tail cannot override the Shell's non-zero exit code.
+    // The fake records every execution; nothing is evaluated by a host shell.
+    const { service, fake, shell, dir, runId } = await dispatchWithCommands(["echo '191 passed in 4.50s'; echo run >> runs.txt; exit 1"])
 
     await waitFor(() => taskOf(service, runId).status === 'blocked', 20000, 'task blocks for a human after the recheck')
 
     // The deliverable was already on disk and verified — the child must NOT be respawned.
     expect(fake.calls.length).toBe(1)
     // One run, one recheck. Never a loop.
-    expect(markerCount(join(dir, 'runs.txt'), 'run')).toBe(2)
+    expect(shell.calls).toHaveLength(2)
+    expect(shell.calls.map((call) => call.command)).toEqual(Array(2).fill("echo '191 passed in 4.50s'; echo run >> runs.txt; exit 1"))
+    expect(existsSync(join(dir, 'runs.txt'))).toBe(false)
 
     const task = taskOf(service, runId)
     expect(task.status).toBe('blocked')
@@ -2717,20 +2799,24 @@ describe('A7: evidence-contract failure path', () => {
   }, 30000)
 
   it('reports a hung command as TIMED OUT, distinct from a non-zero exit', async () => {
-    const { service, dir, runId } = await dispatchWithCommands(['sleep 30'], { evidenceTimeoutMs: 1200 })
-    await waitFor(() => taskOf(service, runId).status === 'blocked', 30000, 'blocked after two timeouts')
-
-    const blocked = eventsOf(dir).filter((e) => e.kind === 'task/blocked' && e.taskId === 'a').pop()!
-    const reason = String(blocked.data?.reason ?? '')
-    expect(reason).toMatch(/TIMED OUT/)
-    expect(reason).not.toMatch(/exit code/) // the whole point: the two are distinguishable
-
-    const recorded = (blocked.data?.evidence as { commands?: Array<Record<string, unknown>> } | undefined)?.commands ?? []
-    expect(recorded).toHaveLength(1)
-    expect(recorded[0].timedOut).toBe(true)
-    expect(recorded[0]).not.toHaveProperty('exitCode')
-    expect(Number(recorded[0].elapsedMs)).toBeGreaterThanOrEqual(1000)
-  }, 60000)
+    const { service, shell, dir, runId } = await dispatchWithCommands(['sleep 30'], { evidenceTimeoutMs: 1200 })
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now())
+    shell.onResult = (request) => { clock.mockReturnValue(Date.now() + request.timeoutMs) }
+    try {
+      await pumpUntil(service, () => taskOf(service, runId).status === 'blocked', 'blocked after two simulated timeouts')
+      const blocked = eventsOf(dir).filter((e) => e.kind === 'task/blocked' && e.taskId === 'a').pop()!
+      const reason = String(blocked.data?.reason ?? '')
+      expect(reason).toMatch(/TIMED OUT/)
+      expect(reason).not.toMatch(/exit code/)
+      const recorded = (blocked.data?.evidence as { commands?: Array<Record<string, unknown>> } | undefined)?.commands ?? []
+      expect(recorded).toHaveLength(1)
+      expect(recorded[0].timedOut).toBe(true)
+      expect(recorded[0]).not.toHaveProperty('exitCode')
+      expect(Number(recorded[0].elapsedMs)).toBeGreaterThanOrEqual(1200)
+      expect(shell.calls).toHaveLength(2)
+      expect(shell.calls.every((call) => call.onExpiry === 'kill' && call.timeoutMs === 1200)).toBe(true)
+    } finally { clock.mockRestore() }
+  }, 15000)
 
   it('leaves a genuine child failure on the existing retry path, with no evidence recheck', async () => {
     const { ctx, service, fake, dir } = await bootSwarm()
@@ -2765,7 +2851,7 @@ describe('A7: evidence-contract failure path', () => {
   }, 30000)
 })
 
-describe('B-config: duty-table toolFilter guard (fail-open)', () => {
+describe('B-config: duty-table toolFilter guard (failure closed)', () => {
   /** The current table with the builder role's toolFilter replaced. */
   const tableWithFilter = (service: SwarmService, filter: { deny?: string[]; allow?: string[] }): unknown => {
     const table = structuredClone(service.duty.get())
@@ -2804,14 +2890,23 @@ describe('B-config: duty-table toolFilter guard (fail-open)', () => {
     expect((service.duty.get().roles.builder as { toolFilter?: { deny?: string[] } }).toolFilter?.deny).toEqual(['bash'])
   })
 
-  it('fails OPEN: an unknown name is accepted when the host tool list is unavailable', async () => {
-    const { ctx, service, dir } = await bootSwarm()
+  it('fails CLOSED at launch when a saved filter cannot be verified', async () => {
+    const { ctx, service, fake, dir } = await bootSwarm()
     contexts.push(ctx)
     dirs.push(dir)
-    // No `tools` service provided at all — the read fails, the guard must not
-    // invent a rejection the host cannot back up.
     const saved = service.setDutyTable(tableWithFilter(service, { deny: ['modlens'] }) as never, 'test')
-    expect((saved.roles.builder as { toolFilter?: { deny?: string[] } }).toolFilter?.deny).toEqual(['modlens'])
+    expect(saved.roles.builder.toolFilter?.deny).toEqual(['modlens'])
+    expect(service.toolFilterFor('builder')).toBeUndefined()
+    const result = service.dispatch({
+      title: 'missing registry', spec: 's',
+      tasks: [{ id: 'unverifiable', subject: 'U', description: 'd', role: 'builder' }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(result.runId)
+    await waitFor(() => service.snapshot().tasks.find((task) => task.runId === result.runId && task.id === 'unverifiable')?.status === 'blocked', 5000, 'unverifiable launch refused')
+    const task = service.snapshot().tasks.find((task) => task.runId === result.runId && task.id === 'unverifiable')!
+    expect(task.humanReview).toBe(true)
+    expect(task.blockedReason).toMatch(/registry unavailable/)
+    expect(fake.calls).toHaveLength(0)
   })
 })
 
