@@ -3,7 +3,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { RUNTIME_LIMITS, type RuntimeKey } from './domain/limits.js'
 
-export const PLUGIN_VERSION = '0.6.31'
+export const PLUGIN_VERSION = '0.6.32'
 
 function runtimeNumber(key: RuntimeKey) {
   const bounds = RUNTIME_LIMITS[key]

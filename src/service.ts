@@ -3,7 +3,7 @@ import { closeSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, re
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { zstdDecompressSync } from 'node:zlib'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { boundContextSummary, createUserMessage, type ContextFormed } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { Service } from '@deepseek-ai/cordis'
@@ -24,6 +24,15 @@ import { buildBoardSnapshot } from './board.js'
 import { spawnTaskAgent, buildReviewPrompt, buildReviewReaskPrompt, parseVerdict, taskReportRelPath, type SpawnDeps } from './dispatch/spawn.js'
 import type { DispatchInput, DispatchResult, DutyTable, ModelRef, RoleConfig, Run, RunDispatchContext, Task, TaskSpec } from './domain/types.js'
 
+// Match the producer kind assigned to historical swarm notices by the V3→V4
+// migration. Native V4 rejects the retired { kind: 'plugin', plugin: ... } wrapper.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'plugin:dsh-swarm-orchestrator': {
+      readonly kind: 'plugin:dsh-swarm-orchestrator'
+    } & ContextFormed
+  }
+}
 
 /**
  * J15: drop tool names a host does not expose from a role's toolFilter.
@@ -275,10 +284,17 @@ interface AgentsLike {
     agentOptions?: { provider?: string; model?: string }
     setup?: (anchorCtx: unknown, anchor: Agent) => void | Promise<void>
   }): Promise<{ agent: Agent; dispose(): Promise<void> }>
-  /** Live-agent lookup by session id (workspace resolution + completion push). */
+  /**
+   * Live-agent lookup by session id (workspace resolution + swarm notices).
+   * `status`/`steer`/`inject` are optional so a host too old to expose them
+   * still receives notices through `followup` (see pushNotice).
+   */
   get?(id: string): {
+    status?: 'idle' | 'running'
     session?: { header?: { cwd?: string } }
     followup?(message: unknown): void
+    steer?(message: unknown): void
+    inject?(message: unknown): void
   } | undefined
 }
 
@@ -1122,9 +1138,64 @@ export class SwarmService extends Service {
   }
 
   /**
+   * P-A/B2: deliver one swarm notice to a dispatching session, on the channel
+   * its CURRENT status calls for — the single path both notifications share.
+   *
+   * `followup()` is `send(..., 'next-turn', true)`: on a BUSY driver the wake is
+   * never latched (live drivers claim queued work themselves), so the notice is
+   * only claimed once the running turn fully ends — and a turn that ends by
+   * abort/error replays only a LATCHED wake, stranding the notice in the inbox
+   * until a human clicks Steer. Production delivered exactly that: a
+   * completed-run notice sat in the queue dock behind the dispatching turn,
+   * invisible to the model. The host's own producers (subagent settlement,
+   * background jobs) avoid it the same way, and so does this: a busy target is
+   * `steer`ed — consumed at the very next step, and it still WAKES if the driver
+   * retires between the status read and the send — while an idle one gets an
+   * ordinary turn. `inject` is the no-wake fallback when a host has no `steer`;
+   * an unknown status keeps plain `followup`, the always-delivered option on a
+   * host too old to report a status.
+   *
+   * The source is a producer-owned swarm NOTICE, never generic `plugin` (which
+   * native V4 persistence rejects) or `user` (which goal / skill-scan /
+   * wake-budget policy treats as human authorization). Its `notice` form keeps
+   * the collapsed transcript presentation while still reaching the model like
+   * any injected context.
+   *
+   * @returns whether the notice was handed to a live session.
+   */
+  private pushNotice(sessionId: string, text: string, summary: string): boolean {
+    const agents = this.ctx.get('agents') as AgentsLike | undefined
+    const live = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
+    if (live === undefined) return false
+    const message = createUserMessage({
+      source: {
+        kind: 'plugin:dsh-swarm-orchestrator',
+        form: 'notice',
+        summary: boundContextSummary(summary),
+      },
+      content: [{ type: 'text', text }],
+    })
+    if (live.status === 'running') {
+      if (typeof live.steer === 'function') {
+        live.steer(message)
+        return true
+      }
+      if (typeof live.inject === 'function') {
+        live.inject(message)
+        return true
+      }
+    }
+    if (typeof live.followup === 'function') {
+      live.followup(message)
+      return true
+    }
+    return false
+  }
+
+  /**
    * P-A: push the run's terminal result into the dispatching chat's inbox, so
    * the dispatcher learns the outcome exactly once, at the moment it's true —
-   * no polling, no optimistic summaries. Only live sessions are woken: a chat
+   * no polling, no optimistic summaries. Only live sessions are reached: a chat
    * that was closed is never disturbed. Failures are contained — a notification
    * problem must never affect the run.
    */
@@ -1134,13 +1205,10 @@ export class SwarmService extends Service {
       const run = this.view().runs.get(runId)
       const sessionId = run?.dispatch?.sessionId
       if (sessionId === undefined) return
-      const agents = this.ctx.get('agents') as AgentsLike | undefined
-      const live = typeof agents?.get === 'function' ? agents.get(sessionId) : undefined
-      if (live === undefined || typeof live.followup !== 'function') return
-      const icon = outcome === 'completed' ? '✅' : outcome === 'paused' ? '⏸' : '❌'
-      const text = `[swarm auto-notification] Swarm run "${run?.title ?? runId}" (${runId}) ${outcome}: ${detail}. `
+      const title = run?.title ?? runId
+      const text = `[swarm auto-notification] Swarm run "${title}" (${runId}) ${outcome}: ${detail}. `
         + 'Briefly relay this to the user. Do not start new work unless the user asks — the live board is on the Swarm tab.'
-      live.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
+      this.pushNotice(sessionId, text, `swarm run ${outcome}: ${title}`)
     } catch (err) {
       this.ctx.logger('swarm').warn('completion push for run %s failed (contained): %s', runId, String(err))
     }
@@ -1204,9 +1272,6 @@ export class SwarmService extends Service {
     for (const [owner, items] of owners) {
       if (!items.some(({ task, episode }) => this.humanWaitPinged.get(taskKeyOf(task)) !== episode)) continue
       try {
-        const agents = this.ctx.get('agents') as AgentsLike | undefined
-        const live = typeof agents?.get === 'function' ? agents.get(owner) : undefined
-        if (live === undefined || typeof live.followup !== 'function') continue
         const brief = (s: string): string => s.length <= 260 ? s : `${s.slice(0, 90)} … ${s.slice(-160)}`
         const lines = items.map(({ task }) => task.status === 'blocked'
           ? `- run ${task.runId} task "${task.id}": ${brief(String(task.blockedReason ?? 'blocked — a human decides'))}`
@@ -1216,7 +1281,10 @@ export class SwarmService extends Service {
           + 'swarm_complete (accept finished work despite the evidence artefact), or the dashboard buttons. '
           + 'You may surface this decision to the user as a multiple-choice prompt. '
           + 'Do not start new work unless the user asks — the live board is on the Swarm tab.'
-        live.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text }] }))
+        // A stranded attention ping is worse than a stranded completion notice:
+        // it means a human decision never reaches the chat. pushNotice steers a
+        // busy owner so the ping is seen at the next step, not after the turn.
+        if (!this.pushNotice(owner, text, `swarm attention: ${items.length} waiting on a human`)) continue
         // Only acknowledge this owner's captured episodes AFTER successful delivery.
         // Missing/throwing sessions and other owners retain their undelivered items.
         for (const { task, episode } of items) this.humanWaitPinged.set(taskKeyOf(task), episode)

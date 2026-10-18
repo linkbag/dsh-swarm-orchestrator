@@ -2,6 +2,14 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.32 — notices reach a busy dispatch turn
+
+- Deliver swarm notices on the channel the dispatching session's live status calls for: an idle owner gets one ordinary turn (`followup`), a busy one is `steer`ed so the notice is consumed at its **next step**. A mid-turn `followup` is claimed only once the running turn fully ends, and a turn that ends by abort/error replays only a *latched* wake — production left a completed-run notice sitting in the queue dock behind the dispatching turn until a human clicked Steer. `inject` is the no-wake fallback for a host without `steer`; an unknown status keeps `followup`, the always-delivered option on an older host.
+- Attribute every notice as a plugin **notice** instead of a user message. A `source.kind: 'user'` is read as human authorization by goal, skill-scan and wake-budget policy and rendered as the operator's own chat bubble; notices now render as a collapsed `dsh-swarm-orchestrator` transcript row with a bounded one-line summary.
+- Use the producer-owned `plugin:dsh-swarm-orchestrator` source kind for both notices, matching the V3→V4 migration. The retired generic `plugin` wrapper caused native V4 persistence to reject the turn with `format v4 message requires a producer-owned source kind`; regressions now reject that wrapper and require the producer-owned kind.
+- Route the B2 human-attention ping the same way. A stranded attention ping is worse than a stranded completion notice: the human decision it carries never reaches the chat.
+- Regressions: a busy dispatcher is steered (never left queued), an idle one gets a follow-up turn, a busy host without `steer` falls back to `inject`, an unknown status keeps `followup`, a throwing channel stays contained, and the attention ping carries the plugin-notice provenance. Full suite passes 605 tests across 32 files.
+
 ## 0.6.31 — lifecycle hardening and readable Flow
 
 - Apply admission to reads and mutations before parsing; bound bodies, SSE streams, buffering and drain time. Authenticate completion and interruption.

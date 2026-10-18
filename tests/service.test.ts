@@ -282,6 +282,24 @@ function makeDispatcher(cwd = 'D:\\work'): unknown {
 }
 
 /**
+ * Decode one delivered swarm notice: the model-facing text and the provenance
+ * the producer declared. Notifications are plugin notices (collapsed transcript
+ * rows), never `kind: 'user'` — several host policies read a user source as the
+ * human speaking.
+ */
+function decodeNotice(message: unknown): {
+  text: string
+  source: { kind?: string; plugin?: string; form?: string; summary?: string }
+} {
+  const envelope = message as {
+    content?: Array<{ type: string; text?: string }>
+    source?: { kind?: string; plugin?: string; form?: string; summary?: string }
+  }
+  const text = envelope?.content?.[0]?.text
+  return { text: typeof text === 'string' ? text : JSON.stringify(message), source: envelope?.source ?? {} }
+}
+
+/**
  * A1: `effortRungs` is pure (role + attempt number) and private, so the ladder's
  * SHAPE is asserted directly off the prototype — the rung order IS the contract,
  * and inferring it from spawn counts would not pin it.
@@ -1730,66 +1748,182 @@ describe('swarm service (integration, fake subagents)', () => {
     expect(run.dispatch?.cwd).toBe('D:\\work')
   })
 
-  it('pushes a completion notification into the live dispatching session (P-A)', async () => {
-    const { ctx, service, fake, dir } = await bootSwarm()
+  /**
+   * A live dispatching session whose inbox records which CHANNEL received the
+   * notice. `status` decides the channel: a busy driver must be steered (a
+   * followup queues behind the running turn), an idle one gets an ordinary turn.
+   */
+  const liveDispatchInbox = (status: 'idle' | 'running' | undefined, opts: { steer?: boolean; inject?: boolean; followup?: boolean } = {}) => {
+    const seen: Array<{ channel: 'steer' | 'inject' | 'followup'; message: unknown; text: string }> = []
+    const record = (channel: 'steer' | 'inject' | 'followup') => (message: unknown): void => {
+      seen.push({ channel, message, text: decodeNotice(message).text })
+    }
+    const handle: Record<string, unknown> = { status }
+    if (opts.steer !== false) handle.steer = record('steer')
+    if (opts.inject !== false) handle.inject = record('inject')
+    if (opts.followup !== false) handle.followup = record('followup')
+    return { seen, handle }
+  }
+
+  it('delivers the run-completion notice to a BUSY dispatcher via steer, not the queued next turn (P-A)', async () => {
+    const { ctx, service, dir } = await bootSwarm()
     contexts.push(ctx)
     dirs.push(dir)
 
-    // A dispatching session that is LIVE: agents.get resolves it and it can
-    // accept followup messages (that's how the completion push is delivered).
-    const followupCalls: string[] = []
+    const inbox = liveDispatchInbox('running')
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+    const originalGet = agents.get.bind(agents)
+    ;(agents as unknown as { get: (id: string) => unknown }).get = (id: string): unknown =>
+      id === 'parent-live' ? inbox.handle : originalGet(id)
     const liveParent = {
       id: 'parent-live',
       options: { provider: 'zai', model: 'glm-5.3' },
       session: { header: { id: 'parent-live', cwd: 'D:\\work' } },
       ctx: { get: (): undefined => undefined },
-      followup: (message: unknown): void => { followupCalls.push(JSON.stringify(message)) },
     } as never
-
-    const agents = new FakeAgents()
-    ctx.reflect.provide('agents', agents as never)
-    // FakeAgents.get returns the anchor for anchor ids; the completion push
-    // looks up the DISPATCH session id — route it through a spy.
-    const originalGet = agents.get.bind(agents)
-    ;(agents as unknown as { get: (id: string) => unknown }).get = (id: string): unknown => {
-      if (id === 'parent-live') {
-        return { followup: (message: unknown): void => { followupCalls.push(JSON.stringify(message)) } }
-      }
-      return originalGet(id)
-    }
 
     const result = service.dispatch({
       title: 'push demo',
       spec: 's',
-      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+      tasks: [
+        { id: 'a', subject: 'A', description: 'd', role: 'builder' },
+        { id: 'b', subject: 'B', description: 'd', role: 'builder', blockedBy: ['a'] },
+      ],
     }, liveParent)
     service.endorse(result.runId)
 
     await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes')
-    // The dispatching session received exactly one followup notification
-    // naming the run, tagged as a swarm auto-notification.
-    expect(followupCalls.length).toBe(1)
-    expect(followupCalls[0]).toContain(result.runId)
-    expect(followupCalls[0]).toContain('swarm auto-notification')
+
+    // Exactly one notice, on the steering channel: a mid-turn followup would be
+    // claimed only after the dispatch turn ends, which is the production stall.
+    expect(inbox.seen.map((n) => n.channel)).toEqual(['steer'])
+    const text = inbox.seen[0].text
+    expect(text).toContain(result.runId)
+    expect(text).toContain('swarm auto-notification')
+    expect(text).toContain('push demo')
   })
 
-  it('notification failures are contained and never affect the run', async () => {
-    const { ctx, service, fake, dir } = await bootSwarm()
+  it('uses a producer-owned v4 source for the collapsed notice, never a generic plugin or user source (P-A)', async () => {
+    const { ctx, service, dir } = await bootSwarm()
     contexts.push(ctx)
     dirs.push(dir)
 
-    // FakeAgents whose anchors ACCEPT followup but the followup throws —
-    // proving the push failure is contained without affecting the run.
+    const inbox = liveDispatchInbox('running')
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+    const originalGet = agents.get.bind(agents)
+    ;(agents as unknown as { get: (id: string) => unknown }).get = (id: string): unknown =>
+      id === 'parent-live' ? inbox.handle : originalGet(id)
+
+    const result = service.dispatch({
+      title: 'attribution demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, {
+      id: 'parent-live',
+      options: { provider: 'zai', model: 'glm-5.3' },
+      session: { header: { id: 'parent-live', cwd: 'D:\\work' } },
+      ctx: { get: (): undefined => undefined },
+    } as never)
+    service.endorse(result.runId)
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes')
+
+    const notice = decodeNotice(inbox.seen[0].message)
+    // Not `kind: 'user'`: goal authority, the skill scan, the wake budget and the
+    // chat transcript all read a user source as the human speaking.
+    // v4 rejects the retired generic `plugin` kind even with a plugin field.
+    expect(notice.source).toEqual({
+      kind: 'plugin:dsh-swarm-orchestrator',
+      form: 'notice',
+      summary: expect.any(String),
+    })
+    expect(typeof notice.source.summary).toBe('string')
+    expect(String(notice.source.summary)).toContain('completed')
+    expect(String(notice.source.summary).length).toBeLessThanOrEqual(120)
+  })
+
+  it('gives an IDLE dispatcher one ordinary turn through followup (P-A)', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    const inbox = liveDispatchInbox('idle')
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+    const originalGet = agents.get.bind(agents)
+    ;(agents as unknown as { get: (id: string) => unknown }).get = (id: string): unknown =>
+      id === 'parent-live' ? inbox.handle : originalGet(id)
+
+    const result = service.dispatch({
+      title: 'idle demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }],
+    }, {
+      id: 'parent-live',
+      options: { provider: 'zai', model: 'glm-5.3' },
+      session: { header: { id: 'parent-live', cwd: 'D:\\work' } },
+      ctx: { get: (): undefined => undefined },
+    } as never)
+    service.endorse(result.runId)
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes')
+
+    expect(inbox.seen.map((n) => n.channel)).toEqual(['followup'])
+    expect(decodeNotice(inbox.seen[0].message).source.kind).toBe('plugin:dsh-swarm-orchestrator')
+  })
+
+  it('falls back to inject on a busy host without steer, and to followup without a status (P-A)', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    // Host from before `steer`/`status` existed: still busy, still notified.
+    const legacy = liveDispatchInbox('running', { steer: false, inject: true })
+    const unknown = liveDispatchInbox(undefined, { steer: false, inject: false, followup: true })
+    const agents = new FakeAgents()
+    ctx.reflect.provide('agents', agents as never)
+    const originalGet = agents.get.bind(agents)
+    const liveOf = (id: string): unknown => {
+      if (id === 'parent-legacy') return legacy.handle
+      if (id === 'parent-unknown') return unknown.handle
+      return originalGet(id)
+    }
+    ;(agents as unknown as { get: (id: string) => unknown }).get = liveOf
+    const dispatcher = (id: string): unknown => ({
+      id,
+      options: { provider: 'zai', model: 'glm-5.3' },
+      session: { header: { id, cwd: 'D:\\work' } },
+      ctx: { get: (): undefined => undefined },
+    })
+
+    const first = service.dispatch({ title: 'legacy host', spec: 's', tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }] }, dispatcher('parent-legacy') as never)
+    const second = service.dispatch({ title: 'unknown status', spec: 's', tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder' }] }, dispatcher('parent-unknown') as never)
+    service.endorse(first.runId)
+    service.endorse(second.runId)
+
+    await waitFor(() => service.snapshot().runs.find((r) => r.id === first.runId)?.status === 'completed'
+      && service.snapshot().runs.find((r) => r.id === second.runId)?.status === 'completed', 8000, 'both runs complete')
+    expect(legacy.seen.map((n) => n.channel)).toEqual(['inject'])
+    expect(unknown.seen.map((n) => n.channel)).toEqual(['followup'])
+    for (const { message } of [...legacy.seen, ...unknown.seen]) {
+      expect(decodeNotice(message).source.kind).toBe('plugin:dsh-swarm-orchestrator')
+    }
+  })
+
+  it('notification failures are contained and never affect the run', async () => {
+    const { ctx, service, dir } = await bootSwarm()
+    contexts.push(ctx)
+    dirs.push(dir)
+
+    // A live dispatcher whose steering channel THROWS — proving the push
+    // failure is contained without affecting the run.
     const agents = new FakeAgents()
     ctx.reflect.provide('agents', agents as never)
     const originalGet = agents.get.bind(agents)
     ;(agents as unknown as { get: (id: string) => unknown }).get = (id: string): unknown => {
-      const result = (originalGet as (id: string) => unknown)(id)
+      const result = originalGet(id) as Record<string, unknown> | undefined
       if (result !== undefined && result !== null) {
-        return {
-          ...result,
-          followup: (): void => { throw new Error('inbox exploded') },
-        }
+        return { ...result, status: 'running', steer: (): void => { throw new Error('inbox exploded') } }
       }
       return result
     }
@@ -2911,30 +3045,41 @@ describe('B-config: duty-table toolFilter guard (failure closed)', () => {
 })
 
 describe('B2: human-attention notification to the dispatching session', () => {
-  /** Boot with a live dispatching session whose inbox records every followup's text. */
-  async function bootWithInbox(overrides: Record<string, unknown> = {}) {
+  /**
+   * Boot with a live dispatching session whose inbox records every notice, the
+   * CHANNEL it arrived on, and its declared provenance.
+   *
+   * The default handle is BUSY (`status: 'running'`): that is the production
+   * shape — the dispatch turn is still running when a task blocks — and it is
+   * what proves the ping is steered into the next step instead of queueing
+   * behind the turn.
+   */
+  async function bootWithInbox(overrides: Record<string, unknown> = {}, status: 'idle' | 'running' = 'running') {
     const { ctx, service, fake, dir } = await bootSwarm(overrides)
     contexts.push(ctx)
     dirs.push(dir)
     // Decoded to the message TEXT (not the stringified envelope) so assertions
     // read what the dispatching agent actually sees.
-    const followupTexts: string[] = []
+    const noticeTexts: string[] = []
+    const channels: string[] = []
+    const noticeSources: Array<{ kind?: string; plugin?: string; form?: string }> = []
     const agents = new FakeAgents()
     ctx.reflect.provide('agents', agents as never)
     const originalGet = agents.get.bind(agents)
+    const record = (channel: 'steer' | 'inject' | 'followup') => (message: unknown): void => {
+      const notice = decodeNotice(message)
+      channels.push(channel)
+      noticeTexts.push(notice.text)
+      noticeSources.push(notice.source)
+    }
     ;(agents as unknown as { get: (id: string) => unknown }).get = (id: string): unknown => {
       // makeDispatcher()'s session id is 'parent-1'.
       if (id === 'parent-1') {
-        return {
-          followup: (message: unknown): void => {
-            const text = (message as { content?: Array<{ type: string; text?: string }> })?.content?.[0]?.text
-            followupTexts.push(typeof text === 'string' ? text : JSON.stringify(message))
-          },
-        }
+        return { status, steer: record('steer'), inject: record('inject'), followup: record('followup') }
       }
       return originalGet(id)
     }
-    return { service, fake, dir, followupTexts }
+    return { service, fake, dir, noticeTexts, channels, noticeSources }
   }
 
   /** Only the attention pings — the completion/failed pushes ride the same inbox. */
@@ -2943,8 +3088,31 @@ describe('B2: human-attention notification to the dispatching session', () => {
   const taskOfRun = (service: SwarmService, runId: string, id: string) =>
     service.snapshot().tasks.find((t) => t.runId === runId && t.id === id)!
 
+  it('steers a busy owner instead of queueing, and every ping is a plugin notice', async () => {
+    const { service, dir, noticeTexts, channels, noticeSources } = await bootWithInbox()
+    const dispatched = service.dispatch({
+      title: 'channel demo',
+      spec: 's',
+      tasks: [{ id: 'a', subject: 'A', description: 'd', role: 'builder', evidence: { commands: ['exit 1'] } }],
+    }, makeDispatcher(dir) as never)
+    service.endorse(dispatched.runId)
+
+    await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'task blocks')
+    await waitFor(() => attention(noticeTexts).length === 1, 8000, 'attention ping arrives')
+
+    // The owner is mid-turn: a followup would sit queued until that turn ended.
+    // Both the attention ping and the follow-up "run paused" notice take the
+    // steering channel — no notice is ever left waiting for the turn to end.
+    expect(channels.length).toBeGreaterThan(0)
+    expect(channels.every((channel) => channel === 'steer')).toBe(true)
+    for (const source of noticeSources) {
+      expect(source).toMatchObject({ kind: 'plugin:dsh-swarm-orchestrator', form: 'notice' })
+      expect(source).not.toHaveProperty('plugin')
+    }
+  }, 30000)
+
   it('pings once with the task, the reason, and every resolution option', async () => {
-    const { service, dir, followupTexts } = await bootWithInbox()
+    const { service, dir, noticeTexts } = await bootWithInbox()
     const dispatched = service.dispatch({
       title: 'attention demo',
       spec: 's',
@@ -2953,9 +3121,9 @@ describe('B2: human-attention notification to the dispatching session', () => {
     service.endorse(dispatched.runId)
 
     await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'task blocks')
-    await waitFor(() => attention(followupTexts).length === 1, 8000, 'attention ping arrives after the coalescing window')
+    await waitFor(() => attention(noticeTexts).length === 1, 8000, 'attention ping arrives after the coalescing window')
 
-    const ping = attention(followupTexts)[0]
+    const ping = attention(noticeTexts)[0]
     expect(ping).toContain('[swarm attention]')
     expect(ping).toContain('1 item')                       // singular for one item
     expect(ping).toContain('task "a"')                     // the task is named
@@ -2968,7 +3136,7 @@ describe('B2: human-attention notification to the dispatching session', () => {
   }, 30000)
 
   it('aggregates: tasks blocking in one burst produce ONE ping listing all of them', async () => {
-    const { service, dir, followupTexts } = await bootWithInbox()
+    const { service, dir, noticeTexts } = await bootWithInbox()
     const dispatched = service.dispatch({
       title: 'burst demo',
       spec: 's',
@@ -2983,18 +3151,18 @@ describe('B2: human-attention notification to the dispatching session', () => {
       const tasks = service.snapshot().tasks.filter((t) => t.runId === dispatched.runId)
       return tasks.length === 2 && tasks.every((t) => t.status === 'blocked')
     }, 20000, 'both tasks block')
-    await waitFor(() => attention(followupTexts).length === 1, 8000, 'exactly one aggregated ping')
+    await waitFor(() => attention(noticeTexts).length === 1, 8000, 'exactly one aggregated ping')
 
-    const ping = attention(followupTexts)[0]
+    const ping = attention(noticeTexts)[0]
     expect(ping).toContain('2 items')
     expect(ping).toContain('task "a"')
     expect(ping).toContain('task "b"')
     // The production incident had eight — one ping, not eight.
-    expect(attention(followupTexts).length).toBe(1)
+    expect(attention(noticeTexts).length).toBe(1)
   }, 30000)
 
   it('re-pings only when the set changes: a re-block after resolution pings, an unchanged set stays silent', async () => {
-    const { service, dir, followupTexts } = await bootWithInbox()
+    const { service, dir, noticeTexts } = await bootWithInbox()
     const dispatched = service.dispatch({
       title: 'dedupe demo',
       spec: 's',
@@ -3003,24 +3171,24 @@ describe('B2: human-attention notification to the dispatching session', () => {
     service.endorse(dispatched.runId)
 
     await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'first block')
-    await waitFor(() => attention(followupTexts).length === 1, 8000, 'first ping')
+    await waitFor(() => attention(noticeTexts).length === 1, 8000, 'first ping')
 
     // Resolve by requeueing: the task unblocks, re-runs, its evidence still
     // fails, the fresh attempt's recheck fails, and it blocks again — a NEW
     // wait, so it must ping again.
     service.retryTask(dispatched.runId, 'a')
     await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'blocks again after retry')
-    await waitFor(() => attention(followupTexts).length === 2, 8000, 'second ping after re-block')
+    await waitFor(() => attention(noticeTexts).length === 2, 8000, 'second ping after re-block')
 
     // An unchanged set must stay silent: force a flush with nothing new waiting.
     ;(SwarmService.prototype as unknown as { flushHumanWaiting: (runId: string) => void })
       .flushHumanWaiting.call(service, dispatched.runId)
     await new Promise((resolve) => setTimeout(resolve, 300))
-    expect(attention(followupTexts).length).toBe(2)
+    expect(attention(noticeTexts).length).toBe(2)
   }, 40000)
 
   it('stays silent when notifyDispatchSession is false', async () => {
-    const { service, dir, followupTexts } = await bootWithInbox({ notifyDispatchSession: false })
+    const { service, dir, noticeTexts } = await bootWithInbox({ notifyDispatchSession: false })
     const dispatched = service.dispatch({
       title: 'silent demo',
       spec: 's',
@@ -3031,7 +3199,7 @@ describe('B2: human-attention notification to the dispatching session', () => {
     await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'blocked but silent')
     // Well past the coalescing window.
     await new Promise((resolve) => setTimeout(resolve, 2500))
-    expect(attention(followupTexts).length).toBe(0)
+    expect(attention(noticeTexts).length).toBe(0)
   }, 30000)
 })
 

@@ -65,6 +65,15 @@ This plugin takes the coordination seriously so you don't have to:
 
 > ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** unless your host has headroom for more - the global cap defaults to 100 in-process agents, which suits a large machine. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` in the Runtime settings.
 
+### Notices reach the running chat (0.6.32)
+
+Swarm notices — the run result and the "waiting on a human" attention ping — now reach the dispatching chat *while its turn is still running*, instead of sitting in the input queue until that turn ends.
+
+- The plugin reads the dispatching session's live status and picks the channel: **idle → one ordinary turn**, **busy → `steer`**, which the running turn consumes at its next step. A mid-turn `followup` is claimed only after the running turn fully ends, and a turn that ends by abort replays only a latched wake — production left a completed-run notice parked behind the dispatch turn until a human clicked **Steer**.
+- A host without `steer` gets the no-wake `inject` fallback, and a host that cannot report status keeps `followup`, so older DSH versions still receive every notice.
+- Notices are attributed as plugin **notices**, not user messages: they render as a collapsed `dsh-swarm-orchestrator` row with a one-line summary, and they are no longer mistaken for human authorization by goal, skill-scan or wake-budget policy. Their producer-owned source kind is `plugin:dsh-swarm-orchestrator`, matching migrated historical notices; the retired `{ kind: 'plugin', plugin: 'dsh-swarm-orchestrator' }` wrapper is rejected by native V4 session persistence.
+- The same routing covers the human-attention ping, so a decision that needs you surfaces during the run rather than after it.
+
 ### Hardening and Flow updates (0.6.31)
 
 This release adds lifecycle, admission and persistence safeguards, plus a readable, left-aligned Flow view.
@@ -278,7 +287,7 @@ Written plainly, because a limit you discover in production costs far more than 
 
 ## Status
 
-**0.6.31 includes lifecycle hardening and readable, left-aligned Flow.** Type checking and the host/client build pass; the full suite passes **601 tests across 32 files**, covering dispatch, authority, admission, persistence, lifecycle, recovery, routing, review gates, notifications, transport, settings and client rendering. Tests use fake subagents and isolated storage; deployment-dependent assertions can skip when their prerequisites are absent. Ten additional isolated headless Chrome checks passed for Flow geometry and interactions before the subsequent left-alignment revision. This is not a claim of verification against the operator's authenticated GUI or production mutation.
+**0.6.32 delivers swarm notices to a running dispatch turn on the status-aware channel, with honest plugin provenance; 0.6.31's lifecycle hardening and readable, left-aligned Flow remain.** Type checking and the host/client build pass; the full suite passes **605 tests across 32 files**, covering dispatch, authority, admission, persistence, lifecycle, recovery, routing, review gates, notifications, transport, settings and client rendering. Tests use fake subagents and isolated storage; deployment-dependent assertions can skip when their prerequisites are absent. Ten additional isolated headless Chrome checks passed for Flow geometry and interactions before the subsequent left-alignment revision. This is not a claim of verification against the operator's authenticated GUI or production mutation.
 
 ## License
 
