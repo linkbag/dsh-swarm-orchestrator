@@ -4,6 +4,16 @@ import { registerSwarmCommand } from './command.js'
 import { registerSwarmRoutes } from './routes.js'
 import { SwarmService } from './service.js'
 import { registerSwarmTools } from './tools/index.js'
+import { structuredFailure } from './failures.js'
+import type { RequestSettlement } from './request-ledger.js'
+
+export * from './work-items.js'
+export { EventWorkItemCheckpoints } from './work-item-store.js'
+export { HARDENING_CAPABILITIES } from './capabilities.js'
+export { RequestLedger, validateRequestBudget } from './request-ledger.js'
+export type { RequestAttribution, RequestBudget, RequestRoute, RequestSettlement, RequestLedgerSummary } from './request-ledger.js'
+export { DEFAULT_POLICY, taskPolicy, validatePolicy } from './policy.js'
+export type { TaskPolicy, TaskPolicyOverride } from './policy.js'
 
 export const name = 'dsh-swarm-orchestrator'
 export { Config, PLUGIN_VERSION }
@@ -85,6 +95,48 @@ export function apply(ctx: Context, config: SwarmConfig) {
       return unpinned
     })
   })
+
+  // One retry owner for policy-aware task/review children. Prepend so the
+  // host's normal/always retry hook cannot swallow permanent errors first.
+  // Unknown/unowned sessions retain the host's own policy unchanged.
+  ctx.effect(() => ctx.on('agent/request-error', async (payload, next) => {
+    const id = String(payload.agent.id)
+    const parent = payload.agent.session.header.origin === 'subagent' ? payload.agent.session.header.parentSession : undefined
+    const parentId = parent !== undefined ? String(parent) : undefined
+    service.recordChildFailure(id, payload.failure, payload.signal.aborted, parentId)
+    if (service.ownsRetryForChild(id, parentId)) return undefined
+    return next()
+  }, { prepend: true }))
+
+  // One durable reservation/send per observed provider-attempt stream. This is
+  // NOT certification of SDK/wire retries, unowned auxiliaries or descendants.
+  ctx.effect(() => ctx.on('llm/stream', async function* (options, next) {
+    const observed = service.beginObservedRequest(options.sessionId !== undefined ? String(options.sessionId) : undefined, { provider: options.provider, model: options.model, ...(options.purpose !== undefined ? { purpose: options.purpose } : {}) })
+    if (observed === undefined) { yield* next(); return }
+    const settlement: RequestSettlement = {}
+    let finished = false
+    try {
+      for await (const chunk of next()) {
+        if (chunk.type === 'usage') settlement.usage = chunk.usage
+        if (chunk.type === 'finish') {
+          finished = true
+          if (chunk.reason.kind === 'error' || chunk.reason.kind === 'aborted') {
+            const failure = chunk.reason.failure
+            settlement.failure = { code: failure.code, ...(failure.status !== undefined ? { status: failure.status } : {}), ...(failure.requestId !== undefined ? { requestId: String(failure.requestId) } : {}) }
+            if (chunk.reason.kind === 'aborted') settlement.cancelled = true
+          }
+        }
+        yield chunk
+      }
+    } catch (error) {
+      const failure = structuredFailure(error)
+      settlement.failure = { code: failure?.code ?? 'UNKNOWN', ...(failure?.status !== undefined ? { status: failure.status } : {}) }
+      throw error
+    } finally {
+      if (options.signal?.aborted || !finished) settlement.cancelled = true
+      observed.settle(settlement)
+    }
+  }, { prepend: true }))
 
   // Web GUI data bridge (GET /swarm/board, POST /swarm/action) — web profiles only.
   ctx.effect(() => wireWhenAvailable(ctx, 'webServer', () => registerSwarmRoutes(ctx, service)))

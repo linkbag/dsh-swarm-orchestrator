@@ -4,3 +4,6 @@ lib/
 .DS_Store
 
 dsh-swarm-orchestrator-*.tgz
+
+# Persistent DSH file-backend guard artifacts, not project source.
+.dsh-ops-update-*.lock

@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Run, Task, TaskEvidence } from '../domain/types.js'
 import type { RoleConfig } from '../domain/types.js'
+import { classifyLlmFailure, structuredFailure, type ClassifiedFailure } from '../failures.js'
+import { taskPolicy } from '../policy.js'
 
 /** Extra spawn context: retry-resume hints (A4) and the evidence contract (J2). */
 export interface PromptContext {
@@ -53,7 +55,7 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context:
       : 'This task has no dependencies; other tasks run in parallel — never touch their scope.',
     '',
     ...(task.writes !== undefined && task.writes.length > 0
-      ? [`Exclusive write scope: ${task.writes.join(', ')} — do not modify files outside this list.`]
+      ? [`Advisory write scope (not a filesystem lock): ${task.writes.join(', ')} — do not modify files outside this list.`]
       : []),
     ...(context.planPath !== undefined
       ? [`The refined plan of record for THIS run is \`${context.planPath}\` in the workspace root. Read that exact artifact, not a sibling run's PLAN-* file; explain any deviation in your summary.`]
@@ -67,7 +69,8 @@ export function buildTaskPrompt(run: Run, task: Task, role: RoleConfig, context:
     ...(context.evidence !== undefined
       ? [
           '',
-          '## Evidence contract (commands must pass; file checks produce advisory warnings)',
+          `## Evidence contract (commands must pass; artifact checks are ${taskPolicy(run, task).evidence})`,
+          ...(context.evidence.artifacts ?? []).map((contract) => `- Structural artifact contract: ${JSON.stringify(contract)}`),
           ...(context.evidence.files ?? []).map((f) => `- Expected artifact exists and is non-empty: \`${f}\` (relative to the workspace)`),
           ...(context.evidence.commands ?? []).map((c) => `- Command exits 0: \`${c}\``),
           // Observed live (w0-baseline-contracts, 2026-09-26): the agent reported done
@@ -250,6 +253,7 @@ export interface SpawnOutcome {
   provider?: string
   model?: string
   childSessionId?: string
+  failure?: ClassifiedFailure
 }
 
 export interface SpawnDeps {
@@ -333,6 +337,9 @@ export async function spawnTaskAgent(
      * its length and never touches the task's retry budget or the model chain.
      */
     effortRungs?: Array<string | undefined>
+    failureForChild?: (sessionId: string) => ClassifiedFailure | undefined
+    /** Replay compatibility only; new policy runs never infer effort from timing. */
+    legacyEffortHeuristic?: boolean
     /** A1: re-pin a retry child to the next rung (the service re-registers that child). */
     onEffortRung?: (childSessionId: string, effort: string) => void
   },
@@ -399,6 +406,8 @@ export async function spawnTaskAgent(
         })
       } catch (err) {
         lastReason = String(err instanceof Error ? err.message : err)
+        const failure = structuredFailure(err)
+        if (failure !== undefined && ['permanent', 'quota', 'cancelled', 'effort'].includes(failure.kind)) return { ok: false, reason: lastReason, failure }
         if (isModelUnavailableError(err)) {
           // The chain walk belongs to a full pass only: a single-candidate pass
           // (the effort retry) must never advance the A6 rotation.
@@ -407,7 +416,7 @@ export async function spawnTaskAgent(
           if (next !== undefined) continue
           return { ok: false, reason: `all model candidates unavailable (last: ${lastReason})` }
         }
-        return { ok: false, reason: lastReason }
+        return { ok: false, reason: lastReason, ...(failure !== undefined ? { failure } : {}) }
       }
 
       lastProvider = candidate.provider.length > 0 ? candidate.provider : undefined
@@ -434,10 +443,12 @@ export async function spawnTaskAgent(
         if (result.stopReason === 'completed') {
           return { ok: true, stopReason: result.stopReason, summary: summarizeOutput(result.output), finalText: outputText(result.output), provider: lastProvider, model: lastModel, childSessionId: run.id }
         }
-        lastFailureWasFast = outputText(result.output).length === 0 && Date.now() - startedAt < FAST_FAILURE_MS
-        return { ok: false, stopReason: result.stopReason, reason: result.diagnostic ?? `child stopped: ${result.stopReason}`, provider: lastProvider, model: lastModel, childSessionId: run.id }
+        const failure = opts.failureForChild?.(run.id) ?? (result.stopReason === 'aborted' ? classifyLlmFailure(undefined, true) : undefined)
+        lastFailureWasFast = opts.legacyEffortHeuristic === true && failure === undefined && outputText(result.output).length === 0 && Date.now() - startedAt < FAST_FAILURE_MS
+        return { ok: false, stopReason: result.stopReason, ...(failure !== undefined ? { failure } : {}), reason: result.diagnostic ?? failure?.code ?? `child stopped: ${result.stopReason}`, provider: lastProvider, model: lastModel, childSessionId: run.id }
       } catch (err) {
-        return { ok: false, reason: String(err instanceof Error ? err.message : err), provider: lastProvider, model: lastModel, childSessionId: run.id }
+        const failure = opts.failureForChild?.(run.id) ?? structuredFailure(err) ?? (opts.signal.aborted ? classifyLlmFailure(undefined, true) : undefined)
+        return { ok: false, reason: String(err instanceof Error ? err.message : err), ...(failure !== undefined ? { failure } : {}), provider: lastProvider, model: lastModel, childSessionId: run.id }
       } finally {
         if (abort !== undefined) opts.signal.removeEventListener('abort', abort)
         try { await dispose() }
@@ -448,15 +459,16 @@ export async function spawnTaskAgent(
     return { ok: false, reason: lastReason, provider: lastProvider, model: lastModel }
   }
 
+  const effortMismatch = (outcome: SpawnOutcome): boolean => outcome.failure !== undefined ? outcome.failure.kind === 'effort' : isUnsupportedEffortError(outcome.reason)
   const first = await runPass(undefined, undefined, true)
   const firstWasFast = lastFailureWasFast
   const failedCandidate = chain.find((candidate) => candidate.provider === first.provider && candidate.model === first.model) ?? chain[0]
   // Legacy callers without a ladder get one bounded no-pin pass. A configured
   // ladder must run its lower rungs FIRST; do not prematurely drop the pin.
-  if (!first.ok && (opts.effortRungs?.length ?? 0) === 0 && isUnsupportedEffortError(first.reason)) {
+  if (!first.ok && (opts.effortRungs?.length ?? 0) === 0 && effortMismatch(first)) {
     lastReason = first.reason ?? lastReason
     const retry = await runPass(undefined)
-    if (retry.ok || !isUnsupportedEffortError(retry.reason)) return retry
+    if (retry.ok || !effortMismatch(retry)) return retry
   }
   // A1: effort varies fastest — before the model chain. When the first pass
   // failed in a way that smells like the PIN rather than the model (the provider
@@ -470,13 +482,13 @@ export async function spawnTaskAgent(
   // longer effort-suspect (that is a genuine model failure, which is the model
   // chain's business).
   const rungQueue = opts.effortRungs ?? []
-  if (!first.ok && rungQueue.length > 0 && chain.length > 0 && (isUnsupportedEffortError(first.reason) || firstWasFast)) {
+  if (!first.ok && rungQueue.length > 0 && chain.length > 0 && (effortMismatch(first) || firstWasFast)) {
     let last: SpawnOutcome = first
     for (const rung of rungQueue) {
       last = await runPass(rung, failedCandidate)
       if (last.ok) return last
       lastReason = last.reason ?? lastReason
-      if (!(isUnsupportedEffortError(last.reason) || lastFailureWasFast)) return last
+      if (!(effortMismatch(last) || lastFailureWasFast)) return last
     }
     return last
   }

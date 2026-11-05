@@ -2,6 +2,19 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.33 — reviewed hardening plan
+
+- Keep physical task ownership through child/Shell drain at every replacement, dependent, review and recovery path. Restore persisted reviews idempotently; commit builder completion with acceptance-pending before releasing ownership. Terminal run notices wait for drain.
+- Persist policy v1 for new runs, with monotone run-policy floors and separate execution/artifact/acceptance/provenance states. Required artifacts hold; warn/strict/off review are explicit. Strict failures park for human intervention rather than silently approve or fail the entire run. Old policy-absent histories retain their original meaning.
+- Validate bounded structural artifacts and retain byte identity even for readable invalid content. Bind review and destructive task decisions to displayed observations, reject stale decisions, consume review episodes once, and journal decision identity/actor/reason. Required/strict external completion cannot bypass acceptance.
+- Prefer typed failure information over timing/diagnostics, select a single task retry owner ahead of native retry middleware, persist bounded Retry-After plus jitter, and hold permanent/quota errors. Add a persisted, heartbeat-independent `maxAttemptSeconds` model-work ceiling shared with review (default 3600, 0 disables), not a certified spend cap or semantic-progress validator.
+- Add meaningful cursor waits, immediate final/abort handling, terminal/drained/any-final modes and bounded output. Heartbeat-only activity no longer wakes default supervision.
+- Acquire non-expiring cooperating-writer ownership before event loading/repair; retain it across durability rollback and async service drain; add explicit write-free replay snapshots. New protocol-3 writes prevent unsafe downgrade, preserving legacy/v2 bytes. Crash markers require proven manual recovery; no expiry/PID-based takeover or raw-writer/distributed fencing is claimed.
+- Journal observed provider-attempt reservations/sends/settlements via native `llm/stream`, retain unknown usage/cost, and gate advisory observed-request counts before adapter I/O. Expose capability/accounting metadata. Refuse all hard budgets and uncertified strict isolation rather than fabricate request coverage or read confinement.
+- Export deterministic-first per-item coordination and an existing-event-store CAS checkpoint adapter: immutable manifests, independent extraction/source-read branches, per-item joins, bounded corrections, explicit qualified holds and synthetic resume. No new scheduler, actual research rerun, qualified admission or filesystem isolation is implied.
+- Default tests isolate `DSH_HOME` and exclude deployment suites unless explicit exported fixtures are supplied. Add restored-mtime-resistant SHA-256 host/client build receipts. Source tests include fail-before lifecycle regressions, composed-hook proofs, storage process contention and golden legacy/new-policy replay.
+- First release of the hardening implementation. Deploying it to a running host still requires an intentional reload/restart plus an exclusive-storage upgrade check; tests and builds never touch a live host, the frozen research pilot, or S8 work.
+
 ## 0.6.32 — notices reach a busy dispatch turn
 
 - Deliver swarm notices on the channel the dispatching session's live status calls for: an idle owner gets one ordinary turn (`followup`), a busy one is `steer`ed so the notice is consumed at its **next step**. A mid-turn `followup` is claimed only once the running turn fully ends, and a turn that ends by abort/error replays only a *latched* wake — production left a completed-run notice sitting in the queue dock behind the dispatching turn until a human clicked Steer. `inject` is the no-wake fallback for a host without `steer`; an unknown status keeps `followup`, the always-delivered option on an older host.

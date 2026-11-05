@@ -1,5 +1,7 @@
 import type { Run, SwarmEventRecord, Task } from './types.js'
 import { validAuthority } from '../authority.js'
+import { taskPolicy, validatePolicy, type TaskPolicy } from '../policy.js'
+import { validateRequestBudget, type RequestBudget } from '../request-ledger.js'
 /** Folded, owned board state — plain JSON only, no live harness objects. */
 export interface SwarmState {
   runs: Map<string, Run>
@@ -19,14 +21,18 @@ export function taskKeyOf(task: Task): string {
   return taskKey(task.runId, task.id)
 }
 
-/** Whether every blocker of `task` is completed (tasks without blockers are always ready). */
+export function isAccepted(task: Task): boolean {
+  return task.status === 'completed' && (task.acceptanceState === undefined || task.acceptanceState === 'accepted')
+}
+
+/** Whether every blocker of `task` is accepted (legacy completed remains accepted). */
 export function isReady(state: SwarmState, task: Task): boolean {
   if (task.status !== 'pending' && task.status !== 'retrying') return false
   const run = state.runs.get(task.runId)
   if (run === undefined) return false
   for (const blocker of task.blockedBy ?? []) {
     const blockerTask = state.tasks.get(taskKey(task.runId, blocker))
-    if (blockerTask === undefined || blockerTask.status !== 'completed') return false
+    if (blockerTask === undefined || !isAccepted(blockerTask)) return false
   }
   return true
 }
@@ -79,6 +85,8 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       taskIds: [],
       stats: { fallbacks: 0, retries: 0, reviewsPassed: 0, reviewsRejected: 0, reviewsUnavailable: 0 },
     }
+    if (d.policy !== undefined) { validatePolicy(d.policy); run.policy = d.policy as unknown as TaskPolicy }
+    if (d.budget !== undefined) { validateRequestBudget(d.budget); run.budget = d.budget as unknown as RequestBudget }
     const dispatch = d.dispatch as Record<string, unknown> | undefined
     if (dispatch !== null && typeof dispatch === 'object') {
       const captured: Run['dispatch'] = {}
@@ -96,6 +104,7 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
     for (const spec of specs) {
       const id = typeof spec.id === 'string' ? spec.id : ''
       if (id.length === 0) continue
+      if (spec.policy !== undefined) validatePolicy(spec.policy, true)
       const key = taskKey(runId, id)
       const task: Task = {
         runId,
@@ -103,6 +112,8 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         subject: typeof spec.subject === 'string' ? spec.subject : id,
         description: typeof spec.description === 'string' ? spec.description : '',
         role: typeof spec.role === 'string' ? spec.role : 'builder',
+        ...(spec.policy !== undefined ? { policy: spec.policy as Task['policy'] } : {}),
+        ...(run.policy !== undefined ? { executionState: 'pending' as const, artifactState: 'unchecked' as const, acceptanceState: 'pending' as const } : {}),
         blockedBy: Array.isArray(spec.blockedBy) ? (spec.blockedBy as string[]) : undefined,
         reviewBy: typeof spec.reviewBy === 'string' ? spec.reviewBy : undefined,
         reviewGate: spec.reviewGate === 'human' ? 'human' : undefined,
@@ -188,6 +199,14 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       if (kind === 'task/completed' && task.status !== 'running' && task.status !== 'dispatching') return
       if (kind === 'task/reviewed' && task.status !== 'reviewing') return
     }
+    if (ownerRun?.policy !== undefined && d.source === 'operator') {
+      if (kind === 'task/completed' && (taskPolicy(ownerRun, task).evidence === 'required' || taskPolicy(ownerRun, task).review === 'strict')) return
+      if (kind === 'task/reviewed') {
+        const observed = d.observed as Record<string, unknown> | undefined
+        if (task.status !== 'reviewing' || task.humanReview !== true || task.attemptRevoked === true || observed === undefined
+          || observed.attemptId !== task.attemptId || observed.reviewEpisode !== task.reviewEpisode || observed.artifactDigest !== task.artifactDigest) return
+      }
+    }
     task.updatedAt = event.at
     if (ownerRun !== undefined) ownerRun.updatedAt = event.at
 
@@ -205,6 +224,15 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         delete task.fileWarnings
         delete task.evidenceOutcomes
         delete task.recovered
+        delete task.artifactDigest
+        delete task.reviewEpisode
+        delete task.retryNotBefore
+        if (ownerRun?.policy !== undefined) {
+          task.executionState = 'running'
+          task.artifactState = 'unchecked'
+          task.acceptanceState = 'pending'
+          delete task.provenance
+        }
         task.status = 'running'
         task.attempts += 1
         // J19: a new attempt becomes the one and only writer for this task.
@@ -212,6 +240,8 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         else delete task.attemptId
         // J22: the reference point for "was this report written by the live attempt?".
         task.attemptStartedAt = event.at
+        delete task.attemptDeadlineAt
+        if (ownerRun?.policy !== undefined && typeof d.attemptDeadlineAt === 'number' && Number.isSafeInteger(d.attemptDeadlineAt) && d.attemptDeadlineAt >= event.at) task.attemptDeadlineAt = d.attemptDeadlineAt
         // A fresh attempt is silent by definition: the previous attempt's note and
         // its timestamp must not feed this attempt's watchdog silence clock (that
         // carryover reclaimed a healthy 7-minute-old retry as "61 min silent").
@@ -272,10 +302,21 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         if (task.status === 'reviewing') task.status = 'running'
         break
       case 'task/completed':
+        if (ownerRun?.policy !== undefined && d.source === 'operator' && (taskPolicy(ownerRun, task).evidence === 'required' || taskPolicy(ownerRun, task).review === 'strict')) break
         // J19: a superseded attempt's success must not close the live task.
         if (staleAttempt(task, d)) break
         if (task.attemptProtocol === 2 && d.source !== 'operator' && task.status !== 'running' && task.status !== 'dispatching') break
         task.status = 'completed'
+        if (ownerRun?.policy !== undefined) {
+          task.executionState = 'succeeded'
+          task.artifactState = d.artifactState === 'invalid' ? 'invalid' : d.artifactState === 'valid' ? 'valid' : 'unchecked'
+          const configuredReview = taskPolicy(ownerRun, task).review
+          const requiredReview = d.source !== 'operator' && configuredReview !== 'off' && (configuredReview === 'strict' || task.reviewGate === 'human' || Boolean(task.reviewBy))
+          const requiredArtifactMissing = taskPolicy(ownerRun, task).evidence === 'required' && (d.artifactState !== 'valid' || typeof d.artifactDigest !== 'string' || !/^[a-f0-9]{64}$/.test(d.artifactDigest))
+          task.acceptanceState = requiredArtifactMissing ? 'held' : d.reviewPending === true || requiredReview ? 'pending' : 'accepted'
+          task.provenance = d.source === 'operator' ? 'external' : d.recovered === true ? 'recovered' : 'model'
+          if (typeof d.artifactDigest === 'string') task.artifactDigest = d.artifactDigest
+        }
         delete task.humanReview
         if (d.revokeAttempt === true) task.attemptRevoked = true
         if (Array.isArray(d.fileWarnings)) task.fileWarnings = d.fileWarnings.filter((v): v is string => typeof v === 'string')
@@ -292,10 +333,17 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         // whose retry is already making progress.
         if (staleAttempt(task, d)) break
         const retrying = d.retry === true
-        task.status = retrying ? 'retrying' : 'failed'
+        const humanHold = ownerRun?.policy !== undefined && d.humanHold === true
+        task.status = humanHold ? 'blocked' : retrying ? 'retrying' : 'failed'
+        if (retrying && typeof d.retryNotBefore === 'number' && Number.isSafeInteger(d.retryNotBefore) && d.retryNotBefore >= event.at) task.retryNotBefore = Math.max(task.retryNotBefore ?? 0, d.retryNotBefore)
+        if (ownerRun?.policy !== undefined) {
+          task.executionState = d.cancelled === true ? 'cancelled' : 'failed'
+          task.acceptanceState = humanHold ? 'held' : retrying ? 'pending' : 'rejected'
+        }
         if (task.attemptProtocol === 2) task.attemptRevoked = true
         delete task.humanReview
         task.lastNote = str('reason') ?? task.lastNote
+        if (humanHold) { task.blockedReason = task.lastNote; task.humanReview = true }
         if (retrying) {
           const runStats = state.runs.get(runId)?.stats
           if (runStats !== undefined) runStats.retries += 1
@@ -305,6 +353,16 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
       case 'task/blocked':
         if (task.attemptProtocol === 2) task.attemptRevoked = true
         task.status = 'blocked'
+        if (ownerRun?.policy !== undefined && d.acceptanceState === 'held') {
+          task.acceptanceState = 'held'
+          if (d.executionState === 'succeeded') task.executionState = 'succeeded'
+        }
+        if (ownerRun?.policy !== undefined && d.artifactState === 'invalid') {
+          task.executionState = d.executionState === 'succeeded' ? 'succeeded' : task.executionState
+          task.artifactState = 'invalid'
+          task.acceptanceState = 'held'
+          if (typeof d.artifactDigest === 'string') task.artifactDigest = d.artifactDigest
+        }
         task.blockedReason = str('reason')
         // A7: reuse the review gate's `human: true` flag (J7). A task blocked because
         // only a person can decide — the work is done but its evidence command keeps
@@ -322,6 +380,10 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         break
       case 'task/review-started':
         if (task.status === 'completed') task.status = 'reviewing'
+        if (ownerRun?.policy !== undefined) {
+          task.acceptanceState = 'pending'
+          task.reviewEpisode = str('reviewEpisode') ?? `review-${event.seq}`
+        }
         if (d.human === true) task.humanReview = true
         break
       case 'task/reviewed': {
@@ -329,6 +391,24 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         // on the current one.
         if (staleAttempt(task, d)) break
         if (task.attemptProtocol === 2 && d.source !== 'operator' && task.status !== 'reviewing') break
+        if (ownerRun?.policy !== undefined && d.source === 'operator') {
+          const observed = d.observed as Record<string, unknown> | undefined
+          if (observed === undefined || observed.attemptId !== task.attemptId || observed.reviewEpisode !== task.reviewEpisode || observed.artifactDigest !== task.artifactDigest) break
+        }
+        const strict = taskPolicy(ownerRun ?? {}, task).review === 'strict'
+        if (ownerRun?.policy !== undefined && strict && (!['approve', 'reject'].includes(str('verdict') ?? 'error') || d.exhausted === true)) {
+          task.status = 'reviewing'
+          task.acceptanceState = 'held'
+          task.humanReview = true
+          task.reviewEpisode = `review-${event.seq}`
+          task.reviewFeedback = str('feedback') ?? 'strict review requires a human decision'
+          task.reviewUnavailable = str('verdict') === 'error'
+          task.reviewExhausted = d.exhausted === true
+          if (typeof d.reviews === 'number') task.reviews = d.reviews
+          const stats = ownerRun.stats
+          if (stats !== undefined) { if (task.reviewUnavailable) stats.reviewsUnavailable += 1; else stats.reviewsRejected += 1 }
+          break
+        }
         delete task.humanReview
         if (task.attemptProtocol === 2) task.attemptRevoked = true
         const verdict = str('verdict') ?? 'error'
@@ -337,10 +417,12 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
         const runStats = state.runs.get(runId)?.stats
         if (verdict === 'approve') {
           task.status = 'completed'
+          if (ownerRun?.policy !== undefined) task.acceptanceState = 'accepted'
           task.reviewed = true
           if (runStats !== undefined) runStats.reviewsPassed += 1
         } else if (verdict === 'reject') {
           task.reviewed = true
+          if (ownerRun?.policy !== undefined) task.acceptanceState = d.exhausted === true ? 'accepted' : 'rejected'
           if (d.exhausted === true) {
             task.status = 'completed'
             task.reviewExhausted = true
@@ -356,6 +438,7 @@ function apply(state: SwarmState, event: SwarmEventRecord): void {
           // `reviewsPassed` unchanged, so a silently skipped review used to be
           // indistinguishable from a clean pass in the run report.
           task.status = 'completed'
+          if (ownerRun?.policy !== undefined) task.acceptanceState = 'accepted'
           task.reviewed = false
           task.reviewUnavailable = true
           task.reviewFeedback = `review unavailable: ${feedback ?? 'unknown reason'}`

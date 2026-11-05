@@ -36,6 +36,13 @@ export interface BoardTask {
   agent?: { label: string; provider?: string; model?: string; effort?: string; requestedEffort?: string }
   reviewerAgent?: { label: string; provider?: string; model?: string; effort?: string; requestedEffort?: string }
   attemptRevoked?: boolean
+  attemptId?: string
+  reviewEpisode?: string
+  artifactDigest?: string
+  executionState?: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  artifactState?: 'unchecked' | 'valid' | 'invalid'
+  acceptanceState?: 'pending' | 'accepted' | 'rejected' | 'held'
+  provenance?: 'model' | 'recovered' | 'external' | 'deterministic-fallback'
   reviewGate?: 'agent' | 'human'
   reviewQueueInfo?: Record<string, unknown>
   fileWarnings?: string[]
@@ -139,6 +146,8 @@ export interface BoardActionBody {
   /** A8: set-run-board-state — the three board presentations. */
   state?: BoardRunState
   verdict?: string
+  observed?: { attemptId?: string; reviewEpisode?: string; artifactDigest?: string }
+  taskObserved?: { attemptId?: string; status: string; attemptRevoked?: boolean }
 }
 
 export type BoardSyncState = 'connecting' | 'live' | 'catching-up' | 'reconnecting' | 'snapshot' | 'stopped'

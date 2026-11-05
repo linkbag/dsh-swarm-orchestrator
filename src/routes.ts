@@ -210,26 +210,48 @@ function actionText(value: unknown, name: string, max: number, optional = false)
   return value
 }
 
-function performAction(service: SwarmService, body: Record<string, unknown>): unknown {
+function performAction(service: SwarmService, body: Record<string, unknown>, actorId?: string): unknown {
   const action = actionText(body.action, 'action', 64)
   // Validate only the identifiers an action uses, before any service mutation.
   const run = (): string => identifier(body.runId, 'runId')
   const task = (): string => identifier(body.taskId, 'taskId')
+  let taskObserved: { attemptId?: string; status: string; attemptRevoked?: boolean } | undefined
+  if (body.taskObserved !== undefined) {
+    if (!isPlainRecord(body.taskObserved)) throw new HttpError(400, 'invalid task observation')
+    const raw = body.taskObserved
+    if (raw.attemptRevoked !== undefined && typeof raw.attemptRevoked !== 'boolean') throw new HttpError(400, 'invalid observed revocation')
+    taskObserved = { status: actionText(raw.status, 'status', 32), ...(raw.attemptId !== undefined ? { attemptId: actionText(raw.attemptId, 'attemptId', 128) } : {}), ...(raw.attemptRevoked !== undefined ? { attemptRevoked: raw.attemptRevoked as boolean } : {}) }
+  }
   switch (action) {
     case 'endorse': { const runId = run(); service.endorse(runId); return { ok: true, action, runId } }
     case 'abort': { const runId = run(); service.abort(runId); return { ok: true, action, runId } }
     case 'resume': { const runId = run(); service.resumeRun(runId); return { ok: true, action, runId } }
-    case 'retry-task': { const runId = run(); const taskId = task(); service.retryTask(runId, taskId); return { ok: true, action, runId, taskId } }
-    case 'interrupt-task': { const runId = run(); const taskId = task(); service.interruptTask(runId, taskId, undefined); return { ok: true, action, runId, taskId } }
+    case 'retry-task': { const runId = run(); const taskId = task(); if (taskObserved === undefined) service.retryTask(runId, taskId); else service.retryTask(runId, taskId, undefined, taskObserved, actorId); return { ok: true, action, runId, taskId } }
+    case 'interrupt-task': { const runId = run(); const taskId = task(); if (taskObserved === undefined) service.interruptTask(runId, taskId, undefined); else service.interruptTask(runId, taskId, undefined, taskObserved, actorId); return { ok: true, action, runId, taskId } }
     case 'complete-task': {
       const runId = run(); const taskId = task()
-      service.completeTaskExternally(runId, taskId, undefined, actionText(body.summary, 'summary', 32768, true))
+      const summary = actionText(body.summary, 'summary', 32768, true)
+      if (taskObserved === undefined) service.completeTaskExternally(runId, taskId, undefined, summary)
+      else service.completeTaskExternally(runId, taskId, undefined, summary, taskObserved, actorId)
       return { ok: true, action, runId, taskId }
     }
     case 'review': {
       const runId = run(); const taskId = task(); const verdict = body.verdict
       if (verdict !== 'approve' && verdict !== 'reject') throw new HttpError(400, 'verdict must be approve or reject')
-      service.review(runId, taskId, verdict)
+      let observed: { attemptId: string; reviewEpisode: string; artifactDigest: string } | undefined
+      if (body.observed !== undefined) {
+        if (!isPlainRecord(body.observed)) throw new HttpError(400, 'observed must be a review observation')
+        observed = {
+          attemptId: actionText(body.observed.attemptId, 'attemptId', 128),
+          reviewEpisode: actionText(body.observed.reviewEpisode, 'reviewEpisode', 128),
+          artifactDigest: actionText(body.observed.artifactDigest, 'artifactDigest', 128),
+        }
+      }
+      try { if (observed === undefined) service.review(runId, taskId, verdict); else service.review(runId, taskId, verdict, observed, actorId) }
+      catch (error) {
+        if (error instanceof Error && /stale or missing review observation|review artifacts/.test(error.message)) throw new HttpError(409, error.message)
+        throw error
+      }
       return { ok: true, action, runId, taskId, verdict }
     }
     case 'set-duty-table': {
@@ -269,6 +291,7 @@ export function registerSwarmRoutes(ctx: Context, service: SwarmService): (() =>
     path: '/swarm',
     async handler(req, res) {
       // Authenticate before parsing even the URL, let alone JSON, SSE or data.
+      let actorId = 'authenticated-dashboard'
       try {
         const connection = ctx.get('connection') as unknown as ConnectionLike | undefined
         if (connection === undefined || typeof connection.admit !== 'function') {
@@ -279,6 +302,8 @@ export function registerSwarmRoutes(ctx: Context, service: SwarmService): (() =>
           sendJson(res, admission.rejection === 401 ? 401 : 403, { error: 'request refused' }, { connection: 'close' }); return
         }
         if (admission.peer === undefined || admission.peer === null) throw new Error('missing peer')
+        const id = typeof admission.peer === 'object' ? (admission.peer as { id?: unknown }).id : undefined
+        if (typeof id === 'string' && id.length <= 128) actorId = 'peer:' + id
       } catch {
         sendJson(res, 503, { error: 'connection admission unavailable' }, { connection: 'close' }); return
       }
@@ -312,10 +337,10 @@ export function registerSwarmRoutes(ctx: Context, service: SwarmService): (() =>
             openBoardStream(req, res, service, streams); return
           case '/swarm/action':
             requireJson(req)
-            sendJson(res, 200, performAction(service, await readJsonBody(req))); return
+            sendJson(res, 200, performAction(service, await readJsonBody(req), actorId)); return
         }
       } catch (error) {
-        sendJson(res, error instanceof HttpError ? error.status : 400, {
+        sendJson(res, error instanceof HttpError ? error.status : error instanceof Error && /stale or missing task observation/.test(error.message) ? 409 : 400, {
           error: String(error instanceof Error ? error.message : error).slice(0, 2048),
         }, { connection: 'close' })
       }

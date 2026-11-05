@@ -8,16 +8,25 @@ vi.mock('node:fs', async (original) => ({ ...await original<typeof import('node:
 
 const PREFIX = 'swarm-hardening-storage-events-'
 const cleanups: string[] = []
+const stores = new Set<EventStore>()
+function openStore(file: string, readOnly = false): EventStore {
+  const store = new EventStore(file, { readOnly })
+  stores.add(store)
+  return store
+}
 function tempStore(): { store: EventStore; dir: string; file: string } {
   const dir = fs.mkdtempSync(join(tmpdir(), PREFIX))
   cleanups.push(dir)
   const file = join(dir, 'events.jsonl')
-  return { store: new EventStore(file), dir, file }
+  let store: EventStore | undefined
+  return { get store() { return store ??= openStore(file) }, dir, file }
 }
 const line = (seq: number): string => JSON.stringify({ seq, at: 1, kind: 'test/event' })
 
 afterEach(() => {
   vi.restoreAllMocks()
+  for (const store of stores) store.close()
+  stores.clear()
   for (const dir of cleanups.splice(0)) {
     expect(dir.startsWith(join(tmpdir(), PREFIX))).toBe(true)
     fs.rmSync(dir, { recursive: true, force: true })
@@ -29,7 +38,8 @@ describe('event store', () => {
     const { store, file } = tempStore()
     expect(store.append('run/created', { runId: 'run-1', data: { title: 't' } }).seq).toBe(1)
     expect(store.append('task/started', { runId: 'run-1', taskId: 'a' }).seq).toBe(2)
-    const reopened = new EventStore(file)
+    store.close()
+    const reopened = openStore(file)
     expect(reopened.all()).toHaveLength(2)
     expect(reopened.seq).toBe(2)
     expect(reopened.append('task/completed', { runId: 'run-1', taskId: 'a' }).seq).toBe(3)
@@ -51,27 +61,27 @@ describe('event store', () => {
     const partial = '{"seq":2,"at":1,"kind":"task'
     fs.writeFileSync(file, line(1) + '\n' + partial)
     vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const reopened = new EventStore(file)
+    const reopened = openStore(file)
     expect(reopened.seq).toBe(1)
     expect(reopened.diagnostics[0]).toMatch(/repaired incomplete event tail/)
     const quarantine = fs.readdirSync(dir).find((name) => name.includes('.corrupt-tail-'))!
     expect(fs.readFileSync(join(dir, quarantine), 'utf8')).toBe(partial)
     expect(fs.readFileSync(file, 'utf8')).toBe(line(1) + '\n')
     expect(reopened.append('task/completed').seq).toBe(2)
-    const again = new EventStore(file)
+    const again = openStore(file, true)
     expect(again.all().map((event) => event.seq)).toEqual([1, 2])
   })
 
   it('preserves a complete valid no-newline EOF record and separates the next append', () => {
     const { file, dir } = tempStore()
     fs.writeFileSync(file, line(1))
-    const reopened = new EventStore(file)
+    const reopened = openStore(file)
     expect(reopened.all()).toHaveLength(1)
     expect(fs.readFileSync(file, 'utf8')).toBe(line(1))
-    expect(fs.readdirSync(dir)).toEqual(['events.jsonl'])
+    expect(fs.readdirSync(dir).sort()).toEqual(['events.jsonl', 'events.jsonl.owner'])
     reopened.append('task/started')
     expect(fs.readFileSync(file, 'utf8').startsWith(line(1) + '\n')).toBe(true)
-    expect(new EventStore(file).all()).toHaveLength(2)
+    expect(openStore(file, true).all()).toHaveLength(2)
   })
 
   it.each([
@@ -83,7 +93,7 @@ describe('event store', () => {
   ])('surfaces complete/interior corruption without modifying source bytes', (raw, number) => {
     const { file, dir } = tempStore()
     fs.writeFileSync(file, raw)
-    expect(() => new EventStore(file)).toThrow(new RegExp(`corrupt event store .* at line ${number}`))
+    expect(() => openStore(file)).toThrow(new RegExp(`corrupt event store .* at line ${number}`))
     expect(fs.readFileSync(file, 'utf8')).toBe(raw)
     expect(fs.readdirSync(dir)).toEqual(['events.jsonl'])
   })
@@ -93,15 +103,15 @@ describe('event store', () => {
     const raw = line(1) + '\n' + JSON.stringify({ seq: 1, at: 2, kind: 'run/endorsed' }) + '\n' + JSON.stringify({ seq: 2, at: 3, kind: 'task/started' }) + '\n'
     fs.writeFileSync(file, raw)
     vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const replay = new EventStore(file)
+    const replay = openStore(file)
     expect(replay.all().map((event) => [event.seq, event.storedSeq])).toEqual([[1, undefined], [2, 1], [3, 2]])
     expect(replay.diagnostics[0]).toContain('original storedSeq values and source bytes preserved')
     expect(fs.readFileSync(file, 'utf8')).toBe(raw)
     const committed = replay.append('run/completed')
     expect(committed.seq).toBe(4)
-    expect(committed.storeVersion).toBe(2)
+    expect(committed.storeVersion).toBe(3)
     expect(fs.readFileSync(file, 'utf8').startsWith(raw)).toBe(true)
-    const reopened = new EventStore(file)
+    const reopened = openStore(file, true)
     expect(reopened.all()).toEqual(replay.all())
     expect(reopened.seq).toBe(4)
   })
@@ -109,16 +119,17 @@ describe('event store', () => {
   it.each([true, false])('refuses sequence resets after strict format starts, including mixed old writers (%s)', (marked) => {
     const { store, file } = tempStore()
     store.append('run/created')
+    store.close()
     fs.appendFileSync(file, JSON.stringify({ seq: 1, at: 2, kind: 'run/endorsed', ...(marked ? { storeVersion: 2 } : {}) }) + '\n')
     const before = fs.readFileSync(file, 'utf8')
-    expect(() => new EventStore(file)).toThrow(/non-increasing sequence/)
+    expect(() => openStore(file)).toThrow(/non-increasing sequence/)
     expect(fs.readFileSync(file, 'utf8')).toBe(before)
   })
 
   it('makes storage read failures visible', () => {
     const { file } = tempStore()
     vi.spyOn(fs, 'readFileSync').mockImplementationOnce(() => { throw Object.assign(new Error('injected read failure'), { code: 'EACCES' }) })
-    expect(() => new EventStore(file)).toThrow(/cannot read event store .*injected read failure/)
+    expect(() => openStore(file)).toThrow(/cannot read event store .*injected read failure/)
   })
 
   it('does not commit sequence or notify when append fails', () => {
@@ -132,7 +143,7 @@ describe('event store', () => {
     expect(store.all()).toHaveLength(1)
     expect(seen).not.toHaveBeenCalled()
     expect(store.append('task/completed').seq).toBe(2)
-    expect(new EventStore(file).all().map((event) => event.seq)).toEqual([1, 2])
+    expect(openStore(file, true).all().map((event) => event.seq)).toEqual([1, 2])
   })
 
   it('rolls back a short write and an fsync failure so the same store can retry', () => {
@@ -149,7 +160,7 @@ describe('event store', () => {
     expect(() => store.append('task/started')).toThrow(/fsync failure/)
     expect(fs.readFileSync(file, 'utf8')).toBe(before)
     expect(store.append('task/completed').seq).toBe(2)
-    expect(new EventStore(file).all()).toHaveLength(2)
+    expect(openStore(file, true).all()).toHaveLength(2)
   })
 
   it('contains a throwing listener and still publishes to the next observer', () => {
@@ -161,7 +172,7 @@ describe('event store', () => {
     expect(() => store.append('run/created')).not.toThrow()
     expect(seen).toHaveBeenCalledOnce()
     expect(store.seq).toBe(1)
-    expect(new EventStore(file).seq).toBe(1)
+    expect(openStore(file, true).seq).toBe(1)
     expect(store.diagnostics[0]).toMatch(/observer failure/)
   })
 
@@ -199,7 +210,8 @@ describe('event store', () => {
     expect(() => store.append('task/completed')).toThrow(/needs reload/)
     expect(append).toHaveBeenCalledOnce()
     vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const reloaded = new EventStore(file)
+    store.close()
+    const reloaded = openStore(file)
     expect(reloaded.seq).toBe(1)
     expect(reloaded.append('task/completed').seq).toBe(2)
   })

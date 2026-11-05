@@ -28,7 +28,7 @@ It has already shipped real work: the first production run reverse-engineered a 
     ┌──────┼──────┐
     ▼      ▼      ▼
  builder builder builder    ▸ parallel wave — one model per role,
-    │      │      │           fallback chains, exclusive write scopes
+    │      │      │           fallback chains, advisory write scopes
     ▼      ▼      ▼
  reviewer reviewer (human)   ▸ rejections loop back with feedback;
     └──────┼──────┘            `reviewGate: "human"` parks it on you
@@ -60,17 +60,57 @@ This plugin takes the coordination seriously so you don't have to:
 - **One run per goal, reviewed before built.** Dispatching into a workspace with an active run raises a warning (or a block, your choice); and unless you opt out, an architect agent reviews the dispatcher's plan into PLAN.md before any builder starts.
 - **Shared concurrency budget.** Swarm agents run in-process on the DSH host, sharing its Node.js heap. A global cap (`maxTotalConcurrentAgents`, default 100) shares the budget across runs and counts cancelling holders until cleanup. Choose a much lower cap on memory-constrained hosts; no fixed cap guarantees memory safety.
 - **Every agent stays on the board.** Task agents cannot spawn hidden sub-agents of their own (`maxSubagentDepth`, default 1). Without that bound an agent could delegate to helpers the dispatcher cannot see or account for — not counted by the global cap, not tracked by the watchdog, not shown on the board, yet all sharing the host heap. Measured on a real machine: one task spawned 12 such hidden helpers while the board showed a single task.
-- **Work outlives its agent.** Every task agent writes a small completion report as its final action. If the host restarts and kills an agent between finishing the work and being recorded, the dispatcher adopts the on-disk report instead of throwing the finished work away and re-running the task. A task can also never sit `dispatching` forever: `spawnTimeoutSeconds` arms a sliding no-progress window — it runs from creation, then every heartbeat re-arms it, so a working child is never killed for elapsed time while a child that never starts or goes silent is reclaimed (per-role override in the Roster).
-- **The right effort for the right model.** Before a child is spawned, the pinned reasoning effort is validated against the deployment's declared model capabilities: a model whose **declared** levels exclude the pin has it stripped, and the candidate chain is never filtered. A model that declares no levels at all is left alone — absence is unknown, and the adapter may resolve such a model through its installed catalog — so since 2026-09-26 the trade-off is the visible way round: no silent downgrade. A pin that is genuinely refused dies fast with no output, and the dispatcher retries the *same* model at the next rung of the effort ladder (`max` → `high` → … → no pin) before any model rotation — without spending the task's retry budget. Reviewer pins are validated the same way, and the preflight's once-only log line reports how many models rest on that uncertainty.
+- **Work outlives its agent.** Every task agent writes a small completion report as its final action. If the host restarts and kills an agent between finishing the work and being recorded, the dispatcher adopts the on-disk report instead of throwing the finished work away and re-running the task. A task can also never sit `dispatching` forever: `spawnTimeoutSeconds` arms a sliding no-progress window — it runs from creation, then every heartbeat re-arms it, so a silent child is reclaimed (per-role override in the Roster). New-policy model work also has the independent `maxAttemptSeconds` ceiling described above.
+- **The right effort for the right model.** Before a child is spawned, the pinned reasoning effort is validated against the deployment's declared model capabilities: a model whose **declared** levels exclude the pin has it stripped, and the candidate chain is never filtered. A model that declares no levels at all is left alone — absence is unknown, and the adapter may resolve such a model through its installed catalog — so since 2026-09-26 the trade-off is the visible way round: no silent downgrade. A typed unsupported-effort failure retries the *same* model at the next rung of the effort ladder (`max` → `high` → … → no pin) before any model rotation — without spending the task's retry budget. Reviewer pins are validated the same way, and the preflight's once-only log line reports how many models rest on that uncertainty.
 
 > ⚠️ **Running multiple swarms from different workspaces in parallel**: this is supported and safe with the global cap. However, be mindful that each swarm agent is an in-process session on the host. We recommend **max 2 concurrent runs** unless your host has headroom for more - the global cap defaults to 100 in-process agents, which suits a large machine. If you experience `ERR_CONNECTION_REFUSED` (host crash), lower `maxTotalConcurrentAgents` in the Runtime settings.
+
+### Reviewed hardening plan (0.6.33)
+
+This release implements the reviewed S0–S7 hardening plan. A rebuilt bundle or build receipt is not proof that an already-running host loaded it: deployment needs an intentional reload/restart and an exclusive-storage upgrade check.
+
+- **Physical ownership survives cancellation.** Same-task replacement, dependent readers, reviews and recovery wait for retained child/Shell holders to drain, even with spare capacity. Persisted reviews resume the same attempt once; builder success and acceptance-pending are committed together. A run cannot announce completion while its writers drain.
+- **Execution is not acceptance.** New runs persist policy version 1 and separate execution, artifact, acceptance and provenance states. Legacy policy-absent histories keep their historical advisory/fail-open meaning. Task overrides can strengthen, never weaken, the run policy.
+- **Evidence:** `advisory` (default) records file/structural warnings; `required` holds missing/invalid artifacts. Commands always require zero exit. Artifact contracts validate bounded regular files, JSON/JSONL/text/binary shape, own required keys, optional schema version, record count and SHA-256. Readable invalid bytes still have content identity. This is structural validation, not scientific/clinical approval or immutable publication.
+- **Review:** `warn` (default) labels unavailable/exhausted reviews without claiming approval; `strict` holds unavailable/malformed/exhausted review for a human; `off` explicitly skips review. Strict review without an assigned reviewer defaults to a human gate. Required/strict acceptance cannot be bypassed by external completion.
+- **Observed decisions:** review uses the displayed `attemptId`, `reviewEpisode` and `artifactDigest`; complete/interrupt/retry use the displayed `attemptId`, `status` and revocation flag. New-policy callers must send these observations. Stale decisions return HTTP 409 without mutation; durable decisions include an ID, authenticated actor label, reason and observed identity. Fetching a newer identity just before sending defeats stale-intent protection and is not supported UI behavior.
+- **Bounded model work:** typed auth/config/quota failures hold for intervention instead of model roulette. Owned child/reviewer errors use the task retry owner, ahead of native retry middleware; direct native parent lineage covers startup before child publication. Transient retry deadlines persist bounded provider Retry-After plus jitter. `maxAttemptSeconds` (profile config, default 3600, 0 disables, max 86400) adds a heartbeat-independent model-work ceiling for new-policy attempts, shared with review. It is not a semantic-progress validator or spend/token cap. Evidence commands retain their own timeout.
+- **Useful waits:** `swarm_wait` defaults to meaningful changes, not heartbeats. Supply `afterSeq` from the returned durable cursor to cover gaps; modes are `meaningful`, `any`, `terminal`, `drained`, and `any-final`. Already-final scopes and already-aborted waits return immediately. `maxChars` bounds text (default 8000, range 512–24000).
+- **Honest accounting:** known child provider attempts produce durable reserved/sent/settled records through the native `llm/stream` hook, including review and attributed auxiliary calls. Missing usage and cost remain unknown, never zero. `budget: { mode: "advisory", maxRequests: N }` gates observed run reservations before adapter I/O; token/cost limits are advisory only. Startup, untracked/descendant/revoked calls and SDK wire retries are not fully certified. **All hard budgets are refused.** Context token estimates are not billed-request accounting.
+- **Isolation:** `writes` remains advisory. Read confinement, OS-enforced scopes, descendant admission and scientific blinding are not certified. **`isolation: "strict"` is refused before dispatch or recovered launch** rather than silently falling back. Workflows, Agent Teams, CWD and a read-only tool mask do not supply that boundary.
+- **Per-item coordination:** exported `WorkItemCoordinator` and `EventWorkItemCheckpoints` support immutable hashed synthetic manifests, durable whole-record CAS, deterministic-first stages, independent extraction/source-reading branches and per-item joins, bounded correction, held failures and unknown accounting. They reuse the existing event authority, not a second scheduler. Callers still own worker execution, actual quiescence, source acquisition and qualified admission. No frozen research sample was rerun or clinically admitted.
+
+Example dispatch fields (not an instruction to execute):
+
+```json
+{
+  "policy": { "version": 1, "evidence": "required", "review": "strict", "isolation": "advisory" },
+  "tasks": [{
+    "id": "item", "subject": "Produce a structured artifact", "description": "Synthetic example", "role": "builder",
+    "reviewGate": "human",
+    "evidence": { "artifacts": [{ "path": "output/item.json", "format": "json", "schemaVersion": 1, "requiredKeys": ["schemaVersion", "result"], "maxBytes": 1048576 }] }
+  }]
+}
+```
+
+#### Storage upgrade and operational recovery
+
+A writable `EventStore` acquires a non-expiring exclusive-create `.owner` marker **before loading or torn-tail repair** and holds it through append/fsync/rollback and service drain. A second cooperating writer refuses to open; it never silently becomes a reader. `new EventStore(file, { readOnly: true })` is an explicit write-free replay snapshot, not a concurrent transaction or automatic tail repair.
+
+New appends use **store protocol 3**, so older readers refuse rather than silently ignore acceptance/budget semantics. Existing legacy/v2 records and original stored cursors are preserved, not rewritten. Back up quiescent storage before a deliberate upgrade; **do not downgrade a protocol-3 store to an older binary**. A crash leaves its marker: only an operator who has proved **all** old writers stopped may preserve the marker as incident evidence and perform manual recovery. PID age, heartbeat expiry and epochs are not permission to steal it. This coordinates cooperating local writers on an atomic-exclusive-create filesystem; it does not fence raw writers, marker deletion, namespace replacement or remote/distributed filesystems, nor promise directory-entry durability after power loss.
+
+#### Safe validation and deployment gate
+
+Default `npm test` uses an owned temporary `DSH_HOME` and excludes the two deployment suites. Opt-in suites require `DSH_SWARM_LIVE_TESTS=1` **and** explicit exported fixtures (`DSH_SWARM_LIVE_STORAGE`, `DSH_SWARM_LIVE_SETTINGS`); they do not fall back to operator storage. No active production session/log is a test fixture.
+
+`npm run build` emits a full SHA-256 input/output receipt in `lib/build-receipt.json`; the freshness test checks source bytes, generated outputs and toolchain, including restored-mtime edits. `npm run verify:build` also verifies the full receipt, compiled public exports and native tool registration without applying a Host or invoking tools. A standalone client build is explicitly client-only and cannot certify the host build. The next release/deployment still requires its own authorization, isolated upgrade/restart checks and confirmation of the loaded host/client revision. S8 research-pilot reruns, expansion and clinical acceptance remain separately gated.
 
 ### Notices reach the running chat (0.6.32)
 
 Swarm notices — the run result and the "waiting on a human" attention ping — now reach the dispatching chat *while its turn is still running*, instead of sitting in the input queue until that turn ends.
 
 - The plugin reads the dispatching session's live status and picks the channel: **idle → one ordinary turn**, **busy → `steer`**, which the running turn consumes at its next step. A mid-turn `followup` is claimed only after the running turn fully ends, and a turn that ends by abort replays only a latched wake — production left a completed-run notice parked behind the dispatch turn until a human clicked **Steer**.
-- A host without `steer` gets the no-wake `inject` fallback, and a host that cannot report status keeps `followup`, so older DSH versions still receive every notice.
+- A host without `steer` gets the no-wake `inject` fallback, and a host that cannot report status keeps `followup`, preserving legacy best-effort behavior. Missing sessions and delivery errors remain contained; delivery is not guaranteed.
 - Notices are attributed as plugin **notices**, not user messages: they render as a collapsed `dsh-swarm-orchestrator` row with a one-line summary, and they are no longer mistaken for human authorization by goal, skill-scan or wake-budget policy. Their producer-owned source kind is `plugin:dsh-swarm-orchestrator`, matching migrated historical notices; the retired `{ kind: 'plugin', plugin: 'dsh-swarm-orchestrator' }` wrapper is rejected by native V4 session persistence.
 - The same routing covers the human-attention ping, so a decision that needs you surfaces during the run rather than after it.
 
@@ -98,7 +138,7 @@ Diagnosed from 47 recorded runs / 184 task failures plus the incidents below, th
 - **Recovery is scoped to running runs.** Orphan recovery only requeues tasks whose run is still running, so a terminal run's tasks stay frozen instead of being re-failed on every host restart.
 - **Review verdicts are parsed from the complete final message** — the parser used to read a 2,000-character summary and fail every thorough review open. A reviewer that omits the verdict line now gets one explicit re-ask before failing open.
 - **Watchdog reclaims adopt finished work and arm the retry backoff.** A child that wrote its report moments before being reclaimed is credited, not failed — the old path stranded a run in `retrying` for seven hours. Orphan recovery re-arms stranded `retrying` tasks, and every fresh attempt starts with a clean silence clock.
-- **Liveness is progress-based, not elapsed-time.** The spawn ceiling is a sliding no-progress window re-armed by every heartbeat, with a per-role `spawnTimeoutSeconds` override in the Roster — a healthy child is never killed for running long.
+- **Heartbeat liveness is separate from bounded model work.** The historical sliding window re-arms on heartbeats (`spawnTimeoutSeconds`, with a per-role override); new-policy attempts also have the independent `maxAttemptSeconds` ceiling. Neither a heartbeat nor a clock proves semantic progress.
 - **The web client holds exactly one `/swarm/events` connection**, reference-counted and shared by the tab, the badge, the header popover and every dispatch card. It previously opened one stream per rendered dispatch card, exhausting the browser's ~6-connections-per-origin budget and freezing the whole UI while the host stayed healthy.
 - **An evidence-only failure no longer re-runs the work.** One command-only recheck, then the task parks for a human (`blocked` + human review). The recorded outcome carries the exit code, the timeout state, the elapsed time and an output tail — a green-but-nonzero suite is diagnosable from the event log.
 
@@ -208,13 +248,13 @@ or the one-shot form: `/swarm build a landing page for this project` (plans it, 
 | --- | --- |
 | `swarm_dispatch` | Submit a run: title, objective, task DAG (id / subject / description / role / blockedBy / reviewBy / reviewGate / model / evidence / writes). |
 | `swarm_status` | The board in text: runs, task states, models in use, latest notes. |
-| `swarm_wait` | Block until the board changes or a timeout hits — supervision without sleep-polling. |
-| `swarm_retry` | Requeue a failed/blocked task after you've fixed the cause (dispatching session only). |
+| `swarm_wait` | Wait on meaningful changes with a durable cursor, terminal/drained modes and bounded text; optional all-event mode. |
+| `swarm_retry` | Requeue a failed/blocked/held task using its observed identity after fixing the cause (dispatching session only). |
 | `swarm_interrupt` | Abort a stalled/running task and requeue it in the same run — no relief sibling needed (dispatching session only). |
 | `swarm_complete` | Mark a task completed when its work was finished outside the swarm (dispatching session only) — keeps the run record in sync with reality. |
 | `swarm_report` | Task agents post interim notes to the board (authenticated to their own task). |
 
-Tasks also accept an **evidence contract** — `evidence: { files: [...], commands: [...] }` — that is machine-checked before a task may close; a **write scope** — `writes: [files]` — that keeps concurrent builders out of each other's files (the dispatcher warns on overlap); and a **human review gate** that parks the verdict on the dashboard. A failing evidence command no longer re-runs the finished work: it gets one command-only recheck, and if the command still fails — non-zero exit or timeout (`evidenceTimeoutMs`, default 120 s) — the task parks on the board for a human verdict, with the exit code and an output tail recorded in the event log.
+Tasks also accept an **evidence contract** — `evidence: { files: [...], commands: [...], artifacts: [...] }` — whose file/structural enforcement follows the explicit policy above; an **advisory write scope** — `writes: [files]` — that warns about overlap but does not lock or intercept writes; and a **human review gate** that parks the verdict on the dashboard. A failing evidence command no longer re-runs the finished work: it gets one command-only recheck, and if the command still fails — non-zero exit or timeout (`evidenceTimeoutMs`, default 120 s) — the task parks on the board for a human verdict, with the exit code and an output tail recorded in the event log.
 
 ## Configuration
 
@@ -241,13 +281,14 @@ Everything has a default; override in your profile's `cordis.patch.yml`:
     circuitBreakerThreshold: 3  # failures in 30s before pausing all retries (0 = off)
     circuitBreakerCooldownMs: 60000  # circuit breaker pause duration
     spawnTimeoutSeconds: 3600   # sliding no-progress window per child, re-armed by heartbeats (0 = off)
+    maxAttemptSeconds: 3600     # new-policy model-work ceiling shared with review; heartbeats cannot renew (0 = off)
     maxSubagentDepth: 1         # delegation-depth cap for task agents (1 = no delegation)
     bootGraceSeconds: 3         # wait after plugin load before orphan recovery
 ```
 
 ## Runtime control
 
-All concurrency, hardening, and watchdog parameters are **tunable from the dashboard** — no YAML editing or restart needed. Open **Settings → AI Swarm → Runtime tuning** (or the **Roster tab → Runtime tuning**) and adjust:
+The runtime parameters listed below are **tunable from the dashboard**; the new `maxAttemptSeconds` ceiling is a profile configuration value, not a dashboard override. Those runtime updates need no YAML editing or restart. Open **Settings → AI Swarm → Runtime tuning** (or the **Roster tab → Runtime tuning**) and adjust:
 
 | Parameter | Default | What it controls |
 |---|---|---|
@@ -259,7 +300,7 @@ All concurrency, hardening, and watchdog parameters are **tunable from the dashb
 | Circuit breaker cooldown (ms) | 60000 | How long retries pause after the breaker trips |
 | Nudge after silence (min) | 20 | Board marker for silent tasks — 0 = off |
 | Stale timeout (sec) | 14400 | Last-resort reclaim for agents that go completely silent (4 hours) |
-| Spawn timeout (sec) | 3600 | Sliding no-progress window per child — re-armed by every heartbeat, so a working child is never killed for elapsed time; a child that never starts or goes silent is reclaimed (0 = off) |
+| Spawn timeout (sec) | 3600 | Heartbeat-renewed liveness window per child, independent of the new-policy model-work ceiling; silent/unstarted children are reclaimed (0 = off) |
 
 Changes are **applied immediately** (no restart) and **persisted to `runtime.json`** in the swarm storage directory, overriding the profile's `cordis.patch.yml` values. They survive host restarts.
 
@@ -277,8 +318,8 @@ Changes are **applied immediately** (no restart) and **persisted to `runtime.jso
 Written plainly, because a limit you discover in production costs far more than one you read here.
 
 - **The board reports disk truth, and the disk can lag the model.** A task agent may finish its work without performing every bookkeeping step the protocol asks of it (for example, writing its `.dsh-swarm/task-<id>.json` report). The board shows what was actually recorded, not what the agent claimed. Treat a task's summary as evidence of what was recorded, and verify deliverables yourself.
-- **Evidence contracts are advisory for files, hard for commands.** A missing or empty `evidence.files` entry becomes a board warning, not a completion block; only a failing `evidence.commands` entry blocks completion (after one command-only recheck, a persistent failure parks the task for a human rather than re-running the work). Scope control is therefore a completion-time audit, not write interception — nothing stops an agent from writing outside its declared `writes` scope; the dispatcher only warns about overlapping scopes at dispatch time.
-- **State is file-backed and serialised within one DSH process.** Concurrent processes editing the same workspace's swarm state are not coordinated. Run one host per workspace.
+- **Evidence contracts are advisory for files, hard for commands.** On advisory/legacy runs, a missing or empty `evidence.files` entry becomes a board warning; new `evidence: "required"` policy holds invalid files/structural artifacts, while a failing `evidence.commands` entry always blocks completion (after one command-only recheck, a persistent failure parks the task for a human rather than re-running the work). Scope control is therefore a completion-time audit, not write interception — nothing stops an agent from writing outside its declared `writes` scope; the dispatcher only warns about overlapping scopes at dispatch time.
+- **One cooperating writable host owns a storage root.** The event-store ownership marker refuses a second writable open and persists after a crash; it is not a distributed lock. Never share the same storage root with old/uncooperative writers or manually steal a live marker.
 - **Member messaging is one-directional.** Task agents can report progress to the dispatcher; they cannot message each other. Coordination happens through the DAG (dependencies and write scopes), not conversation.
 - **One role may hold several concurrent tasks.** The dispatcher bounds concurrency by role and globally, not one-open-task-per-agent, so a single role can own multiple in-flight tasks at once.
 - **Recovery is bounded per boot, not globally.** Orphan recovery requeues a stranded task at most once per host start. A host that restarts repeatedly will requeue the same unwilling task repeatedly — by design, so an unfinished task is not silently abandoned.
@@ -287,7 +328,7 @@ Written plainly, because a limit you discover in production costs far more than 
 
 ## Status
 
-**0.6.32 delivers swarm notices to a running dispatch turn on the status-aware channel, with honest plugin provenance; 0.6.31's lifecycle hardening and readable, left-aligned Flow remain.** Type checking and the host/client build pass; the full suite passes **605 tests across 32 files**, covering dispatch, authority, admission, persistence, lifecycle, recovery, routing, review gates, notifications, transport, settings and client rendering. Tests use fake subagents and isolated storage; deployment-dependent assertions can skip when their prerequisites are absent. Ten additional isolated headless Chrome checks passed for Flow geometry and interactions before the subsequent left-alignment revision. This is not a claim of verification against the operator's authenticated GUI or production mutation.
+**0.6.33 implements the reviewed hardening plan (S0–S7); 0.6.32's status-aware notices and 0.6.31's lifecycle hardening and readable Flow remain.** Type checking, the host/client build, the content receipt/compiled-export verification, and the offline suite pass — **1,005 tests across 38 files** — covering dispatch, authority, admission, persistence, lifecycle, recovery, routing, review gates, notifications, transport, settings and client rendering, plus the new policy/artifact, replay, ownership, ledger and coordination suites. Tests use fake subagents and owned temporary storage; deployment suites are excluded unless explicit fixtures are exported. Historical headless Chrome Flow checks are not validation of this release against the operator's authenticated GUI. No host reload, frozen research rerun, clinical admission or production mutation is claimed.
 
 ## License
 

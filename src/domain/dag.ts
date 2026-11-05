@@ -1,12 +1,14 @@
 import { assertAllowedKeys, DAG_LIMITS, isPlainRecord } from './limits.js'
 import type { TaskSpec } from './types.js'
+import { validatePolicy } from '../policy.js'
+import { validateArtifactContract } from '../artifacts.js'
 
 export interface DagValidation {
   valid: boolean
   errors: string[]
 }
 
-const TASK_KEYS = ['id', 'subject', 'description', 'role', 'blockedBy', 'reviewBy', 'model', 'evidence', 'reviewGate', 'writes']
+const TASK_KEYS = ['id', 'subject', 'description', 'role', 'blockedBy', 'reviewBy', 'model', 'evidence', 'reviewGate', 'writes', 'policy']
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/
 const RESERVED_IDS = new Set(['__proto__', 'prototype', 'constructor'])
 
@@ -86,6 +88,9 @@ export function validateDag(tasks: TaskSpec[]): DagValidation {
         strings(task.blockedBy, `${label} blockedBy`, DAG_LIMITS.blockersPerTask, DAG_LIMITS.idChars, true)
         if (Array.isArray(task.blockedBy)) edges += task.blockedBy.length
       }
+      if (task.policy !== undefined) {
+        try { validatePolicy(task.policy, true) } catch (error) { fail((error as Error).message) }
+      }
       if (task.writes !== undefined) strings(task.writes, `${label} writes`, DAG_LIMITS.pathsPerTask, DAG_LIMITS.pathChars)
       if (task.model !== undefined) {
         if (!isPlainRecord(task.model)) fail(`${label} model must be a plain object`)
@@ -99,9 +104,15 @@ export function validateDag(tasks: TaskSpec[]): DagValidation {
       if (task.evidence !== undefined) {
         if (!isPlainRecord(task.evidence)) fail(`${label} evidence must be a plain object`)
         else {
-          try { assertAllowedKeys(task.evidence, ['files', 'commands'], `${label} evidence`) } catch (error) { fail((error as Error).message) }
+          try { assertAllowedKeys(task.evidence, ['files', 'commands', 'artifacts'], `${label} evidence`) } catch (error) { fail((error as Error).message) }
           if (task.evidence.files !== undefined) strings(task.evidence.files, `${label} evidence.files`, DAG_LIMITS.evidenceFiles, DAG_LIMITS.pathChars)
           if (task.evidence.commands !== undefined) strings(task.evidence.commands, `${label} evidence.commands`, DAG_LIMITS.evidenceCommands, DAG_LIMITS.commandChars)
+          if (task.evidence.artifacts !== undefined) {
+            if (!Array.isArray(task.evidence.artifacts) || task.evidence.artifacts.length > DAG_LIMITS.evidenceFiles) fail('too many artifact contracts')
+            else for (const artifact of task.evidence.artifacts) {
+              try { validateArtifactContract(artifact); totalChars += JSON.stringify(artifact).length } catch (error) { fail((error as Error).message) }
+            }
+          }
         }
       }
       if (edges > DAG_LIMITS.edges) return { valid: false, errors: [`a run may have at most ${DAG_LIMITS.edges} dependency edges`] }

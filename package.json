@@ -1,6 +1,6 @@
 {
   "name": "dsh-swarm-orchestrator",
-  "version": "0.6.32",
+  "version": "0.6.33",
   "description": "Role-based AI swarm orchestration for DeepSeek Harness: duty-table model pinning per role, parallel task DAG with review loops, and a live Swarm dashboard tab in the web GUI.",
   "license": "MIT",
   "author": "linkbag",
@@ -42,8 +42,9 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node scripts/build-client.mjs",
+    "build": "tsc -p tsconfig.build.json && node scripts/build-client.mjs --full-build",
     "build:client": "node scripts/build-client.mjs",
+    "verify:build": "node scripts/verify-build.mjs",
     "prepare": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"

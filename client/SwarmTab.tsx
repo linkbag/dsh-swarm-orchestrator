@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { boardStore, type Board, type BoardRun, type BoardRunState, type BoardSyncState, type BoardTask } from './board-store'
+import { boardStore, type BoardActionBody, type Board, type BoardRun, type BoardRunState, type BoardSyncState, type BoardTask } from './board-store'
 import { DutyTableEditor } from './DutyTableEditor'
 import { FlowChart } from './FlowChart'
 import { RuntimeSettings } from './RuntimeSettings'
@@ -180,7 +180,7 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
   const hostStale = board !== null && isHostStale(board.version, board.capabilities)
   const hostStaleTitle = t(Array.isArray(board?.capabilities) ? 'run.hostCapabilityMissing' : 'run.hostStaleTitle', { version: hostVersion })
 
-  const runAction = useCallback(async (body: { action: string; runId?: string; taskId?: string; verdict?: string; title?: string; state?: BoardRunState }) => {
+  const runAction = useCallback(async (body: BoardActionBody) => {
     // Refuse the actions only a restarted host serves, so a stale host is never sent
     // a request it must reject. Every other action exists on every host.
     if (isCurationAction(body.action) && hostStale) {
@@ -266,6 +266,10 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
         <dt>{t('field.builder')}</dt>
         <dd>{agentIdentity(selectedTask.agent, t('field.identityUnknown'))}</dd>
         <dt>{t('field.reviewStatus')}</dt><dd>{reviewLabel(selectedTask, t)}</dd>
+        {selectedTask.executionState !== undefined && <><dt>{t('field.executionState')}</dt><dd>{selectedTask.executionState}</dd></>}
+        {selectedTask.artifactState !== undefined && <><dt>{t('field.artifactState')}</dt><dd>{selectedTask.artifactState}</dd></>}
+        {selectedTask.acceptanceState !== undefined && <><dt>{t('field.acceptanceState')}</dt><dd>{selectedTask.acceptanceState}</dd></>}
+        {selectedTask.provenance !== undefined && <><dt>{t('field.provenance')}</dt><dd>{selectedTask.provenance}</dd></>}
         {selectedTask.blockedBy !== undefined && selectedTask.blockedBy.length > 0 && (
           <>
             <dt>{t('field.dependsOn')}</dt><dd>{selectedTask.blockedBy.map((b) => <code key={b}>{b}</code>)}</dd>
@@ -328,25 +332,25 @@ export function SwarmTab({ sessionId, initialBoard, initialView, initialSelected
             <button
               className="dsh-swarm-btn primary"
               disabled={busy}
-              onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'approve' }) }}
+              onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'approve', observed: selectedTask.artifactDigest === undefined ? undefined : { attemptId: selectedTask.attemptId, reviewEpisode: selectedTask.reviewEpisode, artifactDigest: selectedTask.artifactDigest } }) }}
             >
               {t('review.approve')}
             </button>
             <button
               className="dsh-swarm-btn danger"
               disabled={busy}
-              onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'reject' }) }}
+              onClick={() => { void runAction({ action: 'review', runId: selectedTask.runId, taskId: selectedTask.id, verdict: 'reject', observed: selectedTask.artifactDigest === undefined ? undefined : { attemptId: selectedTask.attemptId, reviewEpisode: selectedTask.reviewEpisode, artifactDigest: selectedTask.artifactDigest } }) }}
             >
               {t('review.reject')}
             </button>
           </div>
         </>
       )}
-      {(selectedTask.status === 'failed' || selectedTask.status === 'blocked') && (
+      {(selectedTask.status === 'failed' || selectedTask.status === 'blocked' || selectedTask.acceptanceState === 'held') && (
         <button
           className="dsh-swarm-btn primary"
           disabled={busy}
-          onClick={() => { void runAction({ action: 'retry-task', runId: selectedTask.runId, taskId: selectedTask.id }) }}
+          onClick={() => { void runAction({ action: 'retry-task', runId: selectedTask.runId, taskId: selectedTask.id, taskObserved: { attemptId: selectedTask.attemptId, status: selectedTask.status, attemptRevoked: selectedTask.attemptRevoked } }) }}
         >
           {t('task.retry')}
         </button>

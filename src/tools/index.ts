@@ -1,6 +1,33 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SwarmService } from '../service.js'
+import type { TaskSpec } from '../domain/types.js'
+import type { TaskPolicy } from '../policy.js'
+import type { WaitMode } from '../wait.js'
+import type { RequestBudget } from '../request-ledger.js'
+
+const taskObservationSchema = {
+  type: 'object' as const, additionalProperties: false,
+  description: 'Required for new policy runs: copy the attempt/state/revocation from swarm_status; refresh after a stale decision.',
+  properties: { attemptId: { type: 'string' as const }, status: { type: 'string' as const, required: true as const }, attemptRevoked: { type: 'boolean' as const } },
+}
+const policyFields = {
+  evidence: { type: 'string' as const, enum: ['advisory', 'required'], description: 'Advisory records artifact warnings; required holds invalid artifacts.' },
+  review: { type: 'string' as const, enum: ['off', 'warn', 'strict'], description: 'Warn preserves unavailable/exhausted verdicts; strict holds them for human decision.' },
+  isolation: { type: 'string' as const, enum: ['advisory', 'strict'], description: 'Strict is refused unless enforced read, write and descendant confinement is certified.' },
+}
+const artifactSchema = {
+  type: 'object' as const, additionalProperties: false,
+  properties: {
+    path: { type: 'string' as const, required: true as const },
+    format: { type: 'string' as const, required: true as const, enum: ['json', 'jsonl', 'text', 'binary'] },
+    sha256: { type: 'string' as const },
+    requiredKeys: { type: 'array' as const, items: { type: 'string' as const } },
+    schemaVersion: { oneOf: [{ type: 'string' as const }, { type: 'number' as const }] as const },
+    minRecords: { type: 'integer' as const, description: 'Minimum 1 record when supplied; validated by the artifact contract.' },
+    maxBytes: { type: 'integer' as const, description: 'Byte cap 1–16777216; default 1048576 for structural contracts.' },
+  },
+}
 
 const taskItemSchema = {
   type: 'object' as const,
@@ -13,7 +40,8 @@ const taskItemSchema = {
     blockedBy: { type: 'array' as const, items: { type: 'string' as const }, description: 'Task ids that must complete before this one starts' },
     reviewBy: { type: 'string' as const, description: 'Role that reviews this task\'s output after completion (e.g. reviewer); rejections loop back with feedback up to reviewLoops times' },
     reviewGate: { type: 'string' as const, description: '\'agent\' (default) or \'human\' — human routes the verdict to dashboard Approve/Reject buttons' },
-    writes: { type: 'array' as const, items: { type: 'string' as const }, description: 'Files this task may write (exclusive scope). Overlapping concurrent scopes produce a dispatch warning.' },
+    writes: { type: 'array' as const, items: { type: 'string' as const }, description: 'Advisory write scopes, not a filesystem lock. Overlaps produce a dispatch warning.' },
+    policy: { type: 'object' as const, additionalProperties: false, properties: policyFields, description: 'Per-task policy may strengthen but cannot weaken the run policy floor.' },
     model: {
       type: 'object' as const,
       additionalProperties: true,
@@ -26,12 +54,10 @@ const taskItemSchema = {
     evidence: {
       type: 'object' as const,
       additionalProperties: true,
-      description: 'Evidence contract: the task will not close until these hold. { files: [paths], commands: [shell commands] }. '
-        + 'IMPORTANT: commands run through PowerShell on Windows (pwsh) and bash elsewhere, from the workspace root. '
-        + 'Write POSIX/PowerShell command lines — never cmd.exe syntax. Prefer file checks (files: [...]) over '
-        + 'shell expressions: a file check cannot fail for shell reasons.',
+      description: 'Artifact checks are advisory by default, mandatory with policy.evidence=required. Commands must exit zero and run at the workspace root through pwsh on Windows, bash elsewhere (not cmd.exe). Structural validity is not domain or clinical approval.',
       properties: {
-        files: { type: 'array' as const, items: { type: 'string' as const }, description: 'Files (relative to the workspace) that must exist and be non-empty. Preferred — no shell involved.' },
+        files: { type: 'array' as const, items: { type: 'string' as const }, description: 'Workspace-relative nonempty artifact paths; enforced only in required mode.' },
+        artifacts: { type: 'array' as const, items: artifactSchema, description: 'Bounded structural/digest contracts; maximum 16 MiB per artifact.' },
         commands: { type: 'array' as const, items: { type: 'string' as const }, description: 'Commands that must exit 0. Run by pwsh on Windows (bash elsewhere), from the workspace root. Example: "npm run check" or "if (Test-Path app/build.gradle.kts) { exit 0 } else { exit 1 }". Do NOT use cmd.exe-only syntax.' },
       },
     },
@@ -74,6 +100,8 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
       title: { type: 'string', required: true, description: 'Run title shown on the dashboard' },
       spec: { type: 'string', required: true, description: 'The overall objective handed to every task agent as context' },
       tasks: { type: 'array', required: true, items: taskItemSchema, description: 'Ordered task list; independent tasks run in parallel' },
+      policy: { type: 'object', additionalProperties: false, description: 'Versioned acceptance policy; defaults to advisory evidence, warn review, advisory isolation.', properties: { version: { type: 'integer', enum: [1], required: true }, ...policyFields } },
+      budget: { type: 'object', additionalProperties: false, description: 'Run-level observed-request budget; hard mode is refused on uncertified hosts. Token/cost values are advisory, not enforced caps.', properties: { mode: { type: 'string', enum: ['advisory', 'hard'], required: true }, maxRequests: { type: 'integer', description: 'Nonnegative observed-reservation limit for this run.' }, maxTokens: { type: 'integer', description: 'Nonnegative advisory token allowance; not a certified cap.' }, maxCostUsd: { type: 'number', description: 'Nonnegative advisory USD allowance; actual cost remains unknown.' } } },
       endorse: { type: 'boolean', description: 'Set true ONLY when the human has explicitly approved spawning this run' },
       architectReview: { type: 'boolean', description: 'Set false to skip the architect-review first task for this run (or true to force it when the deployment default is off)' },
     },
@@ -87,30 +115,11 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
         {
           title: args.title,
           spec: args.spec,
-          tasks: args.tasks.map((task) => ({
-            id: task.id, subject: task.subject, description: task.description, role: task.role,
-            ...(task.blockedBy !== undefined && task.blockedBy.length > 0 ? { blockedBy: task.blockedBy } : {}),
-            ...(task.reviewBy !== undefined && task.reviewBy.length > 0 ? { reviewBy: task.reviewBy } : {}),
-            ...(task.reviewGate === 'human' ? { reviewGate: 'human' as const } : {}),
-            ...(task.writes !== undefined && task.writes.length > 0 ? { writes: task.writes } : {}),
-            ...(task.model !== undefined && typeof task.model === 'object'
-              && typeof (task.model as { provider?: unknown }).provider === 'string'
-              && typeof (task.model as { model?: unknown }).model === 'string'
-              ? { model: { provider: (task.model as { provider: string }).provider, model: (task.model as { model: string }).model } }
-              : {}),
-            ...(task.evidence !== undefined && typeof task.evidence === 'object'
-              ? {
-                  evidence: {
-                    ...(Array.isArray((task.evidence as { files?: unknown }).files)
-                      ? { files: (task.evidence as { files: string[] }).files.filter((f) => typeof f === 'string') }
-                      : {}),
-                    ...(Array.isArray((task.evidence as { commands?: unknown }).commands)
-                      ? { commands: (task.evidence as { commands: string[] }).commands.filter((c) => typeof c === 'string') }
-                      : {}),
-                  },
-                }
-              : {}),
-          })),
+          // Preserve validated contracts, including unknown fields for the domain
+          // validator to reject rather than silently weakening their semantics.
+          tasks: args.tasks as TaskSpec[],
+          ...(args.policy !== undefined ? { policy: args.policy as TaskPolicy } : {}),
+          ...(args.budget !== undefined ? { budget: args.budget as RequestBudget } : {}),
           ...(args.endorse === true ? { endorse: true } : {}),
           ...(args.architectReview !== undefined ? { architectReview: args.architectReview } : {}),
         },
@@ -166,6 +175,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     parameters: {
       runId: { type: 'string', required: true, description: 'The run id' },
       taskId: { type: 'string', required: true, description: 'The running/dispatching task to interrupt' },
+      observed: taskObservationSchema,
     },
     output: {
       schema: { type: 'string' },
@@ -173,7 +183,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     },
     isConcurrencySafe: () => true,
     execute: async (args, exec) => {
-      service.interruptTask(args.runId, args.taskId, exec.agent === undefined ? undefined : String(exec.agent.id))
+      service.interruptTask(args.runId, args.taskId, exec.agent === undefined ? undefined : String(exec.agent.id), args.observed)
       return `Task ${args.taskId} interrupted and requeued — the dispatcher will relaunch it. Track with swarm_status.`
     },
   })))
@@ -187,6 +197,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     parameters: {
       runId: { type: 'string', required: true, description: 'The run id' },
       taskId: { type: 'string', required: true, description: 'The task that was completed outside the swarm' },
+      observed: taskObservationSchema,
       summary: { type: 'string', description: 'One-line summary of how/where the work was completed' },
     },
     output: {
@@ -195,7 +206,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     },
     isConcurrencySafe: () => true,
     execute: async (args, exec) => {
-      service.completeTaskExternally(args.runId, args.taskId, exec.agent === undefined ? undefined : String(exec.agent.id), args.summary ?? '')
+      service.completeTaskExternally(args.runId, args.taskId, exec.agent === undefined ? undefined : String(exec.agent.id), args.summary ?? '', args.observed)
       return `Task ${args.taskId} marked completed — downstream tasks unblock automatically. Track with swarm_status.`
     },
   })))
@@ -203,11 +214,12 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
   disposers.push(tools.register(defineTool({
     name: 'swarm_retry',
     description:
-      'Requeue a failed or blocked swarm task for another attempt (recovery after a fix). '
+      'Requeue a failed, blocked or acceptance-held swarm task for another attempt (recovery after a fix). '
       + 'Gated to the run\'s dispatching session; other sessions must use the Swarm dashboard.',
     parameters: {
       runId: { type: 'string', required: true, description: 'The run id' },
-      taskId: { type: 'string', required: true, description: 'The failed/blocked task id to requeue' },
+      taskId: { type: 'string', required: true, description: 'The failed/blocked/held task id to requeue' },
+      observed: taskObservationSchema,
     },
     output: {
       schema: { type: 'string' },
@@ -215,7 +227,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     },
     isConcurrencySafe: () => true,
     execute: async (args, exec) => {
-      service.retryTask(args.runId, args.taskId, exec.agent === undefined ? undefined : String(exec.agent.id))
+      service.retryTask(args.runId, args.taskId, exec.agent === undefined ? undefined : String(exec.agent.id), args.observed)
       return `Task ${args.taskId} requeued — the dispatcher will relaunch it when its blockers allow. Track with swarm_status.`
     },
   })))
@@ -223,12 +235,13 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
   disposers.push(tools.register(defineTool({
     name: 'swarm_wait',
     description:
-      'Block until the swarm board changes (task completed/failed, run state change) or the timeout expires — '
-      + 'the preferred way to await a swarm run before reporting anything to the user. '
-      + 'Returns the board text at the moment of the change.',
+      'Wait for meaningful swarm progress or a final-state predicate. Returns a bounded board report and durable cursor; pass that cursor next time to avoid missed changes. Heartbeats do not wake the default mode.',
     parameters: {
       runId: { type: 'string', description: 'Only wait for changes in this run (omit for any swarm activity)' },
       timeoutSeconds: { type: 'number', description: 'Max seconds to wait (default 240, max 600)' },
+      afterSeq: { type: 'integer', description: 'Nonnegative durable cursor returned by the previous wait.' },
+      mode: { type: 'string', enum: ['meaningful', 'any', 'terminal', 'drained', 'any-final'], description: 'Default meaningful; any includes heartbeats; terminal waits for the run, drained also requires resource cleanup; any-final waits for an accepted/failed task.' },
+      maxChars: { type: 'integer', description: 'Bounded report size, 512–24000 characters; default 8000.' },
     },
     output: {
       schema: { type: 'string' },
@@ -237,7 +250,7 @@ export function registerSwarmTools(ctx: Context, service: SwarmService): () => v
     isConcurrencySafe: () => true,
     execute: async (args, exec) => {
       const timeoutSeconds = Math.min(Math.max(args.timeoutSeconds ?? 240, 5), 600)
-      return service.waitForChange(args.runId, timeoutSeconds * 1000, exec.signal)
+      return service.waitForChange(args.runId, timeoutSeconds * 1000, exec.signal, { ...(args.afterSeq !== undefined ? { afterSeq: args.afterSeq } : {}), ...(args.mode !== undefined ? { mode: args.mode as WaitMode } : {}), ...(args.maxChars !== undefined ? { maxChars: args.maxChars } : {}) })
     },
   })))
 

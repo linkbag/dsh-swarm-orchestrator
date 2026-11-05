@@ -55,7 +55,30 @@ export type TaskStatus =
   | 'retrying' | 'completed' | 'failed' | 'blocked'
 
 /** Machine-checkable proof a task must produce before it may close (J2 evidence contract). */
+export interface ArtifactContract {
+  path: string
+  format: 'json' | 'jsonl' | 'text' | 'binary'
+  sha256?: string
+  requiredKeys?: string[]
+  schemaVersion?: string | number
+  minRecords?: number
+  maxBytes?: number
+}
+
+export interface TaskObservation {
+  attemptId?: string
+  status: string
+  attemptRevoked?: boolean
+}
+
+export interface ReviewObservation {
+  attemptId: string
+  reviewEpisode: string
+  artifactDigest: string
+}
+
 export interface TaskEvidence {
+  artifacts?: ArtifactContract[]
   /** Files (relative to the run workspace) that must exist and be non-empty. */
   files?: string[]
   /** Shell commands that must exit 0 (run in the task agent's workspace). */
@@ -77,15 +100,25 @@ export interface TaskSpec {
   evidence?: TaskEvidence
   /** 'human' routes the review verdict to a dashboard Approve/Reject instead of an agent reviewer (J7). */
   reviewGate?: 'agent' | 'human'
-  /** Files this task may write (exclusive scope). Overlapping scopes between concurrent tasks produce a dispatch warning. */
+  /** Advisory write scopes, not a filesystem confinement boundary. */
   writes?: string[]
+  policy?: import('../policy.js').TaskPolicyOverride
 }
 
 /** Task state folded from the event log. */
 export interface Task extends TaskSpec {
   runId: string
   status: TaskStatus
+  /** Present for policy-versioned runs; legacy replay keeps its former meaning. */
+  executionState?: 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  artifactState?: 'unchecked' | 'valid' | 'invalid'
+  acceptanceState?: 'pending' | 'accepted' | 'held' | 'rejected'
+  provenance?: 'model' | 'recovered' | 'external'
+  artifactDigest?: string
+  reviewEpisode?: string
   attempts: number
+  /** Persisted retry admission floor; provider hints survive restart/runtime edits. */
+  retryNotBefore?: number
   /**
    * J19 attempt fence: identity of the attempt currently allowed to move this task.
    *
@@ -109,6 +142,8 @@ export interface Task extends TaskSpec {
    * had already failed.
    */
   attemptStartedAt?: number
+  /** Model-work admission deadline shared with review; heartbeats never renew it. */
+  attemptDeadlineAt?: number
   agent?: { label: string; provider?: string; model?: string; effort?: string; requestedEffort?: string }
   reviewerAgent?: { label: string; provider?: string; model?: string; effort?: string; requestedEffort?: string }
   fileWarnings?: string[]
@@ -162,6 +197,8 @@ export interface RunDispatchContext {
 }
 
 export interface Run {
+  policy?: import('../policy.js').TaskPolicy
+  budget?: import('../request-ledger.js').RequestBudget
   id: string
   title: string
   spec: string
@@ -197,7 +234,7 @@ export type RunBoardState = 'visible' | 'removed' | 'purged'
 /** One append-only event record (JSONL line). */
 export interface SwarmEventRecord {
   /** New writes use strict store protocol 2; older logs remain byte-preserving. */
-  storeVersion?: 2
+  storeVersion?: 2 | 3
   /** Replay-only original cursor when a legacy sequence collision is normalized. */
   storedSeq?: number
   seq: number
@@ -238,6 +275,8 @@ export type SwarmEventKind =
 
 /** Input to SwarmService.dispatch. */
 export interface DispatchInput {
+  policy?: import('../policy.js').TaskPolicy
+  budget?: import('../request-ledger.js').RequestBudget
   title: string
   spec: string
   tasks: TaskSpec[]

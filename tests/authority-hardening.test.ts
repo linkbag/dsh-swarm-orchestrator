@@ -280,7 +280,7 @@ describe('identity-bound report recovery', () => {
     expect(task.recovered).toBe(true)
     expect(task.status).toBe('reviewing')
     expect(task.humanReview).toBe(true)
-    r.service.review(runId, 'a', 'approve')
+    r.service.review(runId, 'a', 'approve', { attemptId: task.attemptId!, reviewEpisode: task.reviewEpisode!, artifactDigest: task.artifactDigest! })
     await flush()
     expect(r.service.snapshot().tasks.find((task) => task.runId === runId && task.id === 'a')?.status).toBe('completed')
     expect(r.service.snapshot().runs.find((run) => run.id === runId)?.stats?.reviewsPassed).toBe(1)

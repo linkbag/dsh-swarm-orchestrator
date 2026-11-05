@@ -217,6 +217,10 @@ class FakeSubagents {
 }
 
 /** Fake agents factory: mints service-owned idle anchor agents. */
+function observation(service: SwarmService, runId: string) {
+  const task = service.snapshot().tasks.find((task) => task.runId === runId && task.id === 'a')!
+  return { attemptId: task.attemptId, status: task.status, attemptRevoked: task.attemptRevoked }
+}
 class FakeAgents {
   readonly created: Array<{ sessionId: string; cwd?: string; agentPreset?: string; agentOptions?: { provider?: string; model?: string } }> = []
   readonly anchors: unknown[] = []
@@ -829,6 +833,8 @@ describe('swarm service (integration, fake subagents)', () => {
     service.endorse(result.runId)
 
     await waitFor(() => service.effortFor('sess-1') === 'max', 5000, 'first child pinned')
+    // Modern runs require an explicit typed effort rejection, not elapsed time.
+    service.recordChildFailure('sess-1', { code: 'UNSUPPORTED_REASONING_EFFORT' })
     fake.release()
     await waitFor(() => fake.calls.length === 2, 5000, 'rung retry started')
     // Mid-flight, between the two children: still one attempt, one task/started.
@@ -1459,13 +1465,17 @@ describe('swarm service (integration, fake subagents)', () => {
     await waitFor(() => service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'a')?.humanReview === true, 5000, 'human review parked')
     expect(service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'a')?.status).toBe('reviewing')
 
+    const observation = () => {
+      const task = service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'a')!
+      return { attemptId: task.attemptId!, reviewEpisode: task.reviewEpisode!, artifactDigest: task.artifactDigest! }
+    }
     // Reject sends it back; the rework completes and parks for review again.
-    service.review(result.runId, 'a', 'reject')
+    service.review(result.runId, 'a', 'reject', observation())
     await waitFor(() => fake.calls.length >= 2, 5000, 'rework after human reject')
     await waitFor(() => service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'a')?.humanReview === true, 5000, 'parked again after rework')
 
     // Approve closes it.
-    service.review(result.runId, 'a', 'approve')
+    service.review(result.runId, 'a', 'approve', observation())
     await waitFor(() => service.snapshot().runs.find((r) => r.id === result.runId)?.status === 'completed', 5000, 'run completes after human approve')
   })
 
@@ -1524,7 +1534,7 @@ describe('swarm service (integration, fake subagents)', () => {
 
     // The fix lands (failOnce consumed) and a human retries the dead task —
     // the run resumes, the dependent unblocks, and everything completes.
-    service.retryTask(result.runId, 'a')
+    service.retryTask(result.runId, 'a', undefined, observation(service, result.runId))
     const dumpRescue = (): string => service.events.all()
       .filter((e) => e.runId === result.runId)
       .map((e) => `${e.kind}:${e.taskId ?? ''}`)
@@ -1957,7 +1967,7 @@ describe('swarm service (integration, fake subagents)', () => {
     await waitFor(() => service.events.all().some((e) => e.kind === 'task/agent-started'), 5000, 'child running')
 
     // Task 'a' is held (stalled). Interrupt it: it should fail-with-retry and requeue.
-    service.interruptTask(result.runId, 'a', undefined)
+    service.interruptTask(result.runId, 'a', undefined, observation(service, result.runId))
     const a = service.snapshot().tasks.find((t) => t.runId === result.runId && t.id === 'a')!
     expect(a.status).toBe('retrying')
 
@@ -1986,7 +1996,7 @@ describe('swarm service (integration, fake subagents)', () => {
     await waitFor(() => service.events.all().some((e) => e.kind === 'task/agent-started'), 5000, 'child running')
 
     expect(() => service.interruptTask(result.runId, 'a', 'wrong-session')).toThrow(/gated to the dispatching session/)
-    service.interruptTask(result.runId, 'a', 'parent-1') // correct session: works
+    service.interruptTask(result.runId, 'a', 'parent-1', observation(service, result.runId)) // correct session: works
     fake.release()
   })
 
@@ -3176,7 +3186,7 @@ describe('B2: human-attention notification to the dispatching session', () => {
     // Resolve by requeueing: the task unblocks, re-runs, its evidence still
     // fails, the fresh attempt's recheck fails, and it blocks again — a NEW
     // wait, so it must ping again.
-    service.retryTask(dispatched.runId, 'a')
+    service.retryTask(dispatched.runId, 'a', undefined, observation(service, dispatched.runId))
     await waitFor(() => taskOfRun(service, dispatched.runId, 'a').status === 'blocked', 20000, 'blocks again after retry')
     await waitFor(() => attention(noticeTexts).length === 2, 8000, 'second ping after re-block')
 

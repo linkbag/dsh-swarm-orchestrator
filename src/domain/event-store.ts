@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { appendFileSync, closeSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { appendFileSync, closeSync, fstatSync, fsyncSync, ftruncateSync, openSync, readFileSync, writeFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { assertAllowedKeys, isPlainRecord } from './limits.js'
+import { StoreOwnership } from './store-ownership.js'
 import type { SwarmEventRecord } from './types.js'
 
 function record(value: unknown, previousSeq: number): SwarmEventRecord {
@@ -12,7 +13,7 @@ function record(value: unknown, previousSeq: number): SwarmEventRecord {
     || (value.runId !== undefined && typeof value.runId !== 'string')
     || (value.taskId !== undefined && typeof value.taskId !== 'string')
     || (value.data !== undefined && !isPlainRecord(value.data))
-    || (value.storeVersion !== undefined && value.storeVersion !== 2)) {
+    || (value.storeVersion !== undefined && value.storeVersion !== 2 && value.storeVersion !== 3)) {
     throw new Error('invalid event envelope or non-increasing sequence')
   }
   assertAllowedKeys(value, ['seq', 'at', 'kind', 'runId', 'taskId', 'data', 'storeVersion'], 'event envelope')
@@ -28,11 +29,24 @@ function isPartialObject(text: string, error: unknown): boolean {
   return position !== null && Number(position[1]) === text.length && /Expected /.test(error.message)
 }
 
+export interface EventStoreOptions {
+  /**
+   * Replay-only snapshot: no ownership, creation, repair, quarantine or appends.
+   * No snapshot isolation from a concurrent writer: use a quiescent copy when a
+   * durability-consistent replay is required; in-progress tails fail explicitly.
+   */
+  readOnly?: boolean
+}
+
 /**
- * Single-writer append-only JSONL source of truth. Appends are synchronous and
- * fsync'd before publishing a sequence or notifying observers. This guarantees
- * file-content durability, not cross-process writer serialization or directory
- * entry durability after power loss. Complete corrupt records are never dropped.
+ * Append-only JSONL source of truth. Writable opens exclusively own the store
+ * BEFORE loading/repairing and retain ownership until explicit close/dispose.
+ * All writers must cooperate with StoreOwnership's non-expiring marker protocol;
+ * crashes leave a marker requiring verified manual recovery, not stale takeover.
+ * Appends are synchronous and fsync'd before publication. This guarantees file
+ * content, not directory-entry power-loss durability or fencing of raw writers.
+ * Complete corrupt records are never dropped. Read-only opens are snapshots,
+ * not live tailers, and refuse incomplete tails without changing any bytes.
  */
 export class EventStore {
   private events: SwarmEventRecord[] = []
@@ -40,11 +54,57 @@ export class EventStore {
   private nextSeq = 1
   private needsSeparator = false
   private failed: string | undefined
+  private isClosed = false
+  private appending = false
+  private readonly ownership: StoreOwnership | undefined
+  readonly file: string
+  readonly readOnly: boolean
   /** Observable normal-load repairs/observer failures; never silence storage loss. */
   readonly diagnostics: string[] = []
 
-  constructor(readonly file: string) {
-    this.load()
+  constructor(file: string, options: EventStoreOptions = {}) {
+    if (options.readOnly !== undefined && typeof options.readOnly !== 'boolean') {
+      throw new TypeError('event store readOnly must be a boolean')
+    }
+    this.readOnly = options.readOnly === true
+    this.ownership = this.readOnly ? undefined : StoreOwnership.acquire(file)
+    this.file = this.ownership?.file ?? resolve(file)
+    try {
+      this.ownership?.assertHeld()
+      this.load()
+    } catch (error) {
+      this.isClosed = true
+      try { this.ownership?.close() } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `cannot open event store ${this.file}; ownership cleanup failed`, { cause: error })
+      }
+      throw error
+    }
+  }
+
+  get closed(): boolean {
+    return this.isClosed
+  }
+
+  private assertOpen(): void {
+    if (this.isClosed) throw new Error(`event store ${this.file} is closed`)
+  }
+
+  /**
+   * Synchronous and idempotent. The caller must first drain its service work.
+   * Reentrant close during append is refused, so serialization/fsync/rollback
+   * cannot release ownership underneath the active mutation. Cleanup errors are
+   * surfaced; an uncertain release leaves a marker requiring manual recovery.
+   */
+  close(): void {
+    if (this.isClosed) return
+    if (this.appending) throw new Error(`cannot close event store ${this.file} during append`)
+    this.isClosed = true
+    this.listeners.clear()
+    this.ownership?.close()
+  }
+
+  dispose(): void {
+    this.close()
   }
 
   private load(): void {
@@ -78,7 +138,7 @@ export class EventStore {
           // Old writers produced real, distinct events with colliding/reset seqs.
           // Physical append order remains authoritative. Preserve every record and
           // its original cursor without ever rewriting the historical bytes.
-          if (persisted.storeVersion === 2) strictSequences = true
+          if (persisted.storeVersion === 2 || persisted.storeVersion === 3) strictSequences = true
           let event = persisted
           if (persisted.seq <= previousSeq) {
             if (strictSequences || persistedJSON === previousPersisted || !Number.isSafeInteger(previousSeq + 1)) {
@@ -104,6 +164,10 @@ export class EventStore {
       start = newline + 1
     }
     if (repairOffset !== undefined) {
+      if (this.readOnly) {
+        throw new Error(`incomplete event tail in read-only event store ${this.file} at line ${lineNumber}; exclusive writable recovery required; no bytes changed`)
+      }
+      this.ownership!.assertHeld()
       // Preserve the exact rejected bytes before removing ONLY the partial tail.
       // This path runs on normal load; development tests use their own temp files.
       const quarantine = `${this.file}.corrupt-tail-${Date.now()}-${randomUUID()}`
@@ -138,60 +202,72 @@ export class EventStore {
   }
 
   get seq(): number {
+    this.assertOpen()
     return this.nextSeq - 1
   }
 
   all(): readonly SwarmEventRecord[] {
+    this.assertOpen()
     return this.events
   }
 
   append(kind: string, fields: Omit<SwarmEventRecord, 'seq' | 'at' | 'kind' | 'storeVersion' | 'storedSeq'> = {}): SwarmEventRecord {
+    this.assertOpen()
+    if (this.readOnly) throw new Error(`cannot append read-only event store ${this.file}`)
     if (this.failed !== undefined) throw new Error(this.failed)
-    // Authoritative envelope fields win even if an untyped caller spoofs them.
-    const input = record({ ...fields, storeVersion: 2, seq: this.nextSeq, at: Date.now(), kind }, this.seq)
-    const serialized = JSON.stringify(input)
-    // Publish the exact JSON snapshot that is persisted, not caller-owned data
-    // with undefined/functions/toJSON behavior that will differ during replay.
-    const event = record(JSON.parse(serialized), this.seq)
-    const line = `${this.needsSeparator ? '\n' : ''}${serialized}\n`
-    mkdirSync(dirname(this.file), { recursive: true })
-    const descriptor = openSync(this.file, 'a', 0o600)
-    let durable = false
+    if (this.appending) throw new Error(`cannot append event store ${this.file} reentrantly`)
+    this.appending = true
+    let event: SwarmEventRecord
     try {
-      const previousLength = fstatSync(descriptor).size
+      // Authoritative envelope fields win even if an untyped caller spoofs them.
+      const input = record({ ...fields, storeVersion: 3, seq: this.nextSeq, at: Date.now(), kind }, this.seq)
+      const serialized = JSON.stringify(input)
+      // Publish the exact JSON snapshot that is persisted, not caller-owned data
+      // with undefined/functions/toJSON behavior that will differ during replay.
+      event = record(JSON.parse(serialized), this.seq)
+      const line = `${this.needsSeparator ? '\n' : ''}${serialized}\n`
+      this.ownership!.assertHeld()
+      const descriptor = openSync(this.file, 'a', 0o600)
+      let durable = false
       try {
-        appendFileSync(descriptor, line, 'utf8')
-        fsyncSync(descriptor)
-        durable = true
-      } catch (error) {
+        const previousLength = fstatSync(descriptor).size
         try {
-          // Windows append handles have FILE_APPEND_DATA but not the write
-          // permission required for ftruncate. Use a separate r+ handle for
-          // rollback; the original append handle remains closed in finally.
-          const rollback = openSync(this.file, 'r+')
+          appendFileSync(descriptor, line, 'utf8')
+          fsyncSync(descriptor)
+          durable = true
+        } catch (error) {
           try {
-            ftruncateSync(rollback, previousLength)
-            fsyncSync(rollback)
-          } finally {
-            closeSync(rollback)
+            // Windows append handles have FILE_APPEND_DATA but not the write
+            // permission required for ftruncate. Use a separate r+ handle for
+            // rollback; the original append handle remains closed in finally.
+            this.ownership!.assertHeld()
+            const rollback = openSync(this.file, 'r+')
+            try {
+              ftruncateSync(rollback, previousLength)
+              fsyncSync(rollback)
+            } finally {
+              closeSync(rollback)
+            }
+          } catch (rollbackError) {
+            this.failed = `event store ${this.file} needs reload after failed append rollback: ${String(rollbackError)}`
           }
-        } catch (rollbackError) {
-          this.failed = `event store ${this.file} needs reload after failed append rollback: ${String(rollbackError)}`
+          throw new Error(`cannot append event store ${this.file}: ${String(error)}${this.failed !== undefined ? `; ${this.failed}` : ''}`, { cause: error })
         }
-        throw new Error(`cannot append event store ${this.file}: ${String(error)}${this.failed !== undefined ? `; ${this.failed}` : ''}`, { cause: error })
+      } finally {
+        try { closeSync(descriptor) } catch (error) {
+          // The bytes may already be durable: never retry this sequence on the
+          // same object when a post-commit close leaves publication uncertain.
+          if (durable) this.failed = `event store ${this.file} needs reload after failed append close: ${String(error)}`
+          throw error
+        }
       }
+      // Publish only after the append and durability barrier succeeded.
+      this.needsSeparator = false
+      this.nextSeq += 1
+      this.events.push(event)
     } finally {
-      try { closeSync(descriptor) } catch (error) {
-        // The bytes may already be durable: never retry this sequence on the
-        // same object when a post-commit close leaves publication uncertain.
-        if (durable) this.failed = `event store ${this.file} needs reload after failed append close: ${String(error)}`
-        throw error
-      }
+      this.appending = false
     }
-    // Publish only after the append and durability barrier succeeded.
-    this.needsSeparator = false
-    this.nextSeq += 1
-    this.events.push(event)
     for (const listener of this.listeners) {
       try { listener(event) } catch (error) {
         let detail: string
@@ -207,6 +283,7 @@ export class EventStore {
   }
 
   subscribe(listener: (event: SwarmEventRecord) => void): () => void {
+    this.assertOpen()
     this.listeners.add(listener)
     return () => this.listeners.delete(listener)
   }

@@ -43,10 +43,7 @@ describe('J21 preflight against the real deployment', () => {
     // Resolve whatever exists; when nothing does, say so rather than failing red —
     // the parser itself stays covered by the unit tests. Asserting against the stale
     // `.imported` copy would be worse: it would silently validate an outdated file.
-    const candidates = [
-      process.env.DSH_HOME !== undefined && process.env.DSH_HOME.length > 0 ? `${process.env.DSH_HOME}/settings.yaml` : '',
-      'C:/Users/tsing/.dsh/settings.yaml',
-    ].filter((p) => p.length > 0)
+    const candidates = [process.env.DSH_SWARM_LIVE_SETTINGS ?? ''].filter((p) => p.length > 0)
     const found = candidates.find((p) => existsSync(p))
     if (found === undefined) {
       console.log('no live settings.yaml at ' + candidates.join(' | ') + ' — skipping the deployment assertion')

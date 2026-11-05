@@ -18,11 +18,17 @@ import { DutyTableStore } from './domain/duty-table.js'
 import { EventStore } from './domain/event-store.js'
 import { RuntimeStore } from './domain/runtime-store.js'
 import { RUNTIME_LIMITS, validateRuntimeInteger } from './domain/limits.js'
-import { fold, isReady, newState, taskKeyOf, type SwarmState } from './domain/projection.js'
+import { fold, isAccepted, isReady, newState, taskKeyOf, type SwarmState } from './domain/projection.js'
+import { DEFAULT_POLICY, taskPolicy, validatePolicy } from './policy.js'
+import { checkArtifacts } from './artifacts.js'
+import { meaningfulEvent, validateWaitOptions, type WaitOptions } from './wait.js'
+import { classifyLlmFailure, type ClassifiedFailure } from './failures.js'
+import { RequestLedger, validateRequestBudget, type RequestRoute, type RequestSettlement, type RequestAttribution } from './request-ledger.js'
+import { EventWorkItemCheckpoints } from './work-item-store.js'
 import type { BoardSnapshot } from './board.js'
 import { buildBoardSnapshot } from './board.js'
 import { spawnTaskAgent, buildReviewPrompt, buildReviewReaskPrompt, parseVerdict, taskReportRelPath, type SpawnDeps } from './dispatch/spawn.js'
-import type { DispatchInput, DispatchResult, DutyTable, ModelRef, RoleConfig, Run, RunDispatchContext, Task, TaskSpec } from './domain/types.js'
+import type { DispatchInput, DispatchResult, DutyTable, ModelRef, ReviewObservation, TaskObservation, RoleConfig, Run, RunDispatchContext, Task, TaskSpec } from './domain/types.js'
 
 // Match the producer kind assigned to historical swarm notices by the V3→V4
 // migration. Native V4 rejects the retired { kind: 'plugin', plugin: ... } wrapper.
@@ -385,6 +391,9 @@ const MAX_REMOVED_RUNS = 50
 export class SwarmService extends Service {
   private readonly swarmConfig: SwarmConfig
   readonly events: EventStore
+  readonly requests: RequestLedger
+  readonly workItems: EventWorkItemCheckpoints
+  private readonly activeRequests = new Set<Promise<void>>()
   readonly duty: DutyTableStore
   readonly runtime: RuntimeStore
   readonly startedAt: number
@@ -444,15 +453,18 @@ export class SwarmService extends Service {
     for (const key of Object.keys(RUNTIME_LIMITS) as Array<keyof typeof RUNTIME_LIMITS>) validateRuntimeInteger(key, config[key])
     mkdirSync(config.storageDir, { recursive: true })
     const events = new EventStore(join(config.storageDir, 'events.jsonl'))
-    const duty = new DutyTableStore(join(config.storageDir, 'duty-table.json'))
-    const runtime = new RuntimeStore(join(config.storageDir, 'runtime.json'))
-    // A valid envelope can still carry an unreplayable payload. Fold before
-    // publication too, and retain that validated initial projection.
-    const initialState = fold(events.all())
+    const { duty, runtime, initialState, requests } = (() => {
+      try {
+        return { duty: new DutyTableStore(join(config.storageDir, 'duty-table.json')), runtime: new RuntimeStore(join(config.storageDir, 'runtime.json')), initialState: fold(events.all()), requests: new RequestLedger(events.all(), (kind, fields) => events.append(kind, fields)) }
+      } catch (error) {
+        try { events.close() } catch (cleanup) { throw new AggregateError([error, cleanup], 'service initialization and ownership cleanup failed') }
+        throw error
+      }
+    })()
     super(ctx, 'swarm')
     this.swarmConfig = config
     this.startedAt = Date.now()
-    ctx.effect(() => () => {
+    ctx.effect(() => async () => {
       this.disposed = true
       if (this.deadlineTimer !== undefined) clearTimeout(this.deadlineTimer)
       if (this.humanWaitTimer !== undefined) clearTimeout(this.humanWaitTimer)
@@ -460,11 +472,16 @@ export class SwarmService extends Service {
       this.reviewQueue.clear()
       const holders = [...this.holders]
       for (const flight of holders) flight.controller.abort()
-      void Promise.allSettled(holders.map((flight) => flight.done)).then(() => {
-        for (const runId of this.runAnchors.keys()) this.releaseAnchor(runId)
-      })
+      await Promise.allSettled([...holders.map((flight) => flight.done), ...this.recoveries.values(), ...this.anchorPromises.values(), ...this.activeRequests])
+      if (this.holders.size > 0) throw new Error('service drain is uncertain; event-store ownership retained for manual recovery')
+      for (const runId of this.runAnchors.keys()) this.releaseAnchor(runId)
+      await Promise.allSettled(this.anchorDisposals)
+      if (this.anchorCleanupFailures.length > 0) throw new AggregateError(this.anchorCleanupFailures, 'anchor drain failed; store ownership retained')
+      events.close()
     })
     this.events = events
+    this.requests = requests
+    this.workItems = new EventWorkItemCheckpoints(events)
     this.state = initialState
     this.stateDirty = false
     // B2: record when each task's CURRENT wait episode began (the seq of the
@@ -474,7 +491,7 @@ export class SwarmService extends Service {
     // resolves with task/failed(retry), swarm_review with task/reviewed,
     // swarm_complete with task/completed; listing them already missed one).
     this.events.subscribe((event) => {
-      if (event.kind === 'task/blocked' || event.kind === 'task/review-started') {
+      if (event.kind === 'task/blocked' || event.kind === 'task/review-started' || event.kind === 'task/reviewed' || event.kind === 'task/failed' && event.data?.humanHold === true) {
         if (event.runId !== undefined && event.taskId !== undefined && typeof event.seq === 'number') {
           this.humanWaitEpisode.set(`${event.runId}/${event.taskId}`, event.seq)
         }
@@ -580,11 +597,18 @@ export class SwarmService extends Service {
       }
       for (const id of run.taskIds) {
         const task = this.view().tasks.get(run.id + '/' + id)
-        if (task === undefined || this.inFlight.has(taskKeyOf(task)) || this.recoveries.has(taskKeyOf(task))) continue
+        if (task === undefined || this.hasTaskHolder(taskKeyOf(task)) || this.recoveries.has(taskKeyOf(task))) continue
         if (task.status === 'reviewing' && task.humanReview === true) { this.scheduleHumanWaitingNotify(run.id); continue }
         if (task.status === 'completed' || task.status === 'reviewing') {
+          if (taskPolicy(run, task).review === 'off') continue
+          if (task.status === 'reviewing' && (task.attemptProtocol !== 2 || task.attemptId === undefined || task.attemptRevoked === true)) {
+            const reason = `legacy review ${id} lacks a resumable attempt identity; inspect and explicitly resolve before resuming`
+            this.events.append('run/paused', { runId: run.id, data: { reason } })
+            this.notifyDispatchSession(run.id, 'paused', reason)
+            break
+          }
           if (task.attemptProtocol === 2 && task.attemptId !== undefined && task.attemptRevoked !== true && task.reviewed !== true && task.reviewUnavailable !== true && task.reviewExhausted !== true) {
-            if (task.reviewGate === 'human') {
+            if (task.reviewGate === 'human' || taskPolicy(run, task).review === 'strict' && !task.reviewBy) {
               this.events.append('task/review-started', { runId: run.id, taskId: id, data: { attemptId: task.attemptId, reviewer: task.reviewBy ?? 'human', human: true } })
               this.scheduleHumanWaitingNotify(run.id)
             } else if (task.reviewBy !== undefined && task.reviewBy.length > 0) void this.runReview(run.id, id, task.reviewBy, task.attemptId)
@@ -789,6 +813,15 @@ export class SwarmService extends Service {
     if (tasks.length === 0) throw new Error('a run needs at least one task')
     const dag = validateDag(tasks)
     if (!dag.valid) throw new Error(`invalid task DAG: ${dag.errors.join('; ')}`)
+    if (input.budget !== undefined) {
+      validateRequestBudget(input.budget)
+      if (input.budget.mode === 'hard') throw new Error('hard request/token/cost budgets are unsupported: complete wire coverage and conservative bounds are not certified')
+    }
+    if (input.policy !== undefined) validatePolicy(input.policy)
+    const acceptancePolicy = { ...DEFAULT_POLICY, ...input.policy }
+    for (const task of tasks) {
+      if (taskPolicy({ policy: acceptancePolicy }, task).isolation === 'strict') throw new Error('strict isolation is unsupported by this host: read confinement, side-effect scopes and descendant admission are not certified')
+    }
     const known = Object.keys(this.duty.get().roles)
     const unknownRoles = [...new Set(tasks.map((t) => t.role).filter((r) => !known.includes(r)))]
     if (unknownRoles.length > 0) throw new Error(`unknown roles ${unknownRoles.join(', ')} — known: ${known.join(', ')}`)
@@ -885,6 +918,8 @@ export class SwarmService extends Service {
         spec: input.spec,
         tasks: effectiveTasks,
         dispatch: captured,
+        policy: acceptancePolicy,
+        ...(input.budget !== undefined ? { budget: input.budget } : {}),
       },
     })
     if (parent !== undefined) this.runParents.set(runId, parent)
@@ -1353,7 +1388,9 @@ export class SwarmService extends Service {
       staleTimeoutSeconds: this.rt('staleTimeoutSeconds'),
       spawnTimeoutSeconds: this.rt('spawnTimeoutSeconds'),
     }
-    return buildBoardSnapshot(visible, this.duty.get(), this.events.seq, PLUGIN_VERSION, { cwd: scopeCwd, unresolvable: scopeUnresolvable }, effectiveRuntime, removedRuns)
+    const snapshot = buildBoardSnapshot(visible, this.duty.get(), this.events.seq, PLUGIN_VERSION, { cwd: scopeCwd, unresolvable: scopeUnresolvable }, effectiveRuntime, removedRuns)
+    snapshot.accounting = snapshot.runs.map((run) => this.requests.summary(run.id))
+    return snapshot
   }
 
   statusText(runId?: string): string {
@@ -1367,7 +1404,7 @@ export class SwarmService extends Service {
       for (const task of tasks) byStatus.set(task.status, (byStatus.get(task.status) ?? 0) + 1)
       lines.push(`${run.id} [${run.status}] "${run.title}" — ${tasks.length} tasks: ${[...byStatus.entries()].map(([s, n]) => `${n} ${s}`).join(', ')}`)
       for (const task of tasks) {
-        lines.push(`  - ${task.id} [${task.status}] (${task.role}${task.agent?.model !== undefined ? ` @ ${task.agent.provider ?? ''}/${task.agent.model}` : ''})${task.lastNote !== undefined ? ` — ${String(task.lastNote).slice(0, 160)}` : ''}`)
+        lines.push(`  - ${task.id} [${task.status}] (${task.role}${task.agent?.model !== undefined ? ` @ ${task.agent.provider ?? ''}/${task.agent.model}` : ''})${run.policy !== undefined ? ' observed=' + JSON.stringify({ attemptId: task.attemptId, status: task.status, attemptRevoked: task.attemptRevoked === true }) : ''}${task.lastNote !== undefined ? ` — ${String(task.lastNote).slice(0, 160)}` : ''}`)
       }
     }
     return lines.join('\n')
@@ -1521,15 +1558,20 @@ export class SwarmService extends Service {
     }
   }
 
+  private readonly anchorDisposals = new Set<Promise<void>>()
+  private readonly anchorCleanupFailures: unknown[] = []
+
   /** Dispose a run's anchor once the run reaches a terminal status. */
   private releaseAnchor(runId: string): void {
     if (this.countRunHolders(runId) > 0) return
     const handle = this.runAnchors.get(runId)
     if (handle === undefined) return
     this.runAnchors.delete(runId)
-    void handle.dispose().catch((err) => {
+    const disposal = handle.dispose().catch((err) => {
+      this.anchorCleanupFailures.push(err)
       this.ctx.logger('swarm').warn('anchor for run %s failed to dispose: %s', runId, String(err))
-    })
+    }).finally(() => this.anchorDisposals.delete(disposal))
+    this.anchorDisposals.add(disposal)
   }
 
   /** K1: the launch capacity this run currently earns (shrinks on provider pain, recovers on success). */
@@ -1659,7 +1701,10 @@ export class SwarmService extends Service {
     const files: EffortSourceFile[] = []
     try {
       const home = process.env.DSH_HOME ?? join(process.env.USERPROFILE ?? '', '.dsh')
-      for (const candidate of [join(home, 'settings.yaml'), join(homedir(), '.dsh', 'settings.yaml')]) {
+      const candidates = process.env.DSH_HOME !== undefined
+        ? [join(home, 'settings.yaml')]
+        : [join(home, 'settings.yaml'), join(homedir(), '.dsh', 'settings.yaml')]
+      for (const candidate of candidates) {
         if (!existsSync(candidate)) continue
         try {
           files.push({ path: candidate, text: readFileSync(candidate, 'utf8') })
@@ -1782,7 +1827,17 @@ export class SwarmService extends Service {
       && (review ? task?.status === 'reviewing' : task?.status === 'running' || task?.status === 'dispatching')
   }
 
+  /** Commit authority can be revoked before physical side-effect ownership ends. */
+  private hasTaskHolder(key: string): boolean {
+    return this.inFlight.has(key) || [...this.holders].some((flight) => flight.taskKey === key)
+  }
+
+  private dependenciesSettled(task: Task): boolean {
+    return (task.blockedBy ?? []).every((id) => !this.hasTaskHolder(task.runId + '/' + id))
+  }
+
   private ownFlight(key: string, flight: InFlight): void {
+    if (this.hasTaskHolder(key)) throw new Error('task still owns an unsettled flight: ' + key)
     this.inFlight.set(key, flight)
     this.holders.add(flight)
   }
@@ -1831,20 +1886,30 @@ export class SwarmService extends Service {
       if (evidence.commandFailures.length === 0) this.events.append('task/heartbeat', { runId, taskId, data: d({ note: '✓ evidence commands passed on recheck — the finished work stands' }) })
     }
     if (evidence.commandFailures.length > 0) {
-      this.events.append('task/blocked', { runId, taskId, data: d({ human: true, reason: 'evidence contract failed twice — automatic retrying stops here. A human decides: accept the work (swarm_complete / dashboard), fix the command, or requeue (swarm_retry). ' + evidence.commandFailures[0], evidence: { commands: evidence.commands.filter((c) => !c.ok).slice(0, 10).map(evidenceRecord), firstRun } }) })
+      this.events.append('task/blocked', { runId, taskId, data: d({ human: true, ...((taskPolicy(this.view().runs.get(runId) ?? {}, task).evidence === 'required' || taskPolicy(this.view().runs.get(runId) ?? {}, task).review === 'strict') ? { acceptanceState: 'held', executionState: 'succeeded' } : {}), reason: 'evidence contract failed twice — automatic retrying stops here. A human decides: accept the work (swarm_complete / dashboard), fix the command, or requeue (swarm_retry). ' + evidence.commandFailures[0], evidence: { commands: evidence.commands.filter((c) => !c.ok).slice(0, 10).map(evidenceRecord), firstRun } }) })
       this.scheduleHumanWaitingNotify(runId)
       return
     }
+    const policy = taskPolicy(this.view().runs.get(runId) ?? {}, task)
+    const artifacts = checkArtifacts(task.evidence, this.view().runs.get(runId)?.dispatch?.cwd ?? process.cwd())
+    if (!artifacts.valid && policy.evidence === 'required') {
+      this.events.append('task/blocked', { runId, taskId, data: d({ human: true, executionState: 'succeeded', artifactState: 'invalid', artifactDigest: artifacts.digest, reason: 'required artifact validation failed: ' + artifacts.issues.join('; ') }) })
+      this.scheduleHumanWaitingNotify(runId)
+      return
+    }
+    const humanReview = task.reviewGate === 'human' || policy.review === 'strict' && !task.reviewBy
+    const reviewPending = policy.review !== 'off' && (humanReview || Boolean(task.reviewBy))
     if (evidence.fileWarnings.length > 0) this.events.append('task/heartbeat', { runId, taskId, data: d({ note: '⚠ evidence warning: ' + evidence.fileWarnings[0] }) })
-    // Commands are quiescent now. Release this phase BEFORE queuing any reviewer.
+    // Commands are quiescent. Commit completion/acceptance-pending BEFORE
+    // releasing ownership, so a failed first append still reaches its owner.
+    this.events.append('task/completed', { runId, taskId, data: d({ summary, recovered, reviewPending, artifactState: artifacts.valid ? 'valid' : 'invalid', artifactDigest: artifacts.digest, fileWarnings: [...evidence.fileWarnings, ...artifacts.issues], evidence: evidence.commands.slice(0, 10).map(evidenceRecord) }) })
     this.finishFlight(key, flight)
     this.evidenceRecheckedAttempt.delete(key)
     this.growConcurrency(runId)
-    this.events.append('task/completed', { runId, taskId, data: d({ summary, recovered, fileWarnings: evidence.fileWarnings, evidence: evidence.commands.slice(0, 10).map(evidenceRecord) }) })
-    if (task.reviewGate === 'human') {
+    if (reviewPending && humanReview) {
       this.events.append('task/review-started', { runId, taskId, data: d({ reviewer: task.reviewBy ?? 'human', human: true }) })
       this.scheduleHumanWaitingNotify(runId)
-    } else if (task.reviewBy !== undefined && task.reviewBy.length > 0) {
+    } else if (reviewPending && task.reviewBy !== undefined && task.reviewBy.length > 0) {
       void this.runReview(runId, taskId, task.reviewBy, flight.attemptId!)
     }
     this.scheduleTick()
@@ -1854,14 +1919,14 @@ export class SwarmService extends Service {
   private recoverReportedTask(task: Task, summary: string): void {
     const key = taskKeyOf(task)
     if (this.recoveries.has(key) || task.attemptId === undefined) return
-    const old = this.inFlight.get(key)
+    const old = this.inFlight.get(key) ?? [...this.holders].find((flight) => flight.taskKey === key)
     old?.controller.abort()
     const attemptId = task.attemptId
     const work = Promise.resolve(old?.done).then(async () => {
       const fresh = this.view().tasks.get(key)
       if (this.disposed || this.view().runs.get(task.runId)?.status !== 'running' || fresh?.attemptId !== attemptId || fresh.attemptRevoked === true) return
       if (fresh.status !== 'running' && fresh.status !== 'dispatching' && fresh.status !== 'reviewing') return
-      if (this.inFlight.has(key)) return
+      if (this.hasTaskHolder(key)) return
       if (this.countGlobalRunning() >= this.rt('maxTotalConcurrentAgents') || this.countRunHolders(task.runId) >= this.effectiveConcurrency(task.runId)) { this.recoveryQueue.set(key, { task: fresh, summary }); return }
       this.recoveryQueue.delete(key)
       if (fresh.status === 'reviewing') this.events.append('task/recovery-started', { runId: task.runId, taskId: task.id, data: { attemptId } })
@@ -1911,7 +1976,7 @@ export class SwarmService extends Service {
 
   /** Human verdict on an exact currently-waiting attempt. */
 
-  review(runId: string, taskId: string, verdict: 'approve' | 'reject'): void {
+  review(runId: string, taskId: string, verdict: 'approve' | 'reject', observed?: ReviewObservation, actorId?: string): void {
     const task = this.view().tasks.get(`${runId}/${taskId}`)
     if (task === undefined) throw new Error(`unknown task ${runId}/${taskId}`)
     if (task.status !== 'reviewing' || task.humanReview !== true) {
@@ -1920,10 +1985,17 @@ export class SwarmService extends Service {
     const run = this.view().runs.get(runId)
     if (run?.status !== 'running' && run?.status !== 'paused') throw new Error(`run ${runId} is inactive; cannot review its task`)
     if (task.attemptProtocol === 2 && (task.attemptId === undefined || task.attemptRevoked === true)) throw new Error(`task ${taskId} has no live human review attempt`)
+    if (run.policy !== undefined) {
+      if (observed === undefined || typeof observed.attemptId !== 'string' || typeof observed.reviewEpisode !== 'string' || typeof observed.artifactDigest !== 'string'
+        || observed.attemptId !== task.attemptId || observed.reviewEpisode !== task.reviewEpisode || observed.artifactDigest !== task.artifactDigest) throw new Error('stale or missing review observation; refresh the task before deciding')
+      const artifacts = checkArtifacts(task.evidence, run.dispatch?.cwd ?? process.cwd())
+      if (artifacts.digest !== observed.artifactDigest) throw new Error('review artifacts changed since validation; revalidate before deciding')
+      if (verdict === 'approve' && artifacts.records.some((record) => record.sha256 === undefined)) throw new Error('review artifacts are not byte-bound; revalidate before approving')
+    }
     const reviews = (task.reviews ?? 0) + 1
     // J19: pin the verdict to the attempt it judges, so a human decision about an
     // old attempt cannot close a task that has since been retried.
-    const fence = { source: 'operator', ...(task.attemptId !== undefined ? { attemptId: task.attemptId } : {}) }
+    const fence = { source: 'operator', decision: this.decision('review:' + verdict, observed, undefined, actorId, 'explicit human ' + verdict), ...(observed !== undefined ? { observed } : {}), ...(task.attemptId !== undefined ? { attemptId: task.attemptId } : {}) }
     if (verdict === 'approve') {
       this.events.append('task/reviewed', { runId, taskId, data: { ...fence, verdict: 'approve', feedback: 'approved by human review' } })
     } else {
@@ -1932,26 +2004,50 @@ export class SwarmService extends Service {
     this.scheduleTick()
   }
 
-  /** C1: resolve when the watched scope changes (long-poll for dispatcher chats). */
-  waitForChange(runId: string | undefined, timeoutMs: number, signal?: AbortSignal): Promise<string> {
+  /** Cursor-safe, bounded long-poll. Heartbeats are liveness, not default progress. */
+  waitForChange(runId: string | undefined, timeoutMs: number, signal?: AbortSignal, options: WaitOptions = {}): Promise<string> {
+    validateWaitOptions(options)
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0 || timeoutMs > 600000) throw new Error('wait timeout must be 0..600000ms')
+    if (runId !== undefined && !this.view().runs.has(runId)) throw new Error(`unknown run ${runId}`)
+    const mode = options.mode ?? 'meaningful'
+    const after = options.afterSeq ?? this.events.seq
+    if (after > this.events.seq) throw new Error('afterSeq is ahead of the durable board cursor')
+    const final = (): boolean => {
+      const state = this.view()
+      const runs = [...state.runs.values()].filter((run) => runId === undefined || run.id === runId)
+      const terminal = runs.length > 0 && runs.every((run) => ['completed', 'failed', 'aborted'].includes(run.status))
+      if (mode === 'any-final') return [...state.tasks.values()].some((task) => (runId === undefined || task.runId === runId) && (isAccepted(task) || task.status === 'failed'))
+      if (mode === 'drained') return terminal && ![...this.holders].some((holder) => runId === undefined || holder.taskKey.startsWith(runId + '/')) && ![...this.recoveries.keys()].some((key) => runId === undefined || key.startsWith(runId + '/'))
+      return terminal
+    }
     return new Promise((resolve) => {
       let settled = false
+      let unsubscribe = (): void => {}
+      let timer: ReturnType<typeof setTimeout> | undefined
       const finish = (note: string): void => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        if (timer !== undefined) clearTimeout(timer)
         unsubscribe()
         signal?.removeEventListener('abort', onAbort)
-        resolve(`${note}\n\n${this.statusText(runId)}`)
+        const cursor = this.events.seq
+        const report = `${note}; cursor=${cursor}; mode=${mode}\n\n${this.statusText(runId)}`
+        const limit = options.maxChars ?? 8000
+        resolve(report.length <= limit ? report : report.slice(0, limit - 100) + `\n… bounded report; retrieve swarm_status for details; cursor=${cursor}`)
       }
-      const unsubscribe = this.events.subscribe((event) => {
-        if (runId === undefined || event.runId === undefined || event.runId === runId) {
-          finish(`change at seq ${event.seq}: ${event.kind}${event.taskId !== undefined ? ` (${event.taskId})` : ''}`)
-        }
-      })
-      const timer = setTimeout(() => finish(`no swarm changes within ${Math.round(timeoutMs / 1000)}s`), timeoutMs)
       const onAbort = (): void => finish('wait aborted')
+      const observe = (event: import('./domain/types.js').SwarmEventRecord): void => {
+        if (event.seq <= after || (runId !== undefined && event.runId !== undefined && event.runId !== runId)) return
+        if (mode === 'any' || mode === 'meaningful' && meaningfulEvent(event) || ['terminal', 'drained', 'any-final'].includes(mode) && final()) finish(`change at seq ${event.seq}: ${event.kind}`)
+      }
+      // Subscribe before rechecking the cursor/state: an event between a prior
+      // tool result and this call is replayed, not lost until the next heartbeat.
+      unsubscribe = this.events.subscribe(observe)
+      timer = setTimeout(() => finish(`no qualifying swarm changes within ${Math.round(timeoutMs / 1000)}s`), timeoutMs)
       signal?.addEventListener('abort', onAbort, { once: true })
+      if (signal?.aborted === true) { finish('wait aborted'); return }
+      if (final()) { finish('watched scope already satisfies the final-state predicate'); return }
+      for (const event of this.events.all()) { observe(event); if (settled) break }
     })
   }
 
@@ -2006,6 +2102,10 @@ export class SwarmService extends Service {
     return true
   }
 
+  private retryAt(task: Task): number {
+    return Math.max(task.retryNotBefore ?? 0, task.updatedAt + Math.min(this.rt('retryBackoffBaseMs') * 2 ** Math.max(0, task.attempts - 1), 60000))
+  }
+
   /** Launch ready tasks up to the concurrency caps. Sync planning; spawns are staggered + fire-and-track. */
   private tick(): void {
     if (this.disposed) return
@@ -2016,19 +2116,23 @@ export class SwarmService extends Service {
       if (run.status !== 'running') continue
       if (!validAuthority(run.dispatch?.authority)) { this.pauseRun(run.id, 'legacy run has no captured caller authority — explicitly resume with conservative permissions or redispatch'); continue }
       const tasks = run.taskIds.map((id) => state.tasks.get(run.id + '/' + id)).filter((task): task is Task => task !== undefined)
+      if (run.budget?.mode === 'hard' || tasks.some((task) => taskPolicy(run, task).isolation === 'strict')) {
+        this.pauseRun(run.id, 'persisted run requires unsupported hard budget or strict isolation capabilities; no child admitted')
+        continue
+      }
       for (const task of tasks) {
         if (task.status === 'blocked') {
-          if (task.humanReview !== true && task.blockedReason?.startsWith('upstream task ') === true && (task.blockedBy?.length ?? 0) > 0 && task.blockedBy!.every((id) => state.tasks.get(run.id + '/' + id)?.status === 'completed')) this.events.append('task/unblocked', { runId: run.id, taskId: task.id, data: { source: 'operator' } })
+          if (task.humanReview !== true && task.blockedReason?.startsWith('upstream task ') === true && (task.blockedBy?.length ?? 0) > 0 && task.blockedBy!.every((id) => { const dependency = state.tasks.get(run.id + '/' + id); return dependency !== undefined && isAccepted(dependency) && !this.hasTaskHolder(taskKeyOf(dependency)) })) this.events.append('task/unblocked', { runId: run.id, taskId: task.id, data: { source: 'operator' } })
           continue
         }
         if (task.status !== 'pending' && task.status !== 'retrying') continue
         const dead = (task.blockedBy ?? []).find((id) => { const status = state.tasks.get(run.id + '/' + id)?.status; return status === 'failed' || status === 'blocked' })
         if (dead !== undefined) this.events.append('task/blocked', { runId: run.id, taskId: task.id, data: { source: 'operator', reason: 'upstream task ' + dead + ' did not complete' } })
-        if (task.status === 'retrying') later(task.updatedAt + Math.min(this.rt('retryBackoffBaseMs') * 2 ** Math.max(0, task.attempts - 1), 60000))
+        if (task.status === 'retrying') later(this.retryAt(task))
       }
       if (this.isCircuitOpen(run.id)) { later(this.circuitBreakerUntil.get(run.id)!); this.checkRunCompletion(run.id); continue }
       for (const [key, request] of this.recoveryQueue) {
-        if (request.task.runId === run.id && !this.recoveries.has(key) && !this.inFlight.has(key) && this.countGlobalRunning() < this.rt('maxTotalConcurrentAgents') && this.countRunHolders(run.id) < this.effectiveConcurrency(run.id)) this.recoverReportedTask(request.task, request.summary)
+        if (request.task.runId === run.id && !this.recoveries.has(key) && !this.hasTaskHolder(key) && this.countGlobalRunning() < this.rt('maxTotalConcurrentAgents') && this.countRunHolders(run.id) < this.effectiveConcurrency(run.id)) this.recoverReportedTask(request.task, request.summary)
       }
       this.launchQueuedReviews(run.id)
       const fresh = this.view()
@@ -2039,9 +2143,9 @@ export class SwarmService extends Service {
       let wave = 0
       for (const task of runTasks) {
         if (capacity <= 0) break
-        if (!isReady(fresh, task) || this.inFlight.has(taskKeyOf(task)) || this.recoveries.has(taskKeyOf(task)) || this.recoveryQueue.has(taskKeyOf(task))) continue
+        if (!isReady(fresh, task) || !this.dependenciesSettled(task) || this.hasTaskHolder(taskKeyOf(task)) || this.recoveries.has(taskKeyOf(task)) || this.recoveryQueue.has(taskKeyOf(task))) continue
         if (task.status === 'retrying') {
-          const at = task.updatedAt + Math.min(this.rt('retryBackoffBaseMs') * 2 ** Math.max(0, task.attempts - 1), 60000)
+          const at = this.retryAt(task)
           if (Date.now() < at) { later(at); continue }
         }
         const cap = this.duty.role(task.role)?.maxConcurrent
@@ -2058,9 +2162,18 @@ export class SwarmService extends Service {
     this.deadlineTimer?.unref?.()
   }
 
+  private assertTaskObservation(run: Run, task: Task, observed?: TaskObservation): void {
+    if (run.policy === undefined) return
+    if (observed === undefined || observed.attemptId !== task.attemptId || observed.status !== task.status || Boolean(observed.attemptRevoked) !== Boolean(task.attemptRevoked)) throw new Error('stale or missing task observation; refresh before a destructive decision')
+  }
+
+  private decision(action: string, observed: TaskObservation | ReviewObservation | undefined, actorSessionId: string | undefined, actorId: string | undefined, reason: string): Record<string, unknown> {
+    return { id: randomUUID(), action, actor: (actorId ?? (actorSessionId !== undefined ? 'session:' + actorSessionId : 'authenticated-dashboard')).slice(0, 256), reason: reason.slice(0, 4096), ...(observed !== undefined ? { observed } : {}) }
+  }
+
   /** Explicit authenticated operator override, not automatic proof. */
 
-  completeTaskExternally(runId: string, taskId: string, actorSessionId: string | undefined, summary: string): void {
+  completeTaskExternally(runId: string, taskId: string, actorSessionId: string | undefined, summary: string, observed?: TaskObservation, actorId?: string): void {
     const run = this.view().runs.get(runId)
     if (run === undefined) throw new Error(`unknown run ${runId}`)
     // Gated to the dispatching session; the dashboard bypasses via its own action.
@@ -2072,6 +2185,9 @@ export class SwarmService extends Service {
     if (task === undefined) throw new Error(`unknown task ${runId}/${taskId}`)
     if (run.status !== 'running' && run.status !== 'paused' && run.status !== 'failed') throw new Error(`run ${runId} is ${run.status}; cannot complete an inactive run's task`)
     if (task.status === 'completed') throw new Error(`task ${taskId} is already completed`)
+    const policy = taskPolicy(run, task)
+    if (policy.evidence === 'required' || policy.review === 'strict') throw new Error('strict acceptance cannot be bypassed by external completion; validate evidence and use the observed review gate')
+    this.assertTaskObservation(run, task, observed)
     if (run.status === 'failed') {
       const authority = validAuthority(run.dispatch?.authority) ? run.dispatch!.authority! : captureAuthority(this.ctx, this.runParents.get(runId), run.dispatch?.cwd)
       this.events.append('run/resumed', { runId, data: { authority } })
@@ -2084,7 +2200,7 @@ export class SwarmService extends Service {
     }
     this.events.append('task/completed', {
       runId, taskId,
-      data: { source: 'operator', revokeAttempt: true, summary: (summary.length > 0 ? summary : `task ${taskId} completed outside the swarm (dispatcher rescue)`) },
+      data: { source: 'operator', revokeAttempt: true, decision: this.decision('complete-task', observed, actorSessionId, actorId, summary), summary: (summary.length > 0 ? summary : `task ${taskId} completed outside the swarm (dispatcher rescue)`) },
     })
     this.scheduleTick()
   }
@@ -2094,7 +2210,7 @@ export class SwarmService extends Service {
    * This is the dispatcher's rescue for stalled children: instead of dispatching
    * a relief-sibling run, the dead task is aborted and retried in place.
    */
-  interruptTask(runId: string, taskId: string, actorSessionId: string | undefined): void {
+  interruptTask(runId: string, taskId: string, actorSessionId: string | undefined, observed?: TaskObservation, actorId?: string): void {
     const run = this.view().runs.get(runId)
     if (run === undefined) throw new Error(`unknown run ${runId}`)
     // Gated to the dispatching session (same rule as swarm_complete).
@@ -2107,6 +2223,7 @@ export class SwarmService extends Service {
     if (task.status !== 'running' && task.status !== 'dispatching') {
       throw new Error(`task ${taskId} is ${task.status}; only running or dispatching tasks can be interrupted`)
     }
+    this.assertTaskObservation(run, task, observed)
     // Abort the in-flight child agent.
     const key = `${runId}/${taskId}`
     const flight = this.inFlight.get(key)
@@ -2119,7 +2236,7 @@ export class SwarmService extends Service {
     // Mark the task as failed-with-retry: the dispatcher requeues it in the same run.
     this.events.append('task/failed', {
       runId, taskId,
-      data: { source: 'operator', retry: true, reason: 'interrupted by the dispatching session (stalled child)' },
+      data: { source: 'operator', retry: true, decision: this.decision('interrupt-task', observed, actorSessionId, actorId, 'explicit interruption of the observed attempt'), reason: 'interrupted by the dispatching session (stalled child)' },
     })
     this.scheduleTick()
   }
@@ -2129,6 +2246,7 @@ export class SwarmService extends Service {
     const run = this.view().runs.get(runId)
     const role = this.duty.role(task.role)
     const key = taskKeyOf(task)
+    if (this.hasTaskHolder(key) || !this.dependenciesSettled(task)) return
     if (run === undefined || role === undefined) {
       this.events.append('task/blocked', { runId, taskId: task.id, data: { source: 'operator', reason: 'run context unavailable' } })
       return
@@ -2160,7 +2278,9 @@ export class SwarmService extends Service {
     this.nudgeCount.delete(key)
     this.nudgedAt.delete(key)
     const d = (fields: Record<string, unknown>): Record<string, unknown> => ({ ...fields, attemptId, phase: 'build' })
-    this.events.append('task/started', { runId, taskId: task.id, data: d({ attemptProtocol: 2, label: 'swarm:' + task.id, provider: candidates[0]?.provider, model: candidates[0]?.model, effort, requestedEffort: rungs[0] }) })
+    const ceilingMs = run.policy !== undefined ? (this.swarmConfig.maxAttemptSeconds ?? 3600) * 1000 : 0
+    const attemptDeadlineAt = ceilingMs > 0 ? Date.now() + ceilingMs : undefined
+    this.events.append('task/started', { runId, taskId: task.id, data: d({ attemptProtocol: 2, ...(attemptDeadlineAt !== undefined ? { attemptDeadlineAt } : {}), label: 'swarm:' + task.id, provider: candidates[0]?.provider, model: candidates[0]?.model, effort, requestedEffort: rungs[0] }) })
     let spawnTimer: ReturnType<typeof setTimeout> | undefined
     let delayTimer: ReturnType<typeof setTimeout> | undefined
     const timeoutMs = (role.spawnTimeoutSeconds ?? this.rt('spawnTimeoutSeconds')) * 1000
@@ -2178,6 +2298,8 @@ export class SwarmService extends Service {
       flight.reclaimReason = reason
       childController.abort()
     }
+    const ceilingTimer = attemptDeadlineAt !== undefined ? setTimeout(() => flight.reclaim?.('attempt execution budget exhausted'), Math.max(0, attemptDeadlineAt - Date.now())) : undefined
+    ceilingTimer?.unref?.()
     const changeEffort = (id: string, pin: string | undefined): void => {
       if (!this.currentFlight(runId, task.id, flight)) return
       this.trackChildSession(id, key, pin, attemptId)
@@ -2203,6 +2325,8 @@ export class SwarmService extends Service {
         ...(this.swarmConfig.maxSubagentDepth > 0 ? { maxDepth: this.swarmConfig.maxSubagentDepth } : {}),
         workspace: run.dispatch?.cwd, toolFilter, priorNotes, evidence: task.evidence,
         initialEffort: rungs[0], effortRungs: rungs.slice(1),
+        legacyEffortHeuristic: run.policy === undefined,
+        failureForChild: (id) => this.childFailures.get(id),
         preflightEffort: (candidate, pin) => this.preflightEffort(task.role, [candidate], pin).effort,
         dependencyHandoffs: this.dependencyHandoffs(run, currentTask), planPath: run.planPath,
         onFallback: (failed, next) => {
@@ -2230,12 +2354,23 @@ export class SwarmService extends Service {
         return
       }
       const reason = flight.reclaimReason ?? outcome.reason ?? 'child stopped: ' + (outcome.stopReason ?? 'unknown')
-      const failureClass = classifyFailure(reason)
+      // A supervisor's liveness reclaim aborts the provider to establish drain,
+      // but is not a caller cancellation. Its retry still uses the task budget.
+      const typed: ClassifiedFailure | undefined = flight.reclaimReason?.startsWith('attempt execution budget exhausted') === true ? { kind: 'permanent', code: 'ATTEMPT_TIME_LIMIT' }
+        : flight.reclaimReason !== undefined && outcome.failure?.kind === 'cancelled' ? { kind: 'transient', code: 'SWARM_WATCHDOG_RECLAIM' } : outcome.failure
+      const failureClass = typed?.kind === 'quota' ? 'quota' : typed?.kind === 'transient' ? 'provider' : typed !== undefined ? 'other' : classifyFailure(reason)
       if (failureClass !== 'other') this.shrinkConcurrency(runId)
-      const retry = this.view().tasks.get(key)!.attempts <= this.rt('maxRetries')
-      this.events.append('task/failed', { runId, taskId: task.id, data: d({ retry: failureClass === 'quota' ? false : retry, reason: failureClass === 'quota' ? 'provider quota exhausted (before this failure: ' + reason + ')' : reason }) })
-      if (failureClass === 'quota') this.pauseRun(runId, reason)
-      else this.recordFailure(runId)
+      const terminal = typed !== undefined && ['permanent', 'quota', 'cancelled'].includes(typed.kind)
+      const retry = !terminal && this.view().tasks.get(key)!.attempts <= this.rt('maxRetries')
+      const baseDelay = Math.min(this.rt('retryBackoffBaseMs') * 2 ** Math.max(0, this.view().tasks.get(key)!.attempts - 1), 60000)
+      const delay = Math.max(baseDelay, typed?.retryAfterMs ?? 0)
+      const retryNotBefore = Date.now() + delay + (run.policy !== undefined && delay > 0 ? Math.floor(Math.random() * Math.min(1000, delay * 0.1)) : 0)
+      const humanHold = run.policy !== undefined && (typed?.kind === 'permanent' || typed?.kind === 'quota')
+      const safeReason = humanHold ? `model work held: ${typed!.code}${typed?.status !== undefined ? ` (HTTP ${typed.status})` : ''}; repair configuration/budget or explicitly retry` : reason
+      this.events.append('task/failed', { runId, taskId: task.id, data: d({ retry: failureClass === 'quota' ? false : retry, ...(retry ? { retryNotBefore } : {}), humanHold, cancelled: typed?.kind === 'cancelled', ...(typed !== undefined ? { failure: typed } : {}), reason: failureClass === 'quota' && !humanHold ? 'provider quota exhausted (before this failure: ' + reason + ')' : safeReason }) })
+      if (humanHold) this.scheduleHumanWaitingNotify(runId)
+      if (failureClass === 'quota') this.pauseRun(runId, safeReason)
+      else if (typed === undefined || typed.kind === 'transient') this.recordFailure(runId)
     }).catch(async (err: unknown) => {
       if (!this.currentFlight(runId, task.id, flight)) return
       // Bookkeeping errors are not proof of completion, even when a report exists.
@@ -2246,18 +2381,22 @@ export class SwarmService extends Service {
     }).catch((err: unknown) => this.ctx.logger('swarm').warn('task completion gate failed: %s', String(err))).finally(() => {
       if (spawnTimer !== undefined) clearTimeout(spawnTimer)
       if (delayTimer !== undefined) clearTimeout(delayTimer)
+      if (ceilingTimer !== undefined) clearTimeout(ceilingTimer)
       controller.signal.removeEventListener('abort', abortChild)
       this.finishFlight(key, flight)
     })
   }
 
 
-  private async runReview(runId: string, taskId: string, reviewerRoleId: string, attemptId: string): Promise<void> {
+  private runReview(runId: string, taskId: string, reviewerRoleId: string, attemptId: string): void {
     const key = runId + '/' + taskId
     const task = this.view().tasks.get(key)
-    if (task?.attemptId !== attemptId || task.status !== 'completed' || this.view().runs.get(runId)?.status !== 'running') return
-    // Same synchronous block as completion: the run must not end before a review is queued.
-    this.events.append('task/review-started', { runId, taskId, data: { attemptId, reviewer: reviewerRoleId } })
+    if (task?.attemptId !== attemptId || task.attemptRevoked === true || task.humanReview === true
+      || (task.status !== 'completed' && task.status !== 'reviewing') || this.view().runs.get(runId)?.status !== 'running') return
+    if (this.hasTaskHolder(key) || this.reviewQueue.get(key)?.attemptId === attemptId) return
+    // Restoring persisted reviewing is idempotent: never mint a new attempt or
+    // append a second start. Only a genuinely new review needs a durable start.
+    if (task.status === 'completed') this.events.append('task/review-started', { runId, taskId, data: { attemptId, reviewer: reviewerRoleId } })
     this.reviewQueue.set(key, { runId, taskId, roleId: reviewerRoleId, attemptId })
     this.scheduleTick()
   }
@@ -2267,7 +2406,7 @@ export class SwarmService extends Service {
       if (request.runId !== runId) continue
       const task = this.view().tasks.get(key)
       if (task?.attemptId !== request.attemptId || task.status !== 'reviewing' || task.humanReview || task.attemptRevoked) { this.reviewQueue.delete(key); continue }
-      if (this.inFlight.has(key)) continue
+      if (this.hasTaskHolder(key)) continue
       const role = this.duty.role(request.roleId)
       const roleCount = [...this.holders].filter((f) => f.roleId === request.roleId && f.taskKey.startsWith(runId + '/')).length
       if (this.countGlobalRunning() >= this.rt('maxTotalConcurrentAgents') || this.countRunHolders(runId) >= this.effectiveConcurrency(runId) || (role?.maxConcurrent !== undefined && roleCount >= role.maxConcurrent)) continue
@@ -2279,10 +2418,18 @@ export class SwarmService extends Service {
   private launchReview(request: { runId: string; taskId: string; roleId: string; attemptId: string }): void {
     const { runId, taskId, roleId, attemptId } = request
     const key = runId + '/' + taskId
+    if (this.hasTaskHolder(key)) return
     const run = this.view().runs.get(runId)!
     const role = this.duty.role(roleId)
     const candidates = role === undefined ? undefined : this.resolveCandidates(run, roleId)
     const d = (fields: Record<string, unknown>): Record<string, unknown> => ({ ...fields, attemptId, phase: 'review' })
+    const deadline = this.view().tasks.get(key)?.attemptDeadlineAt
+    if (deadline !== undefined && deadline <= Date.now()) {
+      this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: 'attempt execution budget exhausted before review admission' }) })
+      this.scheduleHumanWaitingNotify(runId)
+      this.scheduleTick()
+      return
+    }
     if (role === undefined || candidates === undefined) {
       this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: role === undefined ? 'reviewer role "' + roleId + '" unavailable' : 'no model route for reviewer role "' + roleId + '"' }) })
       this.scheduleTick()
@@ -2291,7 +2438,8 @@ export class SwarmService extends Service {
     let toolFilter: { allow?: string[]; deny?: string[] } | undefined
     try { toolFilter = this.spawnToolFilter(role) }
     catch (err) {
-      this.events.append('task/blocked', { runId, taskId, data: d({ human: true, reason: 'review restrictions cannot be enforced: ' + String(err) }) })
+      if (taskPolicy(run, this.view().tasks.get(key)).review === 'strict') this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: 'review restrictions cannot be enforced: ' + String(err) }) })
+      else this.events.append('task/blocked', { runId, taskId, data: d({ human: true, reason: 'review restrictions cannot be enforced: ' + String(err) }) })
       this.scheduleHumanWaitingNotify(runId)
       return
     }
@@ -2319,6 +2467,9 @@ export class SwarmService extends Service {
       flight.reclaimReason = reason
       childController.abort()
     }
+    const attemptDeadlineAt = this.view().tasks.get(key)?.attemptDeadlineAt
+    const ceilingTimer = attemptDeadlineAt !== undefined ? setTimeout(() => flight.reclaim?.('attempt execution budget exhausted during review'), Math.max(0, attemptDeadlineAt - Date.now())) : undefined
+    ceilingTimer?.unref?.()
     const changeEffort = (id: string, pin: string | undefined): void => {
       if (!current()) return
       this.trackChildSession(id, key, pin, attemptId)
@@ -2335,6 +2486,8 @@ export class SwarmService extends Service {
         workspace: run.dispatch?.cwd,
         ...(this.swarmConfig.maxSubagentDepth > 0 ? { maxDepth: this.swarmConfig.maxSubagentDepth } : {}),
         initialEffort: rungs[0], effortRungs: rungs.slice(1),
+        legacyEffortHeuristic: run.policy === undefined,
+        failureForChild: (id) => this.childFailures.get(id),
         preflightEffort: (candidate, pin) => this.preflightEffort('review ' + roleId, [candidate], pin).effort,
         onCandidateStarted: (id, candidate, pin) => {
           if (!current()) return
@@ -2359,6 +2512,18 @@ export class SwarmService extends Service {
         verdict = outcome.ok ? parseVerdict(text) : undefined
       }
       if (!current()) return
+      if (run.policy !== undefined) {
+        const artifacts = checkArtifacts(task.evidence, run.dispatch?.cwd ?? process.cwd())
+        if (artifacts.digest !== task.artifactDigest || artifacts.records.some((record) => record.sha256 === undefined)) {
+          if (taskPolicy(run, task).evidence === 'required') {
+            this.events.append('task/blocked', { runId, taskId, data: d({ human: true, executionState: 'succeeded', artifactState: 'invalid', artifactDigest: artifacts.digest, reason: 'artifacts changed during review; revalidate through an explicit retry' }) })
+            this.scheduleHumanWaitingNotify(runId)
+            return
+          }
+          verdict = undefined
+          outcome = { ok: false, reason: 'artifacts changed during review; prior validation no longer binds this verdict' }
+        }
+      }
       if (verdict === 'reject') {
         const reviews = (this.view().tasks.get(key)?.reviews ?? 0) + 1
         this.events.append('task/reviewed', { runId, taskId, data: d({ verdict, reviews, exhausted: reviews >= this.rt('reviewLoops'), feedback: text }) })
@@ -2369,8 +2534,10 @@ export class SwarmService extends Service {
       if (current()) this.events.append('task/reviewed', { runId, taskId, data: d({ verdict: 'error', feedback: String(err instanceof Error ? err.message : err) }) })
     }).finally(() => {
       if (timer !== undefined) clearTimeout(timer)
+      if (ceilingTimer !== undefined) clearTimeout(ceilingTimer)
       controller.signal.removeEventListener('abort', abortChild)
       this.finishFlight(key, flight)
+      this.scheduleHumanWaitingNotify(runId)
     })
   }
 
@@ -2379,14 +2546,17 @@ export class SwarmService extends Service {
     const run = state.runs.get(runId)
     if (run === undefined || run.status !== 'running') return
     const tasks = run.taskIds.map((id) => state.tasks.get(`${runId}/${id}`)).filter((t): t is Task => t !== undefined)
-    if (tasks.length === 0) return
+    if (tasks.length === 0 || this.countRunHolders(runId) > 0 || [...this.recoveries.keys()].some((key) => key.startsWith(runId + '/'))) return
+    // Physical drain is independent of logical completion. Do not publish a
+    // terminal result while a cancelled writer/reviewer/Shell can still mutate.
     // A run ends when every task is terminal. All completed → 'completed';
     // any terminally failed/blocked (after retries and the upstream cascade)
     // → 'failed' with the same report shape. Runs no longer hang in 'running'
     // forever behind a task that can never succeed.
+    if (tasks.some((task) => task.acceptanceState === 'held' || task.status === 'completed' && !isAccepted(task))) return
     const terminal = ['completed', 'failed', 'blocked'] as const
     if (!tasks.every((t) => (terminal as readonly string[]).includes(t.status))) return
-    const succeeded = tasks.every((t) => t.status === 'completed')
+    const succeeded = tasks.every(isAccepted)
     const byStatus: Record<string, number> = {}
     for (const task of tasks) byStatus[task.status] = (byStatus[task.status] ?? 0) + 1
     this.events.append(succeeded ? 'run/completed' : 'run/failed', {
@@ -2420,7 +2590,7 @@ export class SwarmService extends Service {
   }
 
   /** Requeue a failed/blocked task for another attempt (dashboard action or swarm_retry tool). */
-  retryTask(runId: string, taskId: string, actorSessionId?: string): void {
+  retryTask(runId: string, taskId: string, actorSessionId?: string, observed?: TaskObservation, actorId?: string): void {
     const run = this.view().runs.get(runId)
     if (run === undefined) throw new Error(`unknown run ${runId}`)
     // A5: the recovery tool is for the dispatching session; the dashboard bypasses the gate.
@@ -2430,20 +2600,70 @@ export class SwarmService extends Service {
     }
     const task = this.view().tasks.get(`${runId}/${taskId}`)
     if (task === undefined) throw new Error(`unknown task ${runId}/${taskId}`)
-    if (task.status !== 'failed' && task.status !== 'blocked') {
-      throw new Error(`task ${taskId} is ${task.status}; only failed or blocked tasks can be retried`)
+    if (task.status !== 'failed' && task.status !== 'blocked' && task.acceptanceState !== 'held') {
+      throw new Error(`task ${taskId} is ${task.status}; only failed, blocked or held tasks can be retried`)
     }
+    this.assertTaskObservation(run, task, observed)
     // A5: a terminal run comes back to life when one of its tasks is retried.
     if (run.status === 'failed' || run.status === 'aborted' || run.status === 'completed') {
       const authority = validAuthority(run.dispatch?.authority) ? run.dispatch!.authority! : captureAuthority(this.ctx, this.runParents.get(runId), run.dispatch?.cwd)
       this.events.append('run/resumed', { runId, data: { authority } })
     }
-    this.events.append('task/failed', { runId, taskId, data: { source: 'operator', retry: true, reason: 'manual retry' } })
+    this.events.append('task/failed', { runId, taskId, data: { source: 'operator', retry: true, decision: this.decision('retry-task', observed, actorSessionId, actorId, 'explicit retry of observed failed/blocked/held attempt'), reason: 'manual retry' } })
     // Observed live (run-mujadjk9-d7zr): the retry left the task in `retrying` and the
     // revived run then sat idle for 62 minutes, because a terminal run's tick loop has
     // stopped and appending the event does not restart it. Kick it explicitly —
     // scheduleTick is idempotent, so calling it here cannot double-schedule.
     this.scheduleTick()
+  }
+
+  /** Observe only an authenticated, still-owned child. Unattributed/hidden I/O is
+   * outside this seam; therefore strict wire/token/spend caps remain refused. */
+  beginObservedRequest(sessionId: string | undefined, route: RequestRoute): { id: string; settle: (outcome: RequestSettlement) => void } | undefined {
+    if (sessionId === undefined || this.effortOverrideFor(sessionId) === undefined) return undefined
+    if (this.disposed) throw new Error('swarm service is draining; request admission refused')
+    const ref = this.sessionTasks.get(sessionId)!
+    const task = this.view().tasks.get(ref.taskKey)!
+    const run = this.view().runs.get(task.runId)!
+    const flight = this.inFlight.get(ref.taskKey)
+    const phase: RequestAttribution['phase'] = route.purpose === 'compaction' ? 'compaction' : flight?.phase === 'review' ? 'review' : 'build'
+    const id = this.requests.reserve({ runId: run.id, taskId: task.id, attemptId: task.attemptId ?? 'legacy', sessionId, phase }, route, run.budget)
+    this.requests.sent(id)
+    let release!: () => void
+    const done = new Promise<void>((resolve) => { release = resolve })
+    this.activeRequests.add(done)
+    let settled = false
+    return { id, settle: (outcome) => {
+      if (settled) return
+      settled = true
+      try { this.requests.settle(id, outcome) }
+      finally { this.activeRequests.delete(done); release() }
+    } }
+  }
+
+  private readonly childFailures = new Map<string, ClassifiedFailure>()
+
+  ownsRetryForChild(sessionId: string, directParentSessionId?: string): boolean {
+    const ref = this.sessionTasks.get(sessionId)
+    const task = ref !== undefined ? this.view().tasks.get(ref.taskKey) : undefined
+    if (task !== undefined) return this.effortOverrideFor(sessionId) !== undefined && this.view().runs.get(task.runId)?.policy !== undefined
+    // Native fresh children retain direct-parent lineage before start() returns.
+    // This closes the retry-policy publication gap, without guessing a task or
+    // granting report authentication/accounting to an unknown session.
+    if (directParentSessionId === undefined) return false
+    for (const [runId, anchor] of this.runAnchors) {
+      const run = this.view().runs.get(runId)
+      if (String(anchor.agent.id) === directParentSessionId && run?.policy !== undefined && run.status === 'running' && this.countRunHolders(runId) > 0) return true
+    }
+    return false
+  }
+
+  recordChildFailure(sessionId: string, failure: Parameters<typeof classifyLlmFailure>[0], cancelled = false, directParentSessionId?: string): ClassifiedFailure | undefined {
+    if (this.effortOverrideFor(sessionId) === undefined && !this.ownsRetryForChild(sessionId, directParentSessionId)) return undefined
+    if (!this.childFailures.has(sessionId) && this.childFailures.size >= 4096) throw new Error('bounded child failure capture exhausted; admission refused')
+    const classified = classifyLlmFailure(failure, cancelled)
+    this.childFailures.set(sessionId, classified)
+    return classified
   }
 
   /** Track a spawned child session for report authentication + effort pinning. */
@@ -2456,6 +2676,7 @@ export class SwarmService extends Service {
   }
 
   forgetChildSession(childSessionId: string): void {
+    this.childFailures.delete(childSessionId)
     this.sessionTasks.delete(childSessionId)
   }
 

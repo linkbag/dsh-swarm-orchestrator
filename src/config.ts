@@ -3,7 +3,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { RUNTIME_LIMITS, type RuntimeKey } from './domain/limits.js'
 
-export const PLUGIN_VERSION = '0.6.32'
+export const PLUGIN_VERSION = '0.6.33'
 
 function runtimeNumber(key: RuntimeKey) {
   const bounds = RUNTIME_LIMITS[key]
@@ -35,6 +35,8 @@ export interface SwarmConfig {
   spawnTimeoutSeconds: number
   bootGraceSeconds: number
   maxSubagentDepth: number
+  /** New-policy model work ceiling, independent of heartbeat liveness; 0 disables. */
+  maxAttemptSeconds?: number
   evidenceTimeoutMs: number
 }
 
@@ -94,6 +96,9 @@ export const Config = Schema.object({
   ),
   spawnTimeoutSeconds: runtimeNumber('spawnTimeoutSeconds').description(
     'Sliding no-progress timeout while a child starts or runs, in seconds (0 disables). Heartbeats rearm it.',
+  ),
+  maxAttemptSeconds: Schema.natural().default(3600).min(0).max(86400).description(
+    'New-policy attempt model-work ceiling, including its review, in seconds. Heartbeats do not extend it; evidence commands keep their own ceiling. 0 disables. Not a provider token/spend cap.',
   ),
   bootGraceSeconds: Schema.natural().default(3).min(3).max(3600).description(
     'After plugin load, wait this many seconds for the spawn provider before orphan recovery.',

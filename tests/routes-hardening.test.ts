@@ -460,3 +460,36 @@ describe('one shared SSE stream with bounded slow-client resources', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 })
+
+describe('observed operator-intent transport', () => {
+  it('preserves review observation and the admitted peer identity without logging credentials', async () => {
+    const h = harness()
+    h.admit.mockReturnValue({ peer: { id: 'synthetic-peer' } })
+    const observed = { attemptId: 'att-observed', reviewEpisode: 'review-8', artifactDigest: 'a'.repeat(64) }
+    const result = h.mutation({ action: 'review', runId: 'r', taskId: 't', verdict: 'approve', observed })
+    await result.done
+    expect(result.response.statusCode).toBe(200)
+    expect(h.service.review).toHaveBeenCalledWith('r', 't', 'approve', observed, 'peer:synthetic-peer')
+  })
+
+  it.each(['complete-task', 'interrupt-task', 'retry-task'])('forwards displayed task identity for %s and maps stale intent to conflict', async (action) => {
+    const h = harness()
+    const observed = { attemptId: 'att-old', status: 'running', attemptRevoked: false }
+    const method = action === 'complete-task' ? h.service.completeTaskExternally : action === 'interrupt-task' ? h.service.interruptTask : h.service.retryTask
+    method.mockImplementation(() => { throw new Error('stale or missing task observation; refresh the task') })
+    const result = h.mutation({ action, runId: 'r', taskId: 't', summary: 'reason', taskObserved: observed })
+    await result.done
+    expect(result.response.statusCode).toBe(409)
+    const args = method.mock.calls[0] as unknown[]
+    expect(args).toContainEqual(observed)
+    expect(args.at(-1)).toBe('authenticated-dashboard')
+  })
+
+  it('rejects malformed observations before invoking a mutating method', async () => {
+    const h = harness()
+    const result = h.mutation({ action: 'interrupt-task', runId: 'r', taskId: 't', taskObserved: { status: 'running', attemptRevoked: 'false' } })
+    await result.done
+    expect(result.response.statusCode).toBe(400)
+    expect(actionCalls(h)).toBe(0)
+  })
+})

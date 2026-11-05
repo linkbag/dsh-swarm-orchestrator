@@ -16,9 +16,10 @@ import { Context } from '@deepseek-ai/cordis'
 import * as swarmPlugin from '../src/index.js'
 import { EventStore } from '../src/domain/event-store.js'
 
-const STORAGE = 'C:/Users/tsing/.dsh/storages/swarm'
+// Supply an explicitly authorized, exported fixture, never a hardcoded home.
+const STORAGE = process.env.DSH_SWARM_LIVE_STORAGE ?? ''
 
-describe('boot audit against the real deployment storage', () => {
+describe.skipIf(STORAGE.length === 0)('boot audit against an explicitly exported deployment fixture', () => {
   const dirs: string[] = []
   const contexts: Context[] = []
   afterAll(() => {

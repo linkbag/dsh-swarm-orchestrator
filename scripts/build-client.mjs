@@ -6,6 +6,7 @@ import { build } from 'esbuild';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { makeBuildReceipt } from './build-receipt.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const outfile = join(root, 'lib', 'client.js');
@@ -50,4 +51,5 @@ ${factoryBody.split('\n').map((l) => '\t\t' + l).join('\n')}
 
 mkdirSync(dirname(outfile), { recursive: true });
 writeFileSync(outfile, wrapped);
+writeFileSync(join(root, 'lib', 'build-receipt.json'), JSON.stringify(makeBuildReceipt(root, process.argv.includes('--full-build') ? 'full' : 'client-only'), null, 2) + '\n');
 console.log('build:client ->', outfile, '(' + wrapped.length + ' bytes, v' + pkg.version + ')');

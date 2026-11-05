@@ -1,6 +1,8 @@
 import type { DutyTable, Run, Task } from './domain/types.js'
 import type { SwarmState } from './domain/projection.js'
 import type { RuntimeOverrides } from './domain/runtime-store.js'
+import { HARDENING_CAPABILITIES } from './capabilities.js'
+import type { RequestLedgerSummary } from './request-ledger.js'
 
 /** Owned, plain-JSON board projection served over HTTP/SSE. Never holds live harness objects. */
 export interface BoardSnapshot {
@@ -8,6 +10,8 @@ export interface BoardSnapshot {
   version: string
   /** B1: dashboard actions this host serves (see BOARD_CAPABILITIES). */
   capabilities: readonly string[]
+  support?: typeof HARDENING_CAPABILITIES
+  accounting?: RequestLedgerSummary[]
   seq: number
   runs: Run[]
   tasks: Task[]
@@ -45,7 +49,7 @@ export interface RemovedRun {
  * observed as a bare `unknown action "…"` with nothing happening. Add a capability
  * here whenever a release adds a dashboard action.
  */
-export const BOARD_CAPABILITIES: readonly string[] = ['run-curation', 'interrupt-task', 'complete-task']
+export const BOARD_CAPABILITIES: readonly string[] = ['run-curation', 'interrupt-task', 'complete-task', 'observed-review-cas', 'policy-v1', 'cursor-wait', 'observed-request-accounting']
 
 const MAX_RUNS = 50
 
@@ -70,6 +74,7 @@ export function buildBoardSnapshot(
     service: 'dsh-swarm-orchestrator',
     version,
     capabilities: [...BOARD_CAPABILITIES],
+    support: { ...HARDENING_CAPABILITIES },
     seq,
     runs,
     tasks,
