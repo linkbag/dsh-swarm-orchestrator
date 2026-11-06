@@ -211,6 +211,10 @@ const en: Record<string, string> = {
   'roster.addRole': '+ add role',
   'roster.ph.default': 'default',
   'roster.effortInherit': 'inherit',
+  'roster.role.architect': 'Architect',
+  'roster.role.builder': 'Builder',
+  'roster.role.reviewer': 'Reviewer',
+  'roster.role.integrator': 'Integrator',
 
   'select.inherit': 'inherit deployment default',
   'select.chooseModel': '(choose a model)',
@@ -485,6 +489,10 @@ const zh: Record<string, string> = {
   'roster.addRole': '+ 添加角色',
   'roster.ph.default': '默认',
   'roster.effortInherit': '继承',
+  'roster.role.architect': '架构设计',
+  'roster.role.builder': '干活出工',
+  'roster.role.reviewer': '测试复查',
+  'roster.role.integrator': '整合收拢',
 
   'select.inherit': '继承部署默认',
   'select.chooseModel': '（选择模型）',

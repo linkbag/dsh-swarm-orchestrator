@@ -2,6 +2,12 @@
 
 Notable changes to `dsh-swarm-orchestrator`. Versions follow the npm package.
 
+## 0.6.34 — roster localization and runtime alignment
+
+- Built-in Roster role names follow the interface language. The `architect` / `builder` / `reviewer` / `integrator` card headers render 架构设计 / 干活出工 / 测试复查 / 整合收拢 in Chinese; a label customized under 人设与描述 always wins, custom roles keep their own name, and the stored duty table is never rewritten by a translation (the role id and the editable display-label field stay untouched).
+- The 运行时调优 section now shares the role-card grid's 16px inline padding, so its title, labels and inputs line up with the left border of the Architect card in both the Swarm tab and the Settings page.
+- Regressions: translated role names ship in both locales (lockstep-checked), a customized label is never overwritten, a zh render cannot rewrite the stored label, and roster/runtime padding parity. Full suite: 1,009 tests across 39 files.
+
 ## 0.6.33 — reviewed hardening plan
 
 - Keep physical task ownership through child/Shell drain at every replacement, dependent, review and recovery path. Restore persisted reviews idempotently; commit builder completion with acceptance-pending before releasing ownership. Terminal run notices wait for drain.

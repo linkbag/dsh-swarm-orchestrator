@@ -509,7 +509,9 @@
 .dsh-swarm-hpop-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
 
 /* ── runtime settings ──────────────────────────────────── */
-.dsh-swarm-runtime { padding: 12px 0 4px; border-top: 1px solid rgba(125, 125, 125, 0.2); margin-top: 16px; }
+/* Same 16px inline padding as .dsh-swarm-roster so the tuning controls line up with
+   the left border of the role cards instead of hugging the panel edge. */
+.dsh-swarm-runtime { padding: 12px 16px 4px; border-top: 1px solid rgba(125, 125, 125, 0.2); margin-top: 16px; }
 .dsh-swarm-runtime h4 { margin: 0 0 4px; }
 .dsh-swarm-runtime .dsh-swarm-btn { margin-top: 8px; }
 

@@ -1,14 +1,33 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { boardStore, type Board, type BoardRole } from './board-store'
 import { fetchModelCatalog, subscribeCatalogUpdates, type ModelCatalog } from './catalog'
-import { useT } from './locale'
+import { useT, type Translate } from './locale'
 import { useRequestOwner } from './use-request-owner'
 import { acceptSaved, configKey, createDraft, dutyDraft, editDraft, isDirty, keepDraft, receiveLive, reloadDraft } from './settings-draft'
 
 const EFFORTS = ['', 'minimal', 'low', 'medium', 'high', 'max'] as const
 const BUILTIN_ROLES = ['architect', 'builder', 'reviewer', 'integrator']
 
+/** Shipped English labels; a role still carrying its original label follows the UI language. */
+const SHIPPED_LABELS: Readonly<Record<string, string>> = {
+  architect: 'Architect',
+  builder: 'Builder',
+  reviewer: 'Reviewer',
+  integrator: 'Integrator',
+}
+
 type DraftRole = BoardRole
+
+/**
+ * Roster header name: built-in roles that still carry their shipped English label
+ * are shown in the active language (architect → 架构设计); a customized label always
+ * wins, and a custom role falls back to whatever its owner named it.
+ */
+export function roleDisplayLabel(role: DraftRole, t: Translate): string {
+  const shipped = SHIPPED_LABELS[role.id]
+  if (shipped === undefined || (role.label.length > 0 && role.label !== shipped)) return role.label
+  return t(`roster.role.${role.id}`)
+}
 
 function providerLabel(catalog: ModelCatalog | null, provider: string): string {
   return catalog?.providers.find((p) => p.provider === provider)?.displayName ?? provider
@@ -264,7 +283,7 @@ export function DutyTableEditor({ board, onSaved }: { board: Board | null; onSav
         {Object.values(draft).map((role) => (
           <section key={role.id} className="dsh-swarm-role-card">
             <header>
-              <h4><kbd>{role.id}</kbd> {role.label}</h4>
+              <h4><kbd>{role.id}</kbd> {roleDisplayLabel(role, t)}</h4>
               {!BUILTIN_ROLES.includes(role.id) && (
                 <button className="dsh-swarm-btn ghost" onClick={() => { deleteRole(role.id) }}>{t('roster.remove')}</button>
               )}
